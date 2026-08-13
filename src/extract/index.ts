@@ -198,3 +198,44 @@ export function extractAll(projectRoot: string): ExtractResult {
   const tsResult = extractTypeScript(absRoot, sourceFiles, models);
   return assemble(sourceFiles, schemaFiles, absRoot, models, fields, tsResult);
 }
+
+const SOURCE_EXT = new Set([".ts", ".tsx", ".js", ".jsx"]);
+
+/**
+ * Re-run only the extractors that apply to a single file.
+ * Prisma models from the whole project are still loaded so route/model matching stays correct,
+ * but Prisma nodes are only emitted when `filePath` is a schema.prisma.
+ */
+export function extractForFile(projectRoot: string, filePath: string): ExtractResult {
+  const absRoot = path.resolve(projectRoot);
+  const absFile = path.isAbsolute(filePath) ? path.resolve(filePath) : path.resolve(absRoot, filePath);
+  const rel = toPosix(path.relative(absRoot, absFile));
+  if (rel.startsWith("..")) {
+    throw new Error(`File is outside project root: ${filePath}`);
+  }
+
+  const allModels: PrismaModel[] = [];
+  for (const schema of findPrismaSchemas(absRoot)) {
+    allModels.push(...extractPrismaSchema(schema, absRoot).models);
+  }
+
+  const isPrisma = path.basename(absFile).toLowerCase() === "schema.prisma";
+  const isSource = SOURCE_EXT.has(path.extname(absFile).toLowerCase());
+
+  const schemaFiles = isPrisma ? [absFile] : [];
+  const sourceFiles = isSource ? [absFile] : [];
+
+  let models: PrismaModel[] = [];
+  let fields: ModelField[] = [];
+  if (isPrisma) {
+    const extracted = extractPrismaSchema(absFile, absRoot);
+    models = extracted.models;
+    fields = extracted.fields;
+  }
+
+  const tsResult = sourceFiles.length
+    ? extractTypeScript(absRoot, sourceFiles, allModels)
+    : { imports: [], routes: [], routeModelUsages: [], componentFetches: [] };
+
+  return assemble(sourceFiles, schemaFiles, absRoot, models, fields, tsResult);
+}

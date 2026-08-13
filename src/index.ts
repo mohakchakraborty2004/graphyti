@@ -5,6 +5,7 @@ import ContextGen from "./utils/context";
 import { codeGen } from "./utils/agent";
 import { loadContext } from "./utils/StrAnalyzer";
 import { handleAgentOutput } from "./agentPipeline";
+import { runInitGraph } from "./cli/init-graph";
 
 const program = new Command();
 
@@ -15,6 +16,14 @@ program
     console.log("Initializing project context...");
     await ContextGen();
     console.log("Context gathering complete ✅");
+  });
+
+program
+  .command("init-graph")
+  .description("Extract the code graph and ingest it into HydraDB")
+  .argument("[projectRoot]", "project to extract (defaults to cwd)", process.cwd())
+  .action(async (projectRoot: string) => {
+    await runInitGraph(projectRoot);
   });
 
 program

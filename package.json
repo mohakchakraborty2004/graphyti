@@ -9,7 +9,8 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "ts-node src/index.ts",
     "build": "tsc",
-    "extract:test": "tsx src/extract/test-extract.ts"
+    "extract:test": "tsx src/extract/test-extract.ts",
+    "init-graph": "tsx src/index.ts init-graph"
   },
   "keywords": [],
   "author": "",

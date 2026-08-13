@@ -172,6 +172,7 @@ function collectImports(sourceFile: SourceFile, projectRoot: string): FileImport
 }
 
 function isLocalSpecifier(spec: string): boolean {
+  if (spec.startsWith("@/generated")) return false;
   return spec.startsWith(".") || spec.startsWith("/") || spec.startsWith("@/");
 }
 
