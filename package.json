@@ -1,0 +1,35 @@
+{
+  "name": "dbagent",
+  "version": "1.0.0",
+  "main": "index.js",
+  "bin": {
+    "dbagent": "./dist/index.js"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "ts-node src/index.ts",
+    "build": "tsc"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@google/genai": "^1.10.0",
+    "@google/generative-ai": "^0.24.1",
+    "@hydradb/sdk": "^2.1.2",
+    "@types/commander": "^2.12.0",
+    "@types/dotenv": "^6.1.1",
+    "@types/fs-extra": "^11.0.4",
+    "@types/node": "^24.13.3",
+    "chalk": "^5.4.1",
+    "commander": "^14.0.3",
+    "dotenv": "^17.4.2",
+    "fs-extra": "^11.3.0",
+    "ora": "^8.2.0",
+    "ts-morph": "^28.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^7.0.2",
+    "zod": "^4.4.3"
+  }
+}
