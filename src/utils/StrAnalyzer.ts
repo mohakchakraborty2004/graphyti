@@ -112,7 +112,7 @@ export function saveContextFile(ctx: any, rootDir: string) {
   );
 }
 
-export function loadContext(): any {
+export function loadContext(): string {
   const contextPath = path.resolve(process.cwd(), '.dbagent/context.json');
 
   if (!fs.existsSync(contextPath)) {

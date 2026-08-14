@@ -1,14 +1,16 @@
 {
-  "name": "dbagent",
+  "name": "graphyti",
   "version": "1.0.0",
   "main": "index.js",
   "bin": {
-    "dbagent": "./dist/index.js"
+    "graphyti": "./dist/index.js"
   },
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "ts-node src/index.ts",
-    "build": "tsc"
+    "build": "tsc",
+    "extract:test": "tsx src/extract/test-extract.ts",
+    "init-graph": "tsx src/index.ts init-graph"
   },
   "keywords": [],
   "author": "",
@@ -29,7 +31,10 @@
     "ora": "^8.2.0",
     "ts-morph": "^28.0.0",
     "ts-node": "^10.9.2",
-    "typescript": "^7.0.2",
+    "typescript": "^5.7.3",
     "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "tsx": "^4.23.12"
   }
 }
