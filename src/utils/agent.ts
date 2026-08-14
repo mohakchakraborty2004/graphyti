@@ -14,7 +14,7 @@ interface CodeGenItem {
   description: string;
 }
 
-export async function codeGen(query : string, projectContext : any) : Promise<CodeGenItem[] | undefined>  {
+export async function codeGen(query : string, projectContext : string) : Promise<CodeGenItem[] | undefined>  {
   try {
        const ai = new GoogleGenAI({
             apiKey : process.env.GEMINI_API_KEY || ""
@@ -88,7 +88,7 @@ ADDITIONAL RULES:
  `
 
  const response = await ai.models.generateContent({
-  model: "gemini-2.5-pro",
+  model: "gemini-3.5-flash-lite",
   contents: prompt,
 
   config: {
@@ -156,7 +156,7 @@ export async function codeCombiner(existingCode: string, newCode: string) : Prom
     `
 
     const response = await ai.models.generateContent({
-    model: "gemini-2.5-pro",
+    model: "gemini-3.5-flash-lite",
     contents: prompt,
     config: {
       thinkingConfig: {
@@ -257,7 +257,7 @@ Strictly give the json out put and nothing else. And once again very important s
     `
 
     const response = await ai.models.generateContent({
-    model: "gemini-2.5-flash",
+    model: "gemini-3.5-flash-lite",
     contents: prompt,
     config: {
       thinkingConfig: {

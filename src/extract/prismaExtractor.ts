@@ -45,6 +45,56 @@ function parseFieldLine(line: string): Omit<ModelField, "modelName" | "isRelatio
   };
 }
 
+/**
+ * Parse a Prisma schema from an in-memory string instead of a file path.
+ * `relativeFilePath` is used only to populate model.filePath and warning messages.
+ * Identical logic to extractPrismaSchema — kept separate so the file-reading
+ * variant is unchanged and callers that diff old-vs-new content can pass strings directly.
+ */
+export function extractPrismaSchemaFromSource(
+  source: string,
+  relativeFilePath: string
+): PrismaExtractResult {
+  const stripped = stripComments(source);
+  const models: PrismaModel[] = [];
+  const rawFields: Array<ModelField & { hasRelationAttr: boolean }> = [];
+
+  const modelRe = /\bmodel\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{/g;
+  let match: RegExpExecArray | null;
+  while ((match = modelRe.exec(stripped))) {
+    const name = match[1];
+    const braceIndex = match.index + match[0].length - 1;
+    const block = extractBalancedBlock(stripped, braceIndex);
+    if (!block) {
+      extractWarn(`Unclosed model block for ${name} in ${relativeFilePath}`);
+      continue;
+    }
+    modelRe.lastIndex = block.end + 1;
+    models.push({ name, filePath: relativeFilePath });
+
+    for (const line of block.body.split(/\r?\n/)) {
+      const parsed = parseFieldLine(line);
+      if (!parsed) continue;
+      const hasRelationAttr = /@relation\b/.test(line);
+      rawFields.push({ modelName: name, ...parsed, isRelation: false, hasRelationAttr });
+    }
+  }
+
+  const modelNames = new Set(models.map((m) => m.name));
+  const fields: ModelField[] = rawFields.map(({ hasRelationAttr, ...field }) => {
+    const isRelation = modelNames.has(field.type) || hasRelationAttr;
+    const relatedModelName = modelNames.has(field.type) ? field.type : undefined;
+    if (hasRelationAttr && !relatedModelName) {
+      extractWarn(
+        `@relation on ${field.modelName}.${field.fieldName} but type "${field.type}" is not a known model — skipping related model`
+      );
+    }
+    return { ...field, isRelation, ...(relatedModelName ? { relatedModelName } : {}) };
+  });
+
+  return { models, fields };
+}
+
 export function extractPrismaSchema(schemaPath: string, projectRoot: string): PrismaExtractResult {
   const source = stripComments(fs.readFileSync(schemaPath, "utf8"));
   const relativePath = toPosix(path.relative(projectRoot, schemaPath));
