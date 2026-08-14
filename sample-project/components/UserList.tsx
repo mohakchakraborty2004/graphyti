@@ -1,4 +1,4 @@
-import { apiGet } from "@/lib/apiClient";
+import { apiGet } from "../src/lib/apiClient";
 
 export function UserList() {
   async function load() {

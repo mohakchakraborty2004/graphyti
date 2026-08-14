@@ -1,4 +1,4 @@
-import { formatTitle } from "@/lib/helper";
+import { formatTitle } from "../src/lib/helper";
 
 export function PostCard() {
   async function load() {

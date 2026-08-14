@@ -1,5 +1,5 @@
-import { prisma } from "@/lib/prisma";
-import { formatTitle } from "@/lib/helper";
+import { prisma } from "../../../src/lib/prisma";
+import { formatTitle } from "../../../src/lib/helper";
 
 export async function GET() {
   const posts = await prisma.post.findMany({
