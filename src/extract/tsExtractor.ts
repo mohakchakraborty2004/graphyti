@@ -805,4 +805,41 @@ export function extractTypeScript(
   return { imports, routes, routeModelUsages, componentFetches };
 }
 
+/**
+ * Extract TypeScript/TSX metadata from an in-memory string without touching disk.
+ * Uses ts-morph createSourceFile to create a virtual file at `virtualAbsPath`
+ * so that route-path inference and relative-import resolution still work correctly.
+ *
+ * @param projectRoot   - Absolute path to the project root (for relative path math).
+ * @param virtualAbsPath - The absolute path this content *would* live at on disk.
+ * @param source        - In-memory file content (not yet written to disk).
+ * @param models        - Prisma models for route-model usage detection.
+ */
+export function extractTypeScriptFromSource(
+  projectRoot: string,
+  virtualAbsPath: string,
+  source: string,
+  models: PrismaModel[]
+): TsExtractResult {
+  const project = createProject(projectRoot);
+
+  // createSourceFile registers a virtual file; overwrite=true in case it already exists
+  const sourceFile = project.createSourceFile(virtualAbsPath, source, { overwrite: true });
+
+  const imports: FileImport[] = [];
+  const routes: ApiRoute[] = [];
+  const routeModelUsages: RouteModelUsage[] = [];
+  const componentFetches: ComponentFetch[] = [];
+
+  if (!isInsideNodeModules(sourceFile.getFilePath())) {
+    imports.push(...collectImports(sourceFile, projectRoot));
+    const route = collectRoutes(sourceFile, projectRoot);
+    if (route) routes.push(route);
+    routeModelUsages.push(...collectRouteModelUsages(sourceFile, projectRoot, models));
+    componentFetches.push(...collectComponentFetches(sourceFile, projectRoot));
+  }
+
+  return { imports, routes, routeModelUsages, componentFetches };
+}
+
 export { isComponentFile, isApiRouteFile };

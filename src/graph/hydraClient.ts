@@ -1,7 +1,11 @@
 import dotenv from "dotenv";
+import path from "path";
 import { HydraDBClient, HydraDBError } from "@hydradb/sdk";
 
-dotenv.config();
+// Resolve .env from the tool's own root regardless of cwd.
+// Compiled entrypoint sits at dist/index.js; hydraClient.js is at dist/graph/hydraClient.js
+// — two levels up from __dirname lands at the package root where .env lives.
+dotenv.config({ path: path.join(__dirname, "..", "..", ".env") });
 
 export const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY });
 

@@ -16,7 +16,8 @@ model User {
 
 model Post {
   id        Int      @id @default(autoincrement())
-  title     String
+  title     String?
+  headline  String?
   content   String?
   published Boolean  @default(false)
   status    String   @default("DRAFT")

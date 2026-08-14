@@ -1,8 +1,12 @@
 import { GoogleGenAI, Type } from "@google/genai";
+import path from "path";
 import { ProjectPaths, ShallowScanResult } from "./StrAnalyzer";
 import dotenv from "dotenv";
 import { mergeType } from "../agentPipeline";
-dotenv.config()
+
+// Resolve .env from the tool's own root regardless of cwd.
+// agent.js compiles to dist/utils/agent.js — two levels up is the package root.
+dotenv.config({ path: path.join(__dirname, "..", "..", ".env") });
 
 
 interface CodeGenItem {

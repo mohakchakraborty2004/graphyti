@@ -20,7 +20,7 @@ import type { TsExtractResult } from "./tsExtractor";
 export type { ExtractResult, GraphEdge, GraphNode } from "./types";
 export * from "./types";
 export { extractPrismaSchema, findPrismaSchemas } from "./prismaExtractor";
-export { extractTypeScript, listSourceFiles } from "./tsExtractor";
+export { extractTypeScript, extractTypeScriptFromSource, listSourceFiles } from "./tsExtractor";
 
 function addNode(nodes: Map<string, GraphNode>, node: GraphNode): void {
   if (!nodes.has(node.id)) nodes.set(node.id, node);

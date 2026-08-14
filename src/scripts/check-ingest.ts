@@ -1,6 +1,9 @@
 import { HydraDBClient } from "@hydradb/sdk";
 import dotenv from "dotenv";
-dotenv.config();
+import path from "path";
+// Resolve .env from the tool's own root regardless of cwd.
+// check-ingest.js compiles to dist/scripts/check-ingest.js — two levels up is the package root.
+dotenv.config({ path: path.join(__dirname, "..", "..", ".env") });
 
 async function main() {
   console.log("database:", process.env.HYDRA_DB_DATABASE, "collection:", process.env.HYDRA_DB_COLLECTION);

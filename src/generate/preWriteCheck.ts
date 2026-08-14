@@ -2,7 +2,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as readline from "readline";
 import { loadGraphMap } from "../graph/ingest";
-import { extractPrismaSchemaFromSource } from "../extract/prismaExtractor";
+import { extractPrismaSchemaFromSource, type PrismaExtractResult } from "../extract/prismaExtractor";
 import type { ModelField } from "../extract/types";
 import {
   computeBlastRadius,
@@ -28,6 +28,13 @@ export interface PreWriteCheckResult {
   blastResults: BlastRadiusResult[];
   promptInjection: string;
   confirmed: boolean;
+  /**
+   * Breaking field names per blast result, index-aligned with blastResults[].
+   * Each entry contains only the field names that changed for that specific model,
+   * so the verifier can check each model's blast radius independently without
+   * false-positives from other models' unchanged fields.
+   */
+  breakingFieldNamesPerModel: string[][];
 }
 
 // ---------------------------------------------------------------------------
@@ -48,6 +55,24 @@ interface SchemaDiff {
   additive: FieldChange[];
   /** model:X ids for every model that has at least one BREAKING change */
   affectedModelIds: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Sanity check — catch malformed/truncated LLM output before diffing
+// ---------------------------------------------------------------------------
+
+/**
+ * A generated schema is plausible only if it has at least as many models as
+ * the one on disk. Fewer models means the LLM produced a truncated or
+ * malformed schema — treat this as a parse failure rather than interpreting
+ * every missing model's fields as "removed", which would flood breakingFieldNames
+ * with every field in the database and trigger a full-codebase blast radius.
+ */
+function isPlausibleNewSchema(
+  oldParsed: PrismaExtractResult,
+  newParsed: PrismaExtractResult
+): boolean {
+  return newParsed.models.length >= oldParsed.models.length;
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +156,18 @@ function diffSchema(item: CodeGenItem, projectRoot: string): SchemaDiff | null {
   const relPath = path.relative(projectRoot, absPath).replace(/\\/g, "/");
   const oldParsed = extractPrismaSchemaFromSource(oldSource, relPath);
   const newParsed = extractPrismaSchemaFromSource(newSource, relPath);
+
+  // If the generated schema has fewer models than what's on disk, the LLM
+  // almost certainly produced a truncated or malformed file. Bail out early
+  // so we don't misinterpret every missing model's fields as "removed".
+  if (!isPlausibleNewSchema(oldParsed, newParsed)) {
+    console.warn(
+      `  ⚠️  Generated schema has fewer models than current ` +
+      `(${newParsed.models.length} vs ${oldParsed.models.length}) — ` +
+      `looks malformed or truncated, skipping diff to avoid false blast-radius`
+    );
+    return null;
+  }
 
   // Index fields by model name
   const oldFieldsByModel = new Map<string, ModelField[]>();
@@ -221,7 +258,7 @@ export async function preWriteCheck(
 
   if (diffs.length === 0) {
     // No schema writes, or all schema writes are net-new files
-    return { blastResults: [], promptInjection: "", confirmed: true };
+    return { blastResults: [], promptInjection: "", confirmed: true, breakingFieldNamesPerModel: [] };
   }
 
   // Flatten across all schema files (usually just one)
@@ -240,7 +277,7 @@ export async function preWriteCheck(
   // 3. If there are no breaking changes, proceed immediately
   // -------------------------------------------------------------------------
   if (allBreaking.length === 0) {
-    return { blastResults: [], promptInjection: "", confirmed: true };
+    return { blastResults: [], promptInjection: "", confirmed: true, breakingFieldNamesPerModel: [] };
   }
 
   // -------------------------------------------------------------------------
@@ -270,12 +307,23 @@ export async function preWriteCheck(
     .filter(Boolean)
     .join("\n");
 
+  // Build per-model breaking field names, index-aligned with blastResults[].
+  // Each entry contains only fields that changed for that specific model so
+  // the verifier can check each blast radius independently — no cross-model
+  // false positives (e.g. "author" from Post leaking into User's verify pass).
+  const breakingFieldNamesPerModel = blastResults.map((br) => {
+    const modelName = br.changedNode.id.replace(/^model:/, "");
+    return allBreaking
+      .filter((c) => c.modelName === modelName)
+      .map((c) => c.fieldName);
+  });
+
   // -------------------------------------------------------------------------
   // 7. Confirm (or skip under --yes / --dry-run)
   // -------------------------------------------------------------------------
   if (dryRun || yes) {
     console.log(`\n  ℹ️  Skipping confirmation (${dryRun ? "--dry-run" : "--yes"} flag set)`);
-    return { blastResults, promptInjection, confirmed: true };
+    return { blastResults, promptInjection, confirmed: true, breakingFieldNamesPerModel };
   }
 
   const confirmed = await askConfirm(
@@ -284,5 +332,5 @@ export async function preWriteCheck(
 
   if (!confirmed) console.log("  ✋ Write aborted by user.");
 
-  return { blastResults, promptInjection, confirmed };
+  return { blastResults, promptInjection, confirmed, breakingFieldNamesPerModel };
 }
