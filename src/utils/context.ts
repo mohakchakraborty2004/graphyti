@@ -1,6 +1,20 @@
 import { contextGatherer } from "./agent";
 import { getProjectStructure, saveContextFile, shallowScan } from "./StrAnalyzer";
 
+/**
+ * FALLBACK ONLY — the flat context.json approach, superseded by the code graph.
+ *
+ * Everything in this file predates the graph. `graphyti init` writes an
+ * LLM-summarised, relation-free snapshot of the project to
+ * .dbagent/context.json; it is read back only by the two fallback branches in
+ * index.ts (`--legacy-context`, or HydraDB retrieval returning null).
+ *
+ * The real path is `graphyti init-graph` → cli/init-graph.ts → graph/ingest.ts,
+ * and retrieval via generate/retrieveContext.ts. This file is retained purely as
+ * a demo safety net for a HydraDB outage: it carries no relations, so blast
+ * radius (graph/blastRadius.ts) and verification (verify/verifyChange.ts) have
+ * nothing to work with when it is in use. Do not add features here.
+ */
 export default async function ContextGen(){
     //get file structure info.
     const structure = getProjectStructure();
@@ -16,10 +30,13 @@ export default async function ContextGen(){
 }
 
 /**
- * Format the raw string stored in context.json into an LLM-readable string
- * with the same rough shape buildString() produces: file paths, models/fields,
- * and a natural-language summary. Mirrors the format retrieveContext() returns
- * so codeGen always receives a consistent context contract.
+ * FALLBACK ONLY — format the raw string stored in context.json into an
+ * LLM-readable string with the same rough shape buildString() produces: file
+ * paths, models/fields, and a natural-language summary. Mirrors the format
+ * retrieveContext() returns so codeGen always receives a consistent context
+ * contract even when the graph is unavailable.
+ *
+ * Called only from the two fallback branches in index.ts. See the file header.
  *
  * Handles two cases:
  *   - The stored value is valid JSON (the contextGatherer shape) — extract and

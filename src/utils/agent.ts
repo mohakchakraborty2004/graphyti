@@ -1,13 +1,9 @@
 import { GoogleGenAI, Type } from "@google/genai";
-import path from "path";
 import { ProjectPaths, ShallowScanResult } from "./StrAnalyzer";
-import dotenv from "dotenv";
+import { requireGeminiApiKey } from "../config";
 import { mergeType } from "../agentPipeline";
 
-// Resolve .env from the tool's own root regardless of cwd.
-// agent.js compiles to dist/utils/agent.js — two levels up is the package root.
-dotenv.config({ path: path.join(__dirname, "..", "..", ".env") });
-
+// ../config loads .env from the package root before this module's body runs.
 
 interface CodeGenItem {
   type: string;
@@ -19,10 +15,11 @@ interface CodeGenItem {
 }
 
 export async function codeGen(query : string, projectContext : string) : Promise<CodeGenItem[] | undefined>  {
+  // Resolved outside the try so a missing key surfaces as a config error
+  // instead of being swallowed by the generic catch below.
+  const apiKey = requireGeminiApiKey();
   try {
-       const ai = new GoogleGenAI({
-            apiKey : process.env.GEMINI_API_KEY || ""
-        });
+       const ai = new GoogleGenAI({ apiKey });
 
  const prompt = `You are a professional typescript prisma and nextjs developer, experienced in writing advanced db schema models and apis using prisma, and then integrating and creating components with the same.
  you will be give a simple query and context of the whole project that what the project is about. You are to carefully analyze that query think and write code for the same.
@@ -147,9 +144,7 @@ ADDITIONAL RULES:
 
 
 export async function codeCombiner(existingCode: string, newCode: string) : Promise<mergeType | undefined> {
-    const ai = new GoogleGenAI({
-            apiKey :process.env.GEMINI_API_KEY || ""
-        });
+    const ai = new GoogleGenAI({ apiKey: requireGeminiApiKey() });
     const prompt = `You are a proffesional typescript, nextjs and prisma developer. you will be given two pieces of code. You need to combine the two code blocks
     such that the updated code is in working condition. Return only the code according to the schema given to you. make no mistakes and strictly stick to the schema.
     
@@ -193,9 +188,7 @@ export async function contextGatherer(structure : ProjectPaths, scanResult : Sha
       content: content.slice(0, 2000), 
     }));
 
-        const ai = new GoogleGenAI({
-            apiKey : process.env.GEMINI_API_KEY || ""
-        });
+        const ai = new GoogleGenAI({ apiKey: requireGeminiApiKey() });
 
     const prompt = `You are a proffesional nextjs developer and analyzer, given the project structure and route directories you can determine what the project is about and how it is made.
     You will give out a structured json output which has an array of object. Each object has a route/directory name 

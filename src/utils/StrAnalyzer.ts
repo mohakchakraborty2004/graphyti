@@ -102,6 +102,8 @@ export function shallowScan(rootDir: string): ShallowScanResult {
   return result;
 }
 
+/** FALLBACK ONLY — writes the flat .dbagent/context.json. Superseded by the code
+ *  graph (graph/ingest.ts); see the header of utils/context.ts. */
 export function saveContextFile(ctx: any, rootDir: string) {
   const targetDir = path.join(rootDir, ".dbagent");
   fs.mkdirSync(targetDir, { recursive: true });
@@ -112,6 +114,8 @@ export function saveContextFile(ctx: any, rootDir: string) {
   );
 }
 
+/** FALLBACK ONLY — reads the flat .dbagent/context.json. Called only from the
+ *  fallback branches in index.ts; see the header of utils/context.ts. */
 export function loadContext(): string {
   const contextPath = path.resolve(process.cwd(), '.dbagent/context.json');
 

@@ -1,24 +1,20 @@
 import { HydraDBClient } from "@hydradb/sdk";
-import dotenv from "dotenv";
-import path from "path";
-// Resolve .env from the tool's own root regardless of cwd.
-// check-ingest.js compiles to dist/scripts/check-ingest.js — two levels up is the package root.
-dotenv.config({ path: path.join(__dirname, "..", "..", ".env") });
+import { configSummary, requireHydraConfig } from "../config";
 
 async function main() {
-  console.log("database:", process.env.HYDRA_DB_DATABASE, "collection:", process.env.HYDRA_DB_COLLECTION);
-  const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY });
-  const database = process.env.HYDRA_DB_DATABASE!;
+  console.log(configSummary());
+  const { apiKey, database, collection } = requireHydraConfig();
+  const client = new HydraDBClient({ token: apiKey });
 
- const list = await client.context.list({ database, collection: process.env.HYDRA_DB_COLLECTION, type: "knowledge", page: 1, pageSize: 100 });
-console.log("total ingested:", list.data); // <- fix field name per grep result
+  const list = await client.context.list({ database, collection, type: "knowledge", page: 1, pageSize: 100 });
+  console.log("total ingested:", list.data); // <- fix field name per grep result
 
-  const rel = await client.context.relations({ database,collection: process.env.HYDRA_DB_COLLECTION, id: "model:Post", type: "knowledge" });
+  const rel = await client.context.relations({ database, collection, id: "model:Post", type: "knowledge" });
   console.log("model:post relations:", JSON.stringify(rel.data, null, 2));
 
   const result = await client.query({
     database,
-    collection: process.env.HYDRA_DB_COLLECTION,
+    collection,
     query: "What fields does the Post model have?",
     type: "knowledge",
     queryBy: "hybrid",

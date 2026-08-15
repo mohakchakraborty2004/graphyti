@@ -1,7 +1,8 @@
 import * as path from "path";
 import { HydraDBError } from "@hydradb/sdk";
 import { loadGraphMap, type GraphMap, type GraphMapEntry } from "./ingest";
-import { client, DATABASE, COLLECTION } from "./hydraClient";
+import { client } from "./hydraClient";
+import { requireHydraConfig } from "../config";
 
 // ---------------------------------------------------------------------------
 // Result types
@@ -161,9 +162,10 @@ async function checkHydraConsistency(
   localNeighborIds: Set<string>
 ): Promise<void> {
   try {
+    const { database, collection } = requireHydraConfig();
     const envelope = await client.context.relations({
-      database: DATABASE,
-      collection: COLLECTION || undefined,
+      database,
+      collection,
       id: changedNodeId,
       type: "knowledge",
     });

@@ -1,7 +1,9 @@
 import fs from "fs";
 import path from "path";
-import { execSync } from "child_process";
+import { spawnSync } from "child_process";
 import { codeCombiner } from "./utils/agent";
+import { ALLOWLIST_HELP, parseAllowedCommand } from "./utils/commandAllowlist";
+import { askConfirm } from "./utils/confirm";
 
 export interface mergeType {
   code: string;
@@ -9,6 +11,8 @@ export interface mergeType {
 
 export interface AgentOutputOptions {
   dryRun?: boolean;
+  /** Auto-confirm command execution (CLI `--yes`), mirroring the blast-radius gate. */
+  yes?: boolean;
 }
 
 export interface WriteResult {
@@ -54,7 +58,6 @@ async function writeFileSafe(
     console.log(`✅ Created new file: ${fullPath}`);
   } else {
     const existing = fs.readFileSync(fullPath, "utf-8");
-    console.log(existing);
     // @ts-ignore
     const merged = await codeCombiner(existing, cleanedContent);
     // @ts-ignore
@@ -64,19 +67,79 @@ async function writeFileSafe(
   return fullPath;
 }
 
-function runCommand(cmd: string, dryRun: boolean): boolean {
+/**
+ * Run a single model-generated command, but only if it matches the allowlist in
+ * utils/commandAllowlist.ts, and only after the user has confirmed the exact
+ * command that will run.
+ *
+ * Three layers, in order:
+ *   1. Structural allowlist — the raw string is parsed into a canonical argv.
+ *      A rejection is explained and skipped, never executed.
+ *   2. Explicit y/n confirmation on the printed command (same gate as the
+ *      blast-radius confirmation), skippable only with --yes.
+ *   3. Execution of the canonical argv via spawnSync — the raw model string is
+ *      never handed to a shell.
+ *
+ * @returns The canonical command string that ran, or null if nothing ran.
+ */
+async function runCommand(cmd: unknown, dryRun: boolean, yes: boolean): Promise<string | null> {
+  const check = parseAllowedCommand(cmd);
+
+  if (!check.ok) {
+    console.error(`\n🚫 Refused to run command: ${typeof cmd === "string" ? cmd : String(cmd)}`);
+    console.error(`   ${check.reason}`);
+    console.error(`   Only these command shapes are ever executed:`);
+    for (const line of ALLOWLIST_HELP) console.error(`     • ${line}`);
+    return null;
+  }
+
   if (dryRun) {
-    console.log(`\n⚡ [dry-run] Would run: ${cmd}`);
-    return false;
+    console.log(`\n⚡ [dry-run] Would run: ${check.display}`);
+    return null;
   }
-  try {
-    execSync(cmd, { stdio: "inherit" });
-    console.log(`💡 Executed: ${cmd}`);
-    return true;
-  } catch (err) {
-    console.error(`❌ Failed to run command: ${cmd}`, err);
-    return false;
+
+  console.log(`\n⚡ Command to run (allowlist rule: ${check.rule})`);
+  console.log(`     ${check.display}`);
+  console.log(`     cwd: ${process.cwd()}`);
+
+  if (yes) {
+    console.log(`  ℹ️  Skipping confirmation (--yes flag set)`);
+  } else if (!process.stdin.isTTY) {
+    console.error(
+      `  🚫 Not running: no interactive terminal available to confirm on. ` +
+        `Re-run with --yes to auto-confirm allowlisted commands.`
+    );
+    return null;
+  } else {
+    const confirmed = await askConfirm(`  Run this command? [y/N] `);
+    if (!confirmed) {
+      console.log(`  ✋ Command skipped by user.`);
+      return null;
+    }
   }
+
+  // Execute the canonical argv, not the model's string. shell is enabled only on
+  // Windows, where npm/npx are .cmd shims that cannot be spawned directly; it is
+  // safe because parseAllowedCommand() rejects every shell metacharacter, so no
+  // token can carry operators, quoting or substitution.
+  const isWindows = process.platform === "win32";
+  const [exe, ...args] = check.argv;
+  const result = spawnSync(isWindows ? `${exe}.cmd` : exe, args, {
+    stdio: "inherit",
+    shell: isWindows,
+  });
+
+  if (result.error) {
+    console.error(`❌ Failed to run command: ${check.display}`, result.error.message);
+    return null;
+  }
+  if (result.status !== 0) {
+    console.error(`❌ Command exited with code ${result.status}: ${check.display}`);
+    return null;
+  }
+
+  console.log(`💡 Executed: ${check.display}`);
+  return check.display;
 }
 
 /**
@@ -89,6 +152,7 @@ export async function handleAgentOutput(
   options: AgentOutputOptions = {}
 ): Promise<WriteResult> {
   const dryRun = options.dryRun ?? false;
+  const yes = options.yes ?? false;
   const writtenPaths: string[] = [];
   const executedCommands: string[] = [];
 
@@ -105,8 +169,8 @@ export async function handleAgentOutput(
     }
 
     if (item.type === "command") {
-      const ran = runCommand(item.command, dryRun);
-      if (ran) executedCommands.push(item.command);
+      const ran = await runCommand(item.command, dryRun, yes);
+      if (ran) executedCommands.push(ran);
     }
   }
 

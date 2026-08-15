@@ -1,10 +1,14 @@
 import { HydraDBClient } from "@hydradb/sdk";
+import { requireHydraConfig } from "../config";
 
 async function main() {
-  const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY });
+  // Previously this script read process.env directly without ever loading .env,
+  // so it only worked when the vars were exported in the shell.
+  const { apiKey, database } = requireHydraConfig();
+  const client = new HydraDBClient({ token: apiKey });
 
   await client.databases.create({
-    database: process.env.HYDRA_DB_DATABASE!,
+    database,
     databaseMetadataSchema: [
       { name: "node_kind", dataType: "VARCHAR", enableMatch: true, maxLength: 64 },
       { name: "file_path", dataType: "VARCHAR", enableMatch: true, maxLength: 512 },
@@ -12,7 +16,7 @@ async function main() {
   });
 
   while (true) {
-    const status = await client.databases.status({ database: process.env.HYDRA_DB_DATABASE! });
+    const status = await client.databases.status({ database });
 
     if (!status.data || !status.data.infra) {
       throw new Error("databases.status() returned no data despite not throwing");

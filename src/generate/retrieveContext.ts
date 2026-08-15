@@ -1,6 +1,7 @@
 import { HydraDBError } from "@hydradb/sdk";
 import { buildString } from "@hydradb/sdk/helpers";
-import { client, DATABASE, COLLECTION } from "../graph/hydraClient";
+import { client } from "../graph/hydraClient";
+import { requireHydraConfig } from "../config";
 
 /**
  * Retrieve graph-grounded context from HydraDB for a given user query.
@@ -15,9 +16,10 @@ import { client, DATABASE, COLLECTION } from "../graph/hydraClient";
  */
 export async function retrieveContext(userQuery: string): Promise<string | null> {
   try {
+    const { database, collection } = requireHydraConfig();
     const result = await client.query({
-      database: DATABASE,
-      collection: COLLECTION,
+      database,
+      collection,
       query: userQuery,
       type: "knowledge",
       queryBy: "hybrid",

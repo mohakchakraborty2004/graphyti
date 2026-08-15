@@ -2,7 +2,8 @@ import * as fs from "fs";
 import * as path from "path";
 import { HydraDBError } from "@hydradb/sdk";
 import type { GraphEdge, GraphNode, NodeKind } from "../extract/types";
-import { client, COLLECTION, DATABASE, hydraErrorMessage, waitForIndexed } from "./hydraClient";
+import { client, hydraErrorMessage, waitForIndexed } from "./hydraClient";
+import { requireHydraConfig } from "../config";
 
 /** SDK `IngestContextRequest.appKnowledge` is a JSON array *string*; there is no AppKnowledge item type in the .d.ts. */
 export interface AppKnowledgeItem {
@@ -150,14 +151,14 @@ export function nodeToAppKnowledgeItem(
   targetIds: string[] = [],
   allNodes: GraphNode[] = []
 ): AppKnowledgeItem {
-  if (!DATABASE) throw new Error("HYDRA_DB_DATABASE is not set");
+  const { database, collection } = requireHydraConfig();
   const byId = new Map(allNodes.map((n) => [n.id, n]));
   const models = modelFilePaths(allNodes);
   const filePath = filePathOf(node, models);
   return {
     id: node.id,
-    database: DATABASE,
-    collection: COLLECTION,
+    database,
+    collection: collection ?? "",
     title: displayNameOf(node),
     type: "custom",
     content: { text: describeNode(node, targetIds, byId) },
@@ -183,6 +184,7 @@ function chunk<T>(items: T[], size: number): T[][] {
 }
 
 async function ingestItems(items: AppKnowledgeItem[]): Promise<string[]> {
+  const { database, collection } = requireHydraConfig();
   const ingested: string[] = [];
   const batches = chunk(items, INGEST_BATCH_SIZE);
   for (let i = 0; i < batches.length; i++) {
@@ -192,8 +194,8 @@ async function ingestItems(items: AppKnowledgeItem[]): Promise<string[]> {
     try {
       envelope = await client.context.ingest({
         type: "knowledge",
-        database: DATABASE,
-        collection: COLLECTION || undefined,
+        database,
+        collection,
         upsert: "true",
         appKnowledge: JSON.stringify(batch),
       });
@@ -245,10 +247,10 @@ async function ingestItems(items: AppKnowledgeItem[]): Promise<string[]> {
 }
 
 export async function ingestGraph(nodes: GraphNode[], edges: GraphEdge[], projectRoot: string): Promise<void> {
-  if (!DATABASE) throw new Error("HYDRA_DB_DATABASE is not set");
+  const { database, collection } = requireHydraConfig();
   const adj = adjacencyFromEdges(edges);
   const items = nodes.map((node) => nodeToAppKnowledgeItem(node, adj.get(node.id) ?? [], nodes));
-  console.log(`[ingest] ingesting ${items.length} nodes into ${DATABASE}/${COLLECTION || "(default)"}`);
+  console.log(`[ingest] ingesting ${items.length} nodes into ${database}/${collection ?? "(default)"}`);
   const ids = await ingestItems(items);
   console.log(`[ingest] waiting for indexing of ${ids.length} ids`);
   await waitForIndexed(ids);
@@ -262,11 +264,12 @@ export async function ingestGraph(nodes: GraphNode[], edges: GraphEdge[], projec
 
 export async function deleteKnowledgeIds(ids: string[]): Promise<void> {
   if (ids.length === 0) return;
+  const { database, collection } = requireHydraConfig();
   console.log(`[ingest] deleting ${ids.length} ids`);
   const envelope = await client.context.delete({
     type: "knowledge",
-    database: DATABASE,
-    collection: COLLECTION || undefined,
+    database,
+    collection,
     ids,
   });
   if (envelope.error?.code || envelope.success === false) {

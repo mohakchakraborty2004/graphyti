@@ -17,11 +17,11 @@ import type { PreWriteCheckResult } from "./generate/preWriteCheck";
 const program = new Command();
 
 // ---------------------------------------------------------------------------
-// init
+// init — FALLBACK ONLY (flat context.json). The real indexer is `init-graph`.
 // ---------------------------------------------------------------------------
 program
   .command("init")
-  .description("Analyze and store the initial context of the Next.js project")
+  .description("FALLBACK ONLY — write the flat .dbagent/context.json snapshot (use init-graph instead)")
   .action(async () => {
     console.log("Initializing project context...");
     await ContextGen();
@@ -44,9 +44,9 @@ program
 // ---------------------------------------------------------------------------
 program
   .argument("<query>", "natural language request")
-  .option("--legacy-context", "Force the old context.json path (safety net if HydraDB is unreachable during demo)")
+  .option("--legacy-context", "FALLBACK ONLY — force the old flat .dbagent/context.json path instead of the graph (safety net if HydraDB is unreachable during the demo)")
   .option("--dry-run", "Show blast radius and generated code without writing any files")
-  .option("--yes", "Skip the blast-radius confirmation prompt and auto-confirm all writes")
+  .option("--yes", "Skip the blast-radius and command confirmation prompts and auto-confirm all writes")
   .action(async (query: string, options: Record<string, boolean>) => {
     const dryRun = options.dryRun ?? false;
     const yes    = options.yes    ?? false;
@@ -57,15 +57,22 @@ program
 
     // -----------------------------------------------------------------------
     // 1. Retrieve context
+    //
+    // The graph is the only real path: retrieveContext() queries HydraDB with
+    // graph_context enabled (see generate/retrieveContext.ts). The flat
+    // .dbagent/context.json branches below are FALLBACK ONLY — kept solely as a
+    // demo safety net for when HydraDB is unreachable. They produce a flat file
+    // listing with no relations, so blast radius and verification degrade to
+    // nothing useful. Do not build new features on them.
     // -----------------------------------------------------------------------
     let context: string;
     if (options.legacyContext) {
-      console.log("⚠️  --legacy-context: falling back to .dbagent/context.json");
-      context = formatLegacyContext(loadContext()); // [SUPERSEDED — legacy safety net]
+      console.log("⚠️  --legacy-context: falling back to .dbagent/context.json (no graph, no blast radius)");
+      context = formatLegacyContext(loadContext()); // FALLBACK ONLY — superseded by the graph
     } else {
       context = (await retrieveContext(query)) ?? (() => {
         console.warn("⚠️  HydraDB retrieval returned null — falling back to .dbagent/context.json");
-        return formatLegacyContext(loadContext()); // [SUPERSEDED — fallback only]
+        return formatLegacyContext(loadContext()); // FALLBACK ONLY — superseded by the graph
       })();
     }
 
@@ -183,7 +190,7 @@ program
     // -----------------------------------------------------------------------
     // 7. Write to disk (or preview under --dry-run)
     // -----------------------------------------------------------------------
-    const result = await handleAgentOutput(verifiedActions, { dryRun });
+    const result = await handleAgentOutput(verifiedActions, { dryRun, yes });
 
     if (dryRun) return;
 

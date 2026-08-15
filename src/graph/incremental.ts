@@ -12,7 +12,8 @@ import {
   type GraphMap,
   type GraphMapEntry,
 } from "./ingest";
-import { client, COLLECTION, DATABASE, hydraErrorMessage, waitForIndexed } from "./hydraClient";
+import { client, hydraErrorMessage, waitForIndexed } from "./hydraClient";
+import { requireHydraConfig } from "../config";
 import { HydraDBError } from "@hydradb/sdk";
 
 function entriesEqual(a: GraphMapEntry, b: GraphMapEntry): boolean {
@@ -32,6 +33,7 @@ function ownedIds(map: GraphMap, filePath: string): string[] {
 }
 
 export async function reingestFile(filePath: string, projectRoot: string): Promise<void> {
+  const { database, collection } = requireHydraConfig();
   const absRoot = path.resolve(projectRoot);
   const absFile = path.isAbsolute(filePath) ? path.resolve(filePath) : path.resolve(absRoot, filePath);
   const rel = toPosix(path.relative(absRoot, absFile));
@@ -75,8 +77,8 @@ export async function reingestFile(filePath: string, projectRoot: string): Promi
     try {
       envelope = await client.context.ingest({
         type: "knowledge",
-        database: DATABASE,
-        collection: COLLECTION || undefined,
+        database,
+        collection,
         upsert: "true",
         appKnowledge: JSON.stringify(items),
       });
