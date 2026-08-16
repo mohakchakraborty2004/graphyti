@@ -151,4 +151,4 @@ than hanging. See [`src/agentPipeline.ts`](src/agentPipeline.ts).
 `.dbagent/context.json`. It exists **only** as a safety net for a HydraDB outage:
 with no relations there is no blast radius and nothing for the verifier to check.
 The graph path is the real one. See the header of
-[`src/utils/context.ts`](src/utils/context.ts).
+[`src/utils/context.ts`](src/utils/context.ts)

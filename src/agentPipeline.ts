@@ -1,9 +1,11 @@
 import fs from "fs";
 import path from "path";
 import { spawnSync } from "child_process";
-import { codeCombiner } from "./utils/agent";
 import { ALLOWLIST_HELP, parseAllowedCommand } from "./utils/commandAllowlist";
 import { askConfirm } from "./utils/confirm";
+import { success, error, warn, info, sym, rule, bold } from "./cli/theme";
+import { renderFileDiff, renderDiff } from "./cli/renderDiff";
+import { structuralSchemaMerge } from "./graph/schemaMerge";
 
 export interface mergeType {
   code: string;
@@ -11,21 +13,24 @@ export interface mergeType {
 
 export interface AgentOutputOptions {
   dryRun?: boolean;
-  /** Auto-confirm command execution (CLI `--yes`), mirroring the blast-radius gate. */
   yes?: boolean;
+  /**
+   * Called before any command that uses spawnSync with stdio:"inherit".
+   * The caller should stop any active ora spinner here so it doesn't
+   * conflict with the child process's terminal I/O.
+   */
+  onBeforeCommand?: () => void;
 }
 
 export interface WriteResult {
-  /** Absolute paths of every file that was created or updated */
   writtenPaths: string[];
-  /** Commands that were executed */
   executedCommands: string[];
 }
 
 function ensureDir(dirPath: string) {
   if (!fs.existsSync(dirPath)) {
     fs.mkdirSync(dirPath, { recursive: true });
-    console.log(`📁 Created directory: ${dirPath}`);
+    console.log(`    ${info("›")} Created directory: ${dirPath}`);
   }
 }
 
@@ -43,85 +48,102 @@ async function writeFileSafe(
   const cleanedContent = content.replace(/\\n/g, "\n");
 
   if (dryRun) {
-    console.log(`\n📄 [dry-run] Would write: ${fullPath}`);
-    console.log("─".repeat(60));
-    const lines = cleanedContent.split("\n");
-    const preview = lines.slice(0, 60).join("\n");
-    console.log(preview);
-    if (lines.length > 60) console.log(`  … (${lines.length - 60} more lines)`);
-    console.log("─".repeat(60));
+    const existingContent = fs.existsSync(fullPath) ? fs.readFileSync(fullPath, "utf-8") : null;
+    const diff = renderFileDiff(existingContent, cleanedContent, fullPath);
+    if (diff) {
+      console.log(`\n  ${bold(fullPath)}`);
+      console.log(diff);
+    } else {
+      console.log(`\n  ${info("›")} ${fullPath} ${info("(no changes)")}`);
+    }
     return null;
   }
 
   if (!fs.existsSync(fullPath)) {
     fs.writeFileSync(fullPath, cleanedContent, "utf-8");
-    console.log(`✅ Created new file: ${fullPath}`);
+    console.log(`    ${sym.ok} Created: ${fullPath}`);
   } else {
     const existing = fs.readFileSync(fullPath, "utf-8");
-    // @ts-ignore
-    const merged = await codeCombiner(existing, cleanedContent);
-    // @ts-ignore
-    fs.writeFileSync(fullPath, merged.code.replace(/\\n/g, "\n"), "utf-8");
-    console.log(`🔁 Updated file with merged content: ${fullPath}`);
+    let mergedContent: string;
+
+    if (fileName === "schema.prisma") {
+      // Structural merge for Prisma schemas — no LLM, no lost newlines
+      mergedContent = structuralSchemaMerge(existing, cleanedContent, fullPath, path.resolve(directory, ".."));
+      fs.writeFileSync(fullPath, mergedContent, "utf-8");
+      console.log(`    ${sym.ok} Updated: ${fullPath}`);
+    } else {
+      // For non-schema files, write the generated content directly
+      // (codeCombiner was causing duplicate accumulation and formatting issues)
+      mergedContent = cleanedContent;
+      fs.writeFileSync(fullPath, mergedContent, "utf-8");
+      console.log(`    ${sym.ok} Updated: ${fullPath}`);
+    }
+
+    // Show the diff for actual writes so the user sees what changed
+    const diff = renderDiff(existing, mergedContent, { header: fullPath });
+    if (diff) {
+      console.log();
+      console.log(diff);
+      console.log();
+    }
   }
   return fullPath;
 }
 
 /**
- * Run a single model-generated command, but only if it matches the allowlist in
- * utils/commandAllowlist.ts, and only after the user has confirmed the exact
- * command that will run.
+ * Run a single model-generated command.
  *
- * Three layers, in order:
- *   1. Structural allowlist — the raw string is parsed into a canonical argv.
- *      A rejection is explained and skipped, never executed.
- *   2. Explicit y/n confirmation on the printed command (same gate as the
- *      blast-radius confirmation), skippable only with --yes.
- *   3. Execution of the canonical argv via spawnSync — the raw model string is
- *      never handed to a shell.
- *
- * @returns The canonical command string that ran, or null if nothing ran.
+ * IMPORTANT: before calling spawnSync with stdio:"inherit", we MUST invoke
+ * onBeforeCommand() so the caller can stop any active ora spinner — ora's
+ * repaint timer conflicts with the child process's terminal I/O and causes
+ * the process to hang.
  */
-async function runCommand(cmd: unknown, dryRun: boolean, yes: boolean): Promise<string | null> {
+async function runCommand(
+  cmd: unknown,
+  dryRun: boolean,
+  yes: boolean,
+  onBeforeCommand?: () => void
+): Promise<string | null> {
   const check = parseAllowedCommand(cmd);
 
   if (!check.ok) {
-    console.error(`\n🚫 Refused to run command: ${typeof cmd === "string" ? cmd : String(cmd)}`);
-    console.error(`   ${check.reason}`);
-    console.error(`   Only these command shapes are ever executed:`);
-    for (const line of ALLOWLIST_HELP) console.error(`     • ${line}`);
+    console.error(`    ${error("✗")} Refused to run command: ${typeof cmd === "string" ? cmd : String(cmd)}`);
+    console.error(`      ${check.reason}`);
+    console.error(`      Only these command shapes are ever executed:`);
+    for (const line of ALLOWLIST_HELP) console.error(`        ${sym.bullet} ${line}`);
     return null;
   }
 
   if (dryRun) {
-    console.log(`\n⚡ [dry-run] Would run: ${check.display}`);
+    console.log(`    ${info("›")} Would run: ${check.display}`);
     return null;
   }
 
-  console.log(`\n⚡ Command to run (allowlist rule: ${check.rule})`);
-  console.log(`     ${check.display}`);
-  console.log(`     cwd: ${process.cwd()}`);
+  console.log(`    ${info("›")} ${check.display}`);
+  console.log(`      cwd: ${process.cwd()}`);
 
   if (yes) {
-    console.log(`  ℹ️  Skipping confirmation (--yes flag set)`);
+    console.log(`    ${info("ℹ")} Auto-confirmed (--yes)`);
   } else if (!process.stdin.isTTY) {
     console.error(
-      `  🚫 Not running: no interactive terminal available to confirm on. ` +
-        `Re-run with --yes to auto-confirm allowlisted commands.`
+      `    ${error("✗")} Not running: no interactive terminal. ` +
+        `Re-run with --yes to auto-confirm.`
     );
     return null;
   } else {
-    const confirmed = await askConfirm(`  Run this command? [y/N] `);
+    const confirmed = await askConfirm(`    Run this command? [y/N] `);
     if (!confirmed) {
-      console.log(`  ✋ Command skipped by user.`);
+      console.log(`    ${warn("!")} Skipped by user.`);
       return null;
     }
   }
 
-  // Execute the canonical argv, not the model's string. shell is enabled only on
-  // Windows, where npm/npx are .cmd shims that cannot be spawned directly; it is
-  // safe because parseAllowedCommand() rejects every shell metacharacter, so no
-  // token can carry operators, quoting or substitution.
+  // ── Stop any active spinner BEFORE spawning — critical ────────────────
+  // spawnSync with stdio:"inherit" takes over the terminal. If ora's
+  // repaint timer fires while the child process owns stdio, the two fight
+  // over the terminal and the process hangs.
+  if (onBeforeCommand) onBeforeCommand();
+
   const isWindows = process.platform === "win32";
   const [exe, ...args] = check.argv;
   const result = spawnSync(isWindows ? `${exe}.cmd` : exe, args, {
@@ -130,22 +152,24 @@ async function runCommand(cmd: unknown, dryRun: boolean, yes: boolean): Promise<
   });
 
   if (result.error) {
-    console.error(`❌ Failed to run command: ${check.display}`, result.error.message);
+    console.error(`    ${error("✗")} Failed to run: ${check.display}`, result.error.message);
     return null;
   }
   if (result.status !== 0) {
-    console.error(`❌ Command exited with code ${result.status}: ${check.display}`);
+    console.error(`    ${error("✗")} Exited with code ${result.status}: ${check.display}`);
     return null;
   }
 
-  console.log(`💡 Executed: ${check.display}`);
+  console.log(`    ${sym.ok} Executed: ${check.display}`);
   return check.display;
 }
 
 /**
  * Write all file actions and run all command actions.
- * Returns { writtenPaths, executedCommands } so callers can reingest changed
- * files and build the CLI summary.
+ *
+ * File writes happen first (safe — no terminal I/O conflict).
+ * Commands are run via spawnSync with stdio:"inherit", which requires any
+ * active ora spinner to be paused first via onBeforeCommand.
  */
 export async function handleAgentOutput(
   actions: any[],
@@ -153,13 +177,11 @@ export async function handleAgentOutput(
 ): Promise<WriteResult> {
   const dryRun = options.dryRun ?? false;
   const yes = options.yes ?? false;
+  const onBeforeCommand = options.onBeforeCommand;
   const writtenPaths: string[] = [];
   const executedCommands: string[] = [];
 
-  if (dryRun) {
-    console.log("\n🔍 [dry-run] Showing what would be written — no files will be changed.\n");
-  }
-
+  // ── 1. Write files first (safe — no terminal conflict) ────────────────
   for (const item of actions) {
     if (item.type === "file") {
       const fullDir = path.resolve(process.cwd(), item.directory);
@@ -167,15 +189,14 @@ export async function handleAgentOutput(
       const written = await writeFileSafe(fullDir, item.fileName, item.content, dryRun);
       if (written) writtenPaths.push(written);
     }
-
-    if (item.type === "command") {
-      const ran = await runCommand(item.command, dryRun, yes);
-      if (ran) executedCommands.push(ran);
-    }
   }
 
-  if (dryRun) {
-    console.log("\n✅ [dry-run] Preview complete. Re-run without --dry-run to apply.");
+  // ── 2. Run commands (onBeforeCommand pauses the spinner before each) ──
+  for (const item of actions) {
+    if (item.type === "command") {
+      const ran = await runCommand(item.command, dryRun, yes, onBeforeCommand);
+      if (ran) executedCommands.push(ran);
+    }
   }
 
   return { writtenPaths, executedCommands };

@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { execSync } from "child_process";
+import { error as themeError, success, warn, info, sym } from "../cli/theme";
 
 export interface ProjectPaths {
   root: string;
@@ -29,26 +30,24 @@ export function getProjectStructure(projectRoot: string = process.cwd()): Projec
   const isPagesRouter = fs.existsSync(pagesDir);
 
   if (!isAppRouter && !isPagesRouter) {
-    throw new Error("❌ Could not find either 'pages' or 'app' directory in the project.");
+    throw new Error(`${themeError("✗")} Could not find either 'pages' or 'app' directory in the project.`);
   }
 
   const routerDir = isAppRouter ? appDir : pagesDir;
   const routerType = isAppRouter ? "app" : "pages";
 
-  //Ensuring API directory exists
   const apiDir = path.join(routerDir, "api");
   if (!fs.existsSync(apiDir)) {
     fs.mkdirSync(apiDir, { recursive: true });
-    console.log("📂 Created missing API directory:", apiDir);
+    console.log(`  ${info("›")} Created missing API directory: ${apiDir}`);
   } else {
-    console.log("api directory exists")
+    console.log(`  ${info("›")} api directory exists`);
   }
 
-  //Check Prisma directory
   const prismaDir = path.join(projectRoot, "prisma");
-  console.log("prisma dir :", prismaDir)
+  console.log(`  ${info("›")} prisma dir: ${prismaDir}`);
   if (!fs.existsSync(prismaDir)) {
-    console.log("⚠️ Prisma directory not found. Initializing Prisma...");
+    console.log(`  ${warn("!")} Prisma directory not found. Initializing Prisma...`);
     try {
       execSync("npx prisma init", { stdio: "inherit", cwd: projectRoot });
       execSync("npm install --save-dev prisma dotenv", { stdio: "inherit", cwd: projectRoot });
@@ -60,12 +59,12 @@ export function getProjectStructure(projectRoot: string = process.cwd()): Projec
    fi`,
   { stdio: "inherit", cwd: projectRoot }
 );
-      console.log("✅ Paste your database connection string in the .env file created in the project root.");
+      console.log(`  ${success("✓")} Paste your database connection string in the .env file created in the project root.`);
     } catch (error) {
-      console.error("❌ Failed to initialize Prisma:", error);
+      console.error(`  ${themeError("✗")} Failed to initialize Prisma:`, error);
     }
   } else {
-    console.log("prisma dir exists.")
+    console.log(`  ${info("›")} prisma dir exists`);
   }
 
   return {
@@ -102,8 +101,7 @@ export function shallowScan(rootDir: string): ShallowScanResult {
   return result;
 }
 
-/** FALLBACK ONLY — writes the flat .dbagent/context.json. Superseded by the code
- *  graph (graph/ingest.ts); see the header of utils/context.ts. */
+/** FALLBACK ONLY — writes the flat .dbagent/context.json. */
 export function saveContextFile(ctx: any, rootDir: string) {
   const targetDir = path.join(rootDir, ".dbagent");
   fs.mkdirSync(targetDir, { recursive: true });
@@ -114,13 +112,12 @@ export function saveContextFile(ctx: any, rootDir: string) {
   );
 }
 
-/** FALLBACK ONLY — reads the flat .dbagent/context.json. Called only from the
- *  fallback branches in index.ts; see the header of utils/context.ts. */
+/** FALLBACK ONLY — reads the flat .dbagent/context.json. */
 export function loadContext(): string {
   const contextPath = path.resolve(process.cwd(), '.dbagent/context.json');
 
   if (!fs.existsSync(contextPath)) {
-    throw new Error("❌ Context file not found. Please run `npx dbagent init` first.");
+    throw new Error(`${themeError("✗")} Context file not found. Please run \`npx dbagent init\` first.`);
   }
 
   const raw = fs.readFileSync(contextPath, 'utf-8');
@@ -128,6 +125,6 @@ export function loadContext(): string {
     const context = JSON.parse(raw);
     return context;
   } catch (e) {
-    throw new Error("❌ Failed to parse .dbagent/context.json");
+    throw new Error(`${themeError("✗")} Failed to parse .dbagent/context.json`);
   }
 }

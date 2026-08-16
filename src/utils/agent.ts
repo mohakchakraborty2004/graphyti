@@ -2,6 +2,7 @@ import { GoogleGenAI, Type } from "@google/genai";
 import { ProjectPaths, ShallowScanResult } from "./StrAnalyzer";
 import { requireGeminiApiKey } from "../config";
 import { mergeType } from "../agentPipeline";
+import { error as themeError, success } from "../cli/theme";
 
 // ../config loads .env from the package root before this module's body runs.
 
@@ -15,8 +16,6 @@ interface CodeGenItem {
 }
 
 export async function codeGen(query : string, projectContext : string) : Promise<CodeGenItem[] | undefined>  {
-  // Resolved outside the try so a missing key surfaces as a config error
-  // instead of being swallowed by the generic catch below.
   const apiKey = requireGeminiApiKey();
   try {
        const ai = new GoogleGenAI({ apiKey });
@@ -135,10 +134,10 @@ ADDITIONAL RULES:
 });
  
     const parsedResult: CodeGenItem[] = JSON.parse(response.text!);
-    console.log("code generated successfully.")   
     return parsedResult;
-  } catch (error) {
-    console.log("gen error---------", error);
+  } catch (err) {
+    console.error(`${themeError("✗")} Code generation failed:`, err instanceof Error ? err.message : err);
+    return undefined;
   }
 }
 
@@ -259,10 +258,6 @@ Strictly give the json out put and nothing else. And once again very important s
     config: {
       thinkingConfig: {
        thinkingBudget: 1024,
-        // Turn off thinking:
-        // thinkingBudget: 0
-        // Turn on dynamic thinking:
-         
       },
     }
   })

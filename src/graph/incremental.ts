@@ -15,6 +15,7 @@ import {
 import { client, hydraErrorMessage, waitForIndexed } from "./hydraClient";
 import { requireHydraConfig } from "../config";
 import { HydraDBError } from "@hydradb/sdk";
+import { info, sym } from "../cli/theme";
 
 function entriesEqual(a: GraphMapEntry, b: GraphMapEntry): boolean {
   return (
@@ -57,7 +58,7 @@ export async function reingestFile(filePath: string, projectRoot: string): Promi
   });
 
   console.log(
-    `[reingest] ${rel}: ${toUpsert.length} upsert, ${toDelete.length} delete, ${extracted.nodes.length} current nodes`
+    `  ${info("›")} ${rel}: ${toUpsert.length} upsert, ${toDelete.length} delete, ${extracted.nodes.length} current nodes`
   );
 
   if (toDelete.length > 0) {
@@ -111,8 +112,8 @@ export async function reingestFile(filePath: string, projectRoot: string): Promi
 
   saveGraphMap(absRoot, map);
   if (ingestedIds.length > 0) {
-    console.log(`[reingest] waiting for indexing of ${ingestedIds.length} ids`);
+    console.log(`  ${info("›")} Waiting for indexing of ${ingestedIds.length} ids`);
     await waitForIndexed(ingestedIds);
   }
-  console.log(`[reingest] ${rel} done`);
+  console.log(`  ${sym.ok} ${rel} done`);
 }

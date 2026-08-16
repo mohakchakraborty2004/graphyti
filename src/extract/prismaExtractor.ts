@@ -11,6 +11,26 @@ function stripComments(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
 }
 
+
+function normalizeModelBody(body: string): string {
+  const newlineCount = (body.match(/\n/g) || []).length;
+  if (newlineCount >= 2) return body; // Already formatted
+
+  let result = body;
+
+  result = result.replace(
+    /(^|\s)([a-z][A-Za-z0-9_]*)\s+([A-Z][A-Za-z0-9_]*(?:\[\])?)/g,
+    (match, prefix, fieldName, typeName) => `${prefix}${fieldName}  ${typeName}`
+  );
+
+  // Insert newline before closing brace (only the model-level one)
+  result = result.replace(/\}\s*$/, "\n}");
+
+
+  const parts = result.split(/\s{2,}/);
+  return parts.join("\n");
+}
+
 function extractBalancedBlock(source: string, openIndex: number): { body: string; end: number } | null {
   if (source[openIndex] !== "{") return null;
   let depth = 0;
@@ -72,7 +92,8 @@ export function extractPrismaSchemaFromSource(
     modelRe.lastIndex = block.end + 1;
     models.push({ name, filePath: relativeFilePath });
 
-    for (const line of block.body.split(/\r?\n/)) {
+    const normalizedBody = normalizeModelBody(block.body);
+    for (const line of normalizedBody.split(/\r?\n/)) {
       const parsed = parseFieldLine(line);
       if (!parsed) continue;
       const hasRelationAttr = /@relation\b/.test(line);
@@ -114,7 +135,8 @@ export function extractPrismaSchema(schemaPath: string, projectRoot: string): Pr
     modelRe.lastIndex = block.end + 1;
     models.push({ name, filePath: relativePath });
 
-    for (const line of block.body.split(/\r?\n/)) {
+    const normalizedBody = normalizeModelBody(block.body);
+    for (const line of normalizedBody.split(/\r?\n/)) {
       const parsed = parseFieldLine(line);
       if (!parsed) continue;
       const hasRelationAttr = /@relation\b/.test(line);
