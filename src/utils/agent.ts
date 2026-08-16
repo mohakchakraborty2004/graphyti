@@ -21,10 +21,11 @@ import { scopedCodeGenWithRetry } from "../generate/scopedEdit";
 export async function codeGen(
   editPlan: EditPlan,
   query: string,
-  context: string
+  context: string,
+  timeoutMs = 120_000
 ): Promise<EditPlan | undefined> {
   try {
-    return await scopedCodeGenWithRetry(query, context, editPlan);
+    return await scopedCodeGenWithRetry(query, context, editPlan, timeoutMs);
   } catch (err) {
     console.error(
       `${themeError("✗")} Code generation failed:`,
