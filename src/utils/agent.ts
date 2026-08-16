@@ -1,11 +1,8 @@
-import { GoogleGenAI, Type } from "@google/genai";
 import { ProjectPaths, ShallowScanResult } from "./StrAnalyzer";
-import { requireGeminiApiKey } from "../config";
 import { error as themeError } from "../cli/theme";
 import type { EditPlan } from "../generate/scopedEdit";
 import { scopedCodeGenWithRetry } from "../generate/scopedEdit";
-
-// ../config loads .env from the package root before this module's body runs.
+import { generateCompletion } from "../generate/llmClient";
 
 /**
  * Generate scoped edits for the user's query.
@@ -21,10 +18,11 @@ import { scopedCodeGenWithRetry } from "../generate/scopedEdit";
 export async function codeGen(
   editPlan: EditPlan,
   query: string,
-  context: string
+  context: string,
+  timeoutMs = 120_000
 ): Promise<EditPlan | undefined> {
   try {
-    return await scopedCodeGenWithRetry(query, context, editPlan);
+    return await scopedCodeGenWithRetry(query, context, editPlan, timeoutMs);
   } catch (err) {
     console.error(
       `${themeError("✗")} Code generation failed:`,
@@ -42,8 +40,6 @@ export async function contextGatherer(structure : ProjectPaths, scanResult : Sha
       path: filePath,
       content: content.slice(0, 2000), 
     }));
-
-        const ai = new GoogleGenAI({ apiKey: requireGeminiApiKey() });
 
     const prompt = `You are a proffesional nextjs developer and analyzer, given the project structure and route directories you can determine what the project is about and how it is made.
     You will give out a structured json output which has an array of object. Each object has a route/directory name 
@@ -108,15 +104,5 @@ export async function contextGatherer(structure : ProjectPaths, scanResult : Sha
 Strictly give the json out put and nothing else. And once again very important strictly stick to the scanresults and project structure.
     `
 
-    const response = await ai.models.generateContent({
-    model: "gemini-3.5-flash-lite",
-    contents: prompt,
-    config: {
-      thinkingConfig: {
-       thinkingBudget: 1024,
-      },
-    }
-  })
-
-  return response.text
+  return generateCompletion(prompt, { responseFormat: "json" });
 }

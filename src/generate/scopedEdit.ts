@@ -1,8 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { z } from "zod";
-import { GoogleGenAI, Type } from "@google/genai";
-import { requireGeminiApiKey } from "../config";
+import { generateCompletion } from "./llmClient";
 import {
   structuralSchemaMerge,
   formatPrismaSchema,
@@ -29,7 +28,49 @@ const SchemaEditSchema = z.object({
   newFieldName: z.string().optional(),
   fieldType: z.string().optional(),
   newFieldType: z.string().optional(),
-});
+}).refine(
+  (data) => {
+    if (data.op === "add_field") {
+      return typeof data.fieldName === "string" && data.fieldName.length > 0
+        && typeof data.fieldType === "string" && data.fieldType.length > 0;
+    }
+    return true;
+  },
+  {
+    message: "add_field requires both fieldName and fieldType",
+  }
+).refine(
+  (data) => {
+    if (data.op === "remove_field" || data.op === "rename_field" || data.op === "change_type") {
+      return typeof data.fieldName === "string" && data.fieldName.length > 0;
+    }
+    return true;
+  },
+  {
+    message: "remove_field/rename_field/change_type requires fieldName",
+  }
+).refine(
+  (data) => {
+    if (data.op === "rename_field") {
+      return typeof data.newFieldName === "string" && data.newFieldName.length > 0;
+    }
+    return true;
+  },
+  {
+    message: "rename_field requires newFieldName",
+  }
+).refine(
+  (data) => {
+    if (data.op === "change_type") {
+      return typeof data.fieldType === "string" && data.fieldType.length > 0
+        && typeof data.newFieldType === "string" && data.newFieldType.length > 0;
+    }
+    return true;
+  },
+  {
+    message: "change_type requires fieldType and newFieldType",
+  }
+);
 
 const FileEditSchema = z.object({
   type: z.literal("file"),
@@ -42,11 +83,19 @@ const CommandActionSchema = z.object({
   command: z.string().min(1),
 });
 
+const CreateFileSchema = z.object({
+  type: z.literal("create_file"),
+  filePath: z.string().min(1),
+  content: z.string(),
+  reason: z.string().optional(),
+});
+
 const EditPlanSchema = z.array(
   z.discriminatedUnion("type", [
     SchemaEditSchema,
     FileEditSchema,
     CommandActionSchema,
+    CreateFileSchema,
   ])
 );
 
@@ -55,6 +104,7 @@ export type ScopedEdit = z.infer<typeof ScopedEditSchema>;
 export type SchemaEdit = z.infer<typeof SchemaEditSchema>;
 export type FileEdit = z.infer<typeof FileEditSchema>;
 export type CommandAction = z.infer<typeof CommandActionSchema>;
+export type CreateFile = z.infer<typeof CreateFileSchema>;
 export type EditPlan = z.infer<typeof EditPlanSchema>;
 
 // ---------------------------------------------------------------------------
@@ -83,17 +133,24 @@ function normalizeEditPlan(raw: unknown): unknown {
         .filter((e: any) => e.oldText !== "" || e.newText !== ""); // drop empty edits
     }
 
-    // Normalize SchemaEdit fields
+    // Normalize SchemaEdit fields — do NOT default fieldName/fieldType;
+    // missing values must fail validation and trigger a retry.
     if (normalized.type === "schema") {
-      normalized.fieldName = normalized.fieldName ?? undefined;
-      normalized.newFieldName = normalized.newFieldName ?? undefined;
-      normalized.fieldType = normalized.fieldType ?? undefined;
-      normalized.newFieldType = normalized.newFieldType ?? undefined;
+      if (normalized.fieldName === null) normalized.fieldName = undefined;
+      if (normalized.newFieldName === null) normalized.newFieldName = undefined;
+      if (normalized.fieldType === null) normalized.fieldType = undefined;
+      if (normalized.newFieldType === null) normalized.newFieldType = undefined;
     }
 
     // Normalize CommandAction
     if (normalized.type === "command") {
       normalized.command = normalized.command ?? "";
+    }
+
+    // Normalize CreateFile entries
+    if (normalized.type === "create_file") {
+      normalized.content = normalized.content ?? "";
+      normalized.reason = normalized.reason ?? "";
     }
 
     return normalized;
@@ -120,6 +177,155 @@ export function validateEditPlan(raw: unknown): {
 }
 
 // ---------------------------------------------------------------------------
+// Syntax sanity check — lightweight parse-only validation for new files
+// ---------------------------------------------------------------------------
+
+import ts from "typescript";
+
+/**
+ * Check whether content is syntactically parseable as TypeScript/TSX.
+ * This is NOT a full type-check — just "is this valid syntax."
+ * Returns { ok: true } or { ok: false, reason: string }.
+ */
+export function checkSyntax(
+  content: string,
+  filePath: string
+): { ok: true } | { ok: false; reason: string } {
+  const ext = filePath.split(".").pop()?.toLowerCase() ?? "";
+  const isTsFile = ext === "ts" || ext === "tsx" || ext === "js" || ext === "jsx";
+  if (!isTsFile) return { ok: true }; // skip non-JS/TS files
+
+  const scriptKind = ext === "tsx"
+    ? ts.ScriptKind.TSX
+    : ext === "jsx"
+      ? ts.ScriptKind.JSX
+      : ext === "ts"
+        ? ts.ScriptKind.TS
+        : ts.ScriptKind.JS;
+
+  const sourceFile = ts.createSourceFile(
+    filePath,
+    content,
+    ts.ScriptTarget.Latest,
+    true,  // setParentNodes
+    scriptKind
+  );
+
+  // parseDiagnostics contains syntax/parse errors (not type errors)
+  const parseDiags = (sourceFile as any).parseDiagnostics as ts.Diagnostic[];
+  if (parseDiags.length > 0) {
+    const msg = parseDiags
+      .slice(0, 5)
+      .map((d) => {
+        const line = d.start !== undefined
+          ? sourceFile.getLineAndCharacterOfPosition(d.start).line + 1
+          : "?";
+        const msgText = ts.flattenDiagnosticMessageText(d.messageText, "\n");
+        return `  line ${line}: ${msgText}`;
+      })
+      .join("\n");
+    return { ok: false, reason: `Syntax errors in ${filePath}:\n${msg}` };
+  }
+  return { ok: true };
+}
+
+// ---------------------------------------------------------------------------
+// Query classification — detect single-step vs. multi-step before intent extraction
+// ---------------------------------------------------------------------------
+
+const StepSchema = z.object({
+  description: z.string().min(1),
+  kind: z.enum(["structural_edit", "new_file"]),
+});
+
+const ClassificationSchema = z.object({
+  decomposable: z.boolean(),
+  steps: z.array(StepSchema).min(1),
+});
+
+export type Step = z.infer<typeof StepSchema>;
+export type Classification = z.infer<typeof ClassificationSchema>;
+
+export function validateClassification(raw: unknown): {
+  ok: true;
+  classification: Classification;
+} | {
+  ok: false;
+  reason: string;
+} {
+  const result = ClassificationSchema.safeParse(raw);
+  if (result.success) {
+    return { ok: true, classification: result.data };
+  }
+  return {
+    ok: false,
+    reason: result.error.issues
+      .map((i) => `${i.path.join(".")}: ${i.message}`)
+      .join("; "),
+  };
+}
+
+const CLASSIFICATION_PROMPT = `You are a query classifier. Given a user's natural-language request about a codebase, determine whether it reduces to a SINGLE structural edit on an existing file/model, or whether it requires MULTIPLE steps (including creating files that don't exist yet).
+
+A "structural_edit" is a change to an existing file: adding/removing/renaming a field in a Prisma model, editing a route, modifying a component, etc.
+
+A "new_file" is creating a file that does not currently exist in the project.
+
+Return a JSON object with exactly this shape:
+{
+  "decomposable": true or false,
+  "steps": [
+    { "description": "<short imperative description>", "kind": "structural_edit" | "new_file" }
+  ]
+}
+
+RULES:
+- If the request is a SINGLE change to an existing file or model, set "decomposable" to false and "steps" to exactly one entry with kind "structural_edit".
+- If the request requires creating new files, setting up multiple routes, or combining several unrelated changes, set "decomposable" to true and list each step in order.
+- Steps that create a file that does not currently exist must have kind "new_file".
+- Steps that modify an existing file or Prisma model must have kind "structural_edit".
+- Keep descriptions short (under 15 words). Use imperative mood (e.g. "Add login route", "Rename field").
+- Order steps logically — prerequisites first.`;
+
+export async function classifyQuery(
+  query: string,
+  context: string
+): Promise<{ classification: Classification; raw: unknown }> {
+  const contents = `${CLASSIFICATION_PROMPT}\n\nUser request: ${query}\n\nProject context:\n${context}\n\nReturn ONLY a JSON object. No prose, no explanation.`;
+
+  const genPromise = generateCompletion(contents, { responseFormat: "json" });
+
+  const timeoutPromise = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error("Classification timed out after 15s")), 15_000)
+  );
+
+  const text = await Promise.race([genPromise, timeoutPromise]);
+  const raw = JSON.parse(text);
+  return { classification: raw as Classification, raw };
+}
+
+export async function classifyQueryWithRetry(
+  query: string,
+  context: string
+): Promise<Classification> {
+  const first = await classifyQuery(query, context);
+  const check = validateClassification(first.classification);
+  if (check.ok) return check.classification;
+
+  const retry = await classifyQuery(
+    `${query}\n\nPREVIOUS ATTEMPT FAILED VALIDATION: ${check.reason}\nFix the output and try again.`,
+    context
+  );
+  const retryCheck = validateClassification(retry.classification);
+  if (!retryCheck.ok) {
+    throw new Error(
+      `Classification failed validation after retry: ${retryCheck.reason}`
+    );
+  }
+  return retryCheck.classification;
+}
+
+// ---------------------------------------------------------------------------
 // Intent extraction — narrow LLM call, no code generation
 // ---------------------------------------------------------------------------
 
@@ -138,7 +344,7 @@ For schema changes (Prisma, database models):
   "newFieldType": "<new type, required for change_type>"
 }
 
-For code changes (routes, components, utilities):
+For code changes (routes, components, utilities — both NEW and EXISTING files):
 {
   "type": "file",
   "filePath": "<relative path to the file>",
@@ -161,7 +367,9 @@ RULES:
 - Return an ARRAY of operations. Each operation addresses exactly one thing the user asked for.
 - Make the MINIMAL change necessary. Do NOT propose edits outside what the operation describes.
 - If the request is ambiguous, choose the NARROWEST reasonable scope rather than reinterpreting the whole file.
-- For file edits, oldText must be a SMALL, UNIQUE snippet (2-10 lines) from the current file — enough to be unambiguous but no more.
+- For editing EXISTING files: oldText must be a SMALL, UNIQUE snippet (2-10 lines) from the current file.
+- For creating NEW files: use oldText = "" (empty string) and provide the COMPLETE file content in newText.
+- The system will detect oldText = "" and create the file automatically.
 - Never modify code or fields unrelated to the request.
 - If the user asks for multiple unrelated changes, return multiple separate operations.
 - For schema operations: only include the model and field that change. Do not describe the rest of the schema.`;
@@ -176,9 +384,6 @@ export async function extractIntent(
   /** Current schema.prisma source — needed so the LLM can reference exact field names. */
   schemaSource?: string
 ): Promise<{ plan: EditPlan; raw: unknown }> {
-  const apiKey = requireGeminiApiKey();
-  const ai = new GoogleGenAI({ apiKey });
-
   const userContent = [
     `User query: ${query}`,
     `\nProject context:\n${context}`,
@@ -188,62 +393,18 @@ export async function extractIntent(
     `\nReturn ONLY a JSON array of operations. No prose, no explanation.`,
   ].join("\n");
 
-  const genPromise = ai.models.generateContent({
-    model: "gemini-3.5-flash-lite",
-    contents: `${INTENT_EXTRACTION_PROMPT}\n\n${userContent}`,
-    config: {
-      thinkingConfig: { thinkingBudget: 4096 },
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: Type.ARRAY,
-        items: {
-          type: Type.OBJECT,
-          properties: {
-            type: { type: Type.STRING },
-            model: { type: Type.STRING },
-            op: { type: Type.STRING },
-            fieldName: { type: Type.STRING },
-            newFieldName: { type: Type.STRING },
-            fieldType: { type: Type.STRING },
-            newFieldType: { type: Type.STRING },
-            filePath: { type: Type.STRING },
-            edits: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  filePath: { type: Type.STRING },
-                  oldText: { type: Type.STRING },
-                  newText: { type: Type.STRING },
-                },
-              },
-            },
-            command: { type: Type.STRING },
-          },
-          propertyOrdering: [
-            "type",
-            "model",
-            "op",
-            "fieldName",
-            "newFieldName",
-            "fieldType",
-            "newFieldType",
-            "filePath",
-            "edits",
-            "command",
-          ],
-        },
-      },
-    },
-  });
+  const genPromise = generateCompletion(
+    `${INTENT_EXTRACTION_PROMPT}\n\n${userContent}`,
+    { responseFormat: "json" }
+  );
 
   const timeoutPromise = new Promise<never>((_, reject) =>
     setTimeout(() => reject(new Error("Intent extraction timed out after 30s")), 30_000)
   );
 
-  const response = await Promise.race([genPromise, timeoutPromise]);
+  const text = await Promise.race([genPromise, timeoutPromise]);
 
-  const raw = JSON.parse(response.text!);
+  const raw = JSON.parse(text);
   return { plan: raw as EditPlan, raw };
 }
 
@@ -517,9 +678,9 @@ For each operation in the plan, produce the actual code changes. You have three 
 
 2. FILE EDITS (type: "file"):
    For each file edit, you MUST:
-   - Read the "edits" array from the plan
-   - For each edit, produce the EXACT oldText (verbatim from the current file) and the newText (the minimal replacement)
-   - oldText must be a SMALL, UNIQUE snippet (2-10 lines) from the current file
+   - Check if the file exists in the project context
+   - If the file EXISTS: produce EXACT oldText (verbatim from the current file) and newText (minimal replacement). oldText must be a SMALL, UNIQUE snippet (2-10 lines).
+   - If the file does NOT exist (new file): use oldText = "" and provide the COMPLETE file content in newText
    - Do NOT modify any code outside the oldText/newText snippets
    - Do NOT add imports, exports, or code that wasn't in the original unless the operation explicitly requires it
 
@@ -530,8 +691,8 @@ CRITICAL RULES:
 - Make the MINIMAL change necessary to satisfy the request.
 - Do NOT modify code or fields unrelated to the request.
 - If the request is ambiguous, choose the NARROWEST reasonable scope.
-- Never regenerate an entire file. You produce ONLY targeted oldText/newText pairs.
-- For each file, the edits must be small, focused snippets — NOT the whole file content.
+- For EXISTING files: produce ONLY targeted oldText/newText pairs — NOT the whole file content.
+- For NEW files: produce the COMPLETE file content in newText with oldText = "".
 
 PRISMA RULES:
 - Do NOT modify or remove anything that Prisma generates by default.
@@ -569,9 +730,6 @@ export async function scopedCodeGen(
   plan: EditPlan,
   timeoutMs = 60_000
 ): Promise<EditPlan> {
-  const apiKey = requireGeminiApiKey();
-  const ai = new GoogleGenAI({ apiKey });
-
   const prompt = `${SCOPEDCodeGenPrompt}
 
 User query: ${query}
@@ -584,62 +742,15 @@ ${JSON.stringify(plan, null, 2)}
 
 Remember: for file edits, provide EXACT oldText (verbatim from current file) and newText (minimal replacement). For schema and command entries, pass them through as-is.`;
 
-  const genPromise = ai.models.generateContent({
-    model: "gemini-3.5-flash-lite",
-    contents: prompt,
-    config: {
-      thinkingConfig: { thinkingBudget: 20000 },
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: Type.ARRAY,
-        items: {
-          type: Type.OBJECT,
-          properties: {
-            type: { type: Type.STRING },
-            model: { type: Type.STRING },
-            op: { type: Type.STRING },
-            fieldName: { type: Type.STRING },
-            newFieldName: { type: Type.STRING },
-            fieldType: { type: Type.STRING },
-            newFieldType: { type: Type.STRING },
-            filePath: { type: Type.STRING },
-            edits: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  filePath: { type: Type.STRING },
-                  oldText: { type: Type.STRING },
-                  newText: { type: Type.STRING },
-                },
-              },
-            },
-            command: { type: Type.STRING },
-          },
-          propertyOrdering: [
-            "type",
-            "model",
-            "op",
-            "fieldName",
-            "newFieldName",
-            "fieldType",
-            "newFieldType",
-            "filePath",
-            "edits",
-            "command",
-          ],
-        },
-      },
-    },
-  });
+  const genPromise = generateCompletion(prompt, { responseFormat: "json" });
 
   const timeoutPromise = new Promise<never>((_, reject) =>
     setTimeout(() => reject(new Error(`LLM generation timed out after ${Math.round(timeoutMs / 1000)}s`)), timeoutMs)
   );
 
-  const response = await Promise.race([genPromise, timeoutPromise]);
+  const text = await Promise.race([genPromise, timeoutPromise]);
 
-  return JSON.parse(response.text!) as EditPlan;
+  return JSON.parse(text) as EditPlan;
 }
 
 /**
@@ -648,16 +759,18 @@ Remember: for file edits, provide EXACT oldText (verbatim from current file) and
 export async function scopedCodeGenWithRetry(
   query: string,
   context: string,
-  plan: EditPlan
+  plan: EditPlan,
+  timeoutMs = 120_000
 ): Promise<EditPlan> {
-  const first = await scopedCodeGen(query, context, plan);
+  const first = await scopedCodeGen(query, context, plan, timeoutMs);
   const check = validateEditPlan(first);
   if (check.ok) return check.plan;
 
   const retry = await scopedCodeGen(
     `${query}\n\nPREVIOUS OUTPUT FAILED VALIDATION: ${check.reason}\nFix the output and try again. Return ONLY valid JSON.`,
     context,
-    plan
+    plan,
+    timeoutMs
   );
   const retryCheck = validateEditPlan(retry);
   if (!retryCheck.ok) {

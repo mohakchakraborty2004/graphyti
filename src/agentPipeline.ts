@@ -5,8 +5,8 @@ import { ALLOWLIST_HELP, parseAllowedCommand } from "./utils/commandAllowlist";
 import { askConfirm } from "./utils/confirm";
 import { success, error, warn, info, sym, rule, bold } from "./cli/theme";
 import { renderDiff } from "./cli/renderDiff";
-import type { EditPlan, FileEdit, SchemaEdit, CommandAction } from "./generate/scopedEdit";
-import { applyScopedEdits, applySchemaEdit } from "./generate/scopedEdit";
+import type { EditPlan, FileEdit, SchemaEdit, CommandAction, CreateFile } from "./generate/scopedEdit";
+import { applyScopedEdits, applySchemaEdit, checkSyntax } from "./generate/scopedEdit";
 import { StaleEditError, AmbiguousEditError } from "./generate/scopedEdit";
 
 export { StaleEditError, AmbiguousEditError };
@@ -23,6 +23,10 @@ export interface WriteResult {
   executedCommands: string[];
   /** FileEdits that failed due to stale or ambiguous oldText — orchestrator retries once. */
   staleEdits: Array<{ edit: FileEdit; error: StaleEditError | AmbiguousEditError }>;
+  /** New files created by CreateFile operations. */
+  createdPaths: string[];
+  /** CreateFile operations that failed (file already exists or syntax error). */
+  createFailures: Array<{ edit: CreateFile; error: string }>;
 }
 
 function ensureDir(dirPath: string) {
@@ -116,6 +120,8 @@ export async function handleAgentOutput(
   const writtenPaths: string[] = [];
   const executedCommands: string[] = [];
   const staleEdits: WriteResult["staleEdits"] = [];
+  const createdPaths: string[] = [];
+  const createFailures: WriteResult["createFailures"] = [];
 
   // ── 1. FileEdit entries ─────────────────────────────────────────────
   for (const item of plan) {
@@ -196,7 +202,54 @@ export async function handleAgentOutput(
     }
   }
 
-  // ── 2. SchemaEdit entries ────────────────────────────────────────────
+  // ── 2. CreateFile entries ───────────────────────────────────────────
+  for (const item of plan) {
+    if (item.type !== "create_file") continue;
+    const createOp = item as CreateFile;
+
+    const absPath = path.isAbsolute(createOp.filePath)
+      ? createOp.filePath
+      : path.resolve(projectRoot, createOp.filePath);
+
+    if (dryRun) {
+      if (fs.existsSync(absPath)) {
+        console.error(`\n  ${error("✗")} ${absPath} ${error("already exists — cannot create")}`);
+      } else {
+        console.log(`\n  ${info("›")} ${absPath} ${info("(new file — syntax check pending)")}`);
+        const syntaxCheck = checkSyntax(createOp.content, createOp.filePath);
+        if (!syntaxCheck.ok) {
+          console.error(`    ${error("✗")} ${syntaxCheck.reason}`);
+        } else {
+          console.log(`    ${sym.ok} Syntax OK`);
+        }
+      }
+      continue;
+    }
+
+    // Actual write
+    if (fs.existsSync(absPath)) {
+      const msg = `File already exists — cannot create ${createOp.filePath}. The plan assumed this file did not exist (stale graph state or planning bug).`;
+      console.error(`    ${error("✗")} ${msg}`);
+      createFailures.push({ edit: createOp, error: msg });
+      continue;
+    }
+
+    // Syntax sanity check before writing
+    const syntaxCheck = checkSyntax(createOp.content, createOp.filePath);
+    if (!syntaxCheck.ok) {
+      console.error(`    ${error("✗")} ${syntaxCheck.reason}`);
+      createFailures.push({ edit: createOp, error: syntaxCheck.reason });
+      continue;
+    }
+
+    const dir = path.dirname(absPath);
+    ensureDir(dir);
+    fs.writeFileSync(absPath, createOp.content, "utf-8");
+    console.log(`    ${sym.ok} Created: ${absPath} ${info(`— ${createOp.reason}`)}`);
+    createdPaths.push(absPath);
+  }
+
+  // ── 3. SchemaEdit entries ────────────────────────────────────────────
   for (const item of plan) {
     if (item.type !== "schema") continue;
     const schemaEdit = item as SchemaEdit;
@@ -253,5 +306,5 @@ export async function handleAgentOutput(
     if (ran) executedCommands.push(ran);
   }
 
-  return { writtenPaths, executedCommands, staleEdits };
+  return { writtenPaths, executedCommands, staleEdits, createdPaths, createFailures };
 }
