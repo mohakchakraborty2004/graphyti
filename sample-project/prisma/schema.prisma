@@ -8,31 +8,32 @@ generator client {
 }
 
 model User {
-  id    Int    @id @default(autoincrement())
-  email String @unique
-  name  String?
-  posts Post[]
+  id       Int     @id @default(autoincrement())
+  email    String  @unique
+  name     String?
+  posts    Post[]
+  password String
 }
 
 model Post {
-  id        Int      @id @default(autoincrement())
+  id        Int       @id @default(autoincrement())
   title     String?
   headline  String?
   heading   String?
   content   String?
-  published Boolean  @default(false)
-  status    String?  @default("DRAFT")
-  priority  Int      @default(0)
+  published Boolean   @default(false)
+  status    String?   @default("DRAFT")
+  priority  Int       @default(0)
   authorId  Int?
-  author    User?    @relation(fields: [authorId], references: [id])
+  author    User?     @relation(fields: [authorId], references: [id])
   comments  Comment[]
 }
 
 model Comment {
-  id      Int    @id @default(autoincrement())
+  id      Int     @id @default(autoincrement())
   caption String?
   body    String?
   content String?
   postId  Int
-  post    Post   @relation(fields: [postId], references: [id])
+  post    Post    @relation(fields: [postId], references: [id])
 }

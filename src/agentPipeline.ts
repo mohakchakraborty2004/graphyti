@@ -4,27 +4,25 @@ import { spawnSync } from "child_process";
 import { ALLOWLIST_HELP, parseAllowedCommand } from "./utils/commandAllowlist";
 import { askConfirm } from "./utils/confirm";
 import { success, error, warn, info, sym, rule, bold } from "./cli/theme";
-import { renderFileDiff, renderDiff } from "./cli/renderDiff";
-import { structuralSchemaMerge } from "./graph/schemaMerge";
+import { renderDiff } from "./cli/renderDiff";
+import type { EditPlan, FileEdit, SchemaEdit, CommandAction } from "./generate/scopedEdit";
+import { applyScopedEdits, applySchemaEdit } from "./generate/scopedEdit";
+import { StaleEditError, AmbiguousEditError } from "./generate/scopedEdit";
 
-export interface mergeType {
-  code: string;
-}
+export { StaleEditError, AmbiguousEditError };
 
 export interface AgentOutputOptions {
   dryRun?: boolean;
   yes?: boolean;
-  /**
-   * Called before any command that uses spawnSync with stdio:"inherit".
-   * The caller should stop any active ora spinner here so it doesn't
-   * conflict with the child process's terminal I/O.
-   */
+  projectRoot?: string;
   onBeforeCommand?: () => void;
 }
 
 export interface WriteResult {
   writtenPaths: string[];
   executedCommands: string[];
+  /** FileEdits that failed due to stale or ambiguous oldText — orchestrator retries once. */
+  staleEdits: Array<{ edit: FileEdit; error: StaleEditError | AmbiguousEditError }>;
 }
 
 function ensureDir(dirPath: string) {
@@ -34,70 +32,6 @@ function ensureDir(dirPath: string) {
   }
 }
 
-/**
- * Write or merge a single file.
- * Returns the absolute path that was written, or null on dry-run.
- */
-async function writeFileSafe(
-  directory: string,
-  fileName: string,
-  content: string,
-  dryRun: boolean
-): Promise<string | null> {
-  const fullPath = path.join(directory, fileName);
-  const cleanedContent = content.replace(/\\n/g, "\n");
-
-  if (dryRun) {
-    const existingContent = fs.existsSync(fullPath) ? fs.readFileSync(fullPath, "utf-8") : null;
-    const diff = renderFileDiff(existingContent, cleanedContent, fullPath);
-    if (diff) {
-      console.log(`\n  ${bold(fullPath)}`);
-      console.log(diff);
-    } else {
-      console.log(`\n  ${info("›")} ${fullPath} ${info("(no changes)")}`);
-    }
-    return null;
-  }
-
-  if (!fs.existsSync(fullPath)) {
-    fs.writeFileSync(fullPath, cleanedContent, "utf-8");
-    console.log(`    ${sym.ok} Created: ${fullPath}`);
-  } else {
-    const existing = fs.readFileSync(fullPath, "utf-8");
-    let mergedContent: string;
-
-    if (fileName === "schema.prisma") {
-      // Structural merge for Prisma schemas — no LLM, no lost newlines
-      mergedContent = structuralSchemaMerge(existing, cleanedContent, fullPath, path.resolve(directory, ".."));
-      fs.writeFileSync(fullPath, mergedContent, "utf-8");
-      console.log(`    ${sym.ok} Updated: ${fullPath}`);
-    } else {
-      // For non-schema files, write the generated content directly
-      // (codeCombiner was causing duplicate accumulation and formatting issues)
-      mergedContent = cleanedContent;
-      fs.writeFileSync(fullPath, mergedContent, "utf-8");
-      console.log(`    ${sym.ok} Updated: ${fullPath}`);
-    }
-
-    // Show the diff for actual writes so the user sees what changed
-    const diff = renderDiff(existing, mergedContent, { header: fullPath });
-    if (diff) {
-      console.log();
-      console.log(diff);
-      console.log();
-    }
-  }
-  return fullPath;
-}
-
-/**
- * Run a single model-generated command.
- *
- * IMPORTANT: before calling spawnSync with stdio:"inherit", we MUST invoke
- * onBeforeCommand() so the caller can stop any active ora spinner — ora's
- * repaint timer conflicts with the child process's terminal I/O and causes
- * the process to hang.
- */
 async function runCommand(
   cmd: unknown,
   dryRun: boolean,
@@ -138,10 +72,6 @@ async function runCommand(
     }
   }
 
-  // ── Stop any active spinner BEFORE spawning — critical ────────────────
-  // spawnSync with stdio:"inherit" takes over the terminal. If ora's
-  // repaint timer fires while the child process owns stdio, the two fight
-  // over the terminal and the process hangs.
   if (onBeforeCommand) onBeforeCommand();
 
   const isWindows = process.platform === "win32";
@@ -165,39 +95,163 @@ async function runCommand(
 }
 
 /**
- * Write all file actions and run all command actions.
+ * Write all file actions and run all command actions from an EditPlan.
  *
- * File writes happen first (safe — no terminal I/O conflict).
- * Commands are run via spawnSync with stdio:"inherit", which requires any
- * active ora spinner to be paused first via onBeforeCommand.
+ * File writes happen first. For each FileEdit, reads the current on-disk
+ * content and applies scoped edits. If an edit fails due to stale or
+ * ambiguous oldText, it is collected in staleEdits (NOT thrown) so the
+ * orchestrator can implement one-retry-then-fail.
+ *
+ * SchemaEdit entries are applied deterministically via applySchemaEdit.
+ * CommandAction entries go through the existing allowlist + confirmation flow.
  */
 export async function handleAgentOutput(
-  actions: any[],
+  plan: EditPlan,
   options: AgentOutputOptions = {}
 ): Promise<WriteResult> {
   const dryRun = options.dryRun ?? false;
   const yes = options.yes ?? false;
+  const projectRoot = options.projectRoot ?? process.cwd();
   const onBeforeCommand = options.onBeforeCommand;
   const writtenPaths: string[] = [];
   const executedCommands: string[] = [];
+  const staleEdits: WriteResult["staleEdits"] = [];
 
-  // ── 1. Write files first (safe — no terminal conflict) ────────────────
-  for (const item of actions) {
-    if (item.type === "file") {
-      const fullDir = path.resolve(process.cwd(), item.directory);
-      if (!dryRun) ensureDir(fullDir);
-      const written = await writeFileSafe(fullDir, item.fileName, item.content, dryRun);
-      if (written) writtenPaths.push(written);
+  // ── 1. FileEdit entries ─────────────────────────────────────────────
+  for (const item of plan) {
+    if (item.type !== "file") continue;
+    const fileEdit = item as FileEdit;
+
+    const absPath = path.isAbsolute(fileEdit.filePath)
+      ? fileEdit.filePath
+      : path.resolve(projectRoot, fileEdit.filePath);
+
+    if (dryRun) {
+      if (fs.existsSync(absPath)) {
+        const currentContent = fs.readFileSync(absPath, "utf-8");
+        try {
+          const result = applyScopedEdits(currentContent, fileEdit.edits, fileEdit.filePath);
+          const diff = renderDiff(currentContent, result, { header: absPath });
+          if (diff) {
+            console.log(`\n  ${bold(absPath)}`);
+            console.log(diff);
+          } else {
+            console.log(`\n  ${info("›")} ${absPath} ${info("(no changes)")}`);
+          }
+        } catch (err) {
+          if (err instanceof StaleEditError || err instanceof AmbiguousEditError) {
+            console.error(`\n  ${error("✗")} ${err.message}`);
+            for (const f of err.failures) {
+              console.error(`    ${sym.bullet} ${f.filePath}: ${f.oldText}${f.count !== undefined ? ` (${f.count} matches)` : ""}`);
+            }
+          } else {
+            throw err;
+          }
+        }
+      } else {
+        console.log(`\n  ${info("›")} ${absPath} ${info("(new file)")}`);
+      }
+      continue;
+    }
+
+    // Actual write
+    const dir = path.dirname(absPath);
+    ensureDir(dir);
+
+    let currentContent: string;
+    if (fs.existsSync(absPath)) {
+      currentContent = fs.readFileSync(absPath, "utf-8");
+    } else {
+      if (fileEdit.edits.length === 1 && fileEdit.edits[0].oldText === "") {
+        fs.writeFileSync(absPath, fileEdit.edits[0].newText, "utf-8");
+        console.log(`    ${sym.ok} Created: ${absPath}`);
+        writtenPaths.push(absPath);
+        continue;
+      }
+      console.error(`    ${error("✗")} File does not exist and no creation edit: ${absPath}`);
+      continue;
+    }
+
+    try {
+      const mergedContent = applyScopedEdits(currentContent, fileEdit.edits, fileEdit.filePath);
+      fs.writeFileSync(absPath, mergedContent, "utf-8");
+      console.log(`    ${sym.ok} Updated: ${absPath}`);
+
+      const diff = renderDiff(currentContent, mergedContent, { header: absPath });
+      if (diff) {
+        console.log();
+        console.log(diff);
+        console.log();
+      }
+
+      writtenPaths.push(absPath);
+    } catch (err) {
+      if (err instanceof StaleEditError || err instanceof AmbiguousEditError) {
+        // Collect for retry — do NOT write anything for this file
+        console.error(`    ${error("✗")} ${err.message}`);
+        staleEdits.push({ edit: fileEdit, error: err });
+      } else {
+        throw err;
+      }
     }
   }
 
-  // ── 2. Run commands (onBeforeCommand pauses the spinner before each) ──
-  for (const item of actions) {
-    if (item.type === "command") {
-      const ran = await runCommand(item.command, dryRun, yes, onBeforeCommand);
-      if (ran) executedCommands.push(ran);
+  // ── 2. SchemaEdit entries ────────────────────────────────────────────
+  for (const item of plan) {
+    if (item.type !== "schema") continue;
+    const schemaEdit = item as SchemaEdit;
+
+    // Find schema.prisma
+    const candidates = [
+      path.join(projectRoot, "prisma", "schema.prisma"),
+      path.join(projectRoot, "schema.prisma"),
+    ];
+    const schemaPath = candidates.find((p) => fs.existsSync(p));
+    if (!schemaPath) {
+      console.error(`    ${error("✗")} No schema.prisma found for ${schemaEdit.op} on ${schemaEdit.model}`);
+      continue;
+    }
+    const relSchemaPath = path.relative(projectRoot, schemaPath);
+
+    if (dryRun) {
+      console.log(`\n  ${bold(relSchemaPath)} — schema edit: ${schemaEdit.op} on ${schemaEdit.model}.${schemaEdit.fieldName ?? ""}`);
+      if (schemaEdit.op === "add_field") {
+        console.log(`    ${info("+")} ${schemaEdit.model}.${schemaEdit.fieldName} ${schemaEdit.fieldType}`);
+      } else if (schemaEdit.op === "remove_field") {
+        console.log(`    ${error("−")} ${schemaEdit.model}.${schemaEdit.fieldName} removed`);
+      } else if (schemaEdit.op === "rename_field") {
+        console.log(`    ${info("~")} ${schemaEdit.model}.${schemaEdit.fieldName} → ${schemaEdit.newFieldName}`);
+      } else if (schemaEdit.op === "change_type") {
+        console.log(`    ${info("~")} ${schemaEdit.model}.${schemaEdit.fieldName}: ${schemaEdit.fieldType} → ${schemaEdit.newFieldType}`);
+      }
+      continue;
+    }
+
+    const existing = fs.readFileSync(schemaPath, "utf-8");
+    try {
+      const result = applySchemaEdit(existing, schemaEdit, schemaPath, projectRoot);
+      console.log(`    ${sym.ok} Schema updated: ${relSchemaPath} (${schemaEdit.op} on ${schemaEdit.model})`);
+
+      const diff = renderDiff(existing, result, { header: relSchemaPath });
+      if (diff) {
+        console.log();
+        console.log(diff);
+        console.log();
+      }
+
+      writtenPaths.push(schemaPath);
+    } catch (err) {
+      console.error(`    ${error("✗")} Schema edit failed: ${err instanceof Error ? err.message : err}`);
     }
   }
 
-  return { writtenPaths, executedCommands };
+  // ── 3. CommandAction entries ─────────────────────────────────────────
+  for (const item of plan) {
+    if (item.type !== "command") continue;
+    const cmd = item as CommandAction;
+    const ran = await runCommand(cmd.command, dryRun, yes, onBeforeCommand);
+    if (ran) executedCommands.push(ran);
+  }
+
+  return { writtenPaths, executedCommands, staleEdits };
 }
