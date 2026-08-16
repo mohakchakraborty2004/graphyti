@@ -40,7 +40,7 @@ const KEYS = [
   "HYDRA_DB_API_KEY",
   "HYDRA_DB_DATABASE",
   "HYDRA_DB_COLLECTION",
-  "GEMINI_API_KEY",
+  "OPENROUTER_API_KEY",
 ] as const;
 
 type EnvState = Partial<Record<(typeof KEYS)[number], string>>;
@@ -62,7 +62,7 @@ const FULL_ENV: EnvState = {
   HYDRA_DB_API_KEY: "hydra-key-abc123",
   HYDRA_DB_DATABASE: "graphyti_db",
   HYDRA_DB_COLLECTION: "code_graph",
-  GEMINI_API_KEY: "gemini-key-xyz789",
+  OPENROUTER_API_KEY: "openrouter-key-xyz789",
 };
 
 // ---------------------------------------------------------------------------
@@ -194,7 +194,7 @@ for (const [label, value] of [
 console.log("\n=== requireHydraConfig: MISSING ===");
 
 {
-  const config = freshConfig({ HYDRA_DB_DATABASE: "d", GEMINI_API_KEY: "g" });
+  const config = freshConfig({ HYDRA_DB_DATABASE: "d", OPENROUTER_API_KEY: "o" });
   const err = captureThrow(() => config.requireHydraConfig());
   check(
     "missing API key throws and names it",
@@ -209,7 +209,7 @@ console.log("\n=== requireHydraConfig: MISSING ===");
 }
 
 {
-  const config = freshConfig({ HYDRA_DB_API_KEY: "k", GEMINI_API_KEY: "g" });
+  const config = freshConfig({ HYDRA_DB_API_KEY: "k", OPENROUTER_API_KEY: "o" });
   const err = captureThrow(() => config.requireHydraConfig());
   check(
     "missing database throws and names it",
@@ -264,43 +264,43 @@ console.log("\n=== requireHydraConfig: MISSING ===");
 }
 
 // ---------------------------------------------------------------------------
-// 5. requireGeminiApiKey
+// 5. requireOpenRouterApiKey
 // ---------------------------------------------------------------------------
 
-console.log("\n=== requireGeminiApiKey ===");
+console.log("\n=== requireOpenRouterApiKey ===");
 
 {
   const config = freshConfig(FULL_ENV);
   check(
     "returns the key when set",
-    config.requireGeminiApiKey() === "gemini-key-xyz789",
-    JSON.stringify(config.requireGeminiApiKey())
+    config.requireOpenRouterApiKey() === "openrouter-key-xyz789",
+    JSON.stringify(config.requireOpenRouterApiKey())
   );
 }
 
 {
   const config = freshConfig({ HYDRA_DB_API_KEY: "k", HYDRA_DB_DATABASE: "d" });
-  const err = captureThrow(() => config.requireGeminiApiKey());
+  const err = captureThrow(() => config.requireOpenRouterApiKey());
   check(
-    "missing key throws and names GEMINI_API_KEY",
-    err !== null && /GEMINI_API_KEY/.test(err.message),
+    "missing key throws and names OPENROUTER_API_KEY",
+    err !== null && /OPENROUTER_API_KEY/.test(err.message),
     `err=${err?.message}`
   );
 }
 
 {
-  // Hydra credentials being present must not make the Gemini check pass, and
+  // Hydra credentials being present must not make the OpenRouter check pass, and
   // vice versa — they are independent gates.
-  const config = freshConfig({ GEMINI_API_KEY: "g" });
+  const config = freshConfig({ OPENROUTER_API_KEY: "o" });
   check(
-    "Gemini key alone does not satisfy the Hydra gate",
+    "OpenRouter key alone does not satisfy the Hydra gate",
     captureThrow(() => config.requireHydraConfig()) !== null,
     "requireHydraConfig did not throw"
   );
   check(
-    "…and the Gemini gate still passes",
-    config.requireGeminiApiKey() === "g",
-    "requireGeminiApiKey failed"
+    "…and the OpenRouter gate still passes",
+    config.requireOpenRouterApiKey() === "o",
+    "requireOpenRouterApiKey failed"
   );
 }
 
@@ -315,12 +315,12 @@ console.log("\n=== configSummary ===");
   const summary = config.configSummary();
   check(
     "no secret value appears in the summary",
-    !summary.includes("hydra-key-abc123") && !summary.includes("gemini-key-xyz789"),
+    !summary.includes("hydra-key-abc123") && !summary.includes("openrouter-key-xyz789"),
     `summary=${summary}`
   );
   check(
     "secrets are reported as set/MISSING",
-    /HYDRA_DB_API_KEY=set/.test(summary) && /GEMINI_API_KEY=set/.test(summary),
+    /HYDRA_DB_API_KEY=set/.test(summary) && /OPENROUTER_API_KEY=set/.test(summary),
     `summary=${summary}`
   );
   check(
@@ -335,7 +335,7 @@ console.log("\n=== configSummary ===");
   const summary = config.configSummary();
   check(
     "missing secrets are flagged MISSING",
-    /HYDRA_DB_API_KEY=MISSING/.test(summary) && /GEMINI_API_KEY=MISSING/.test(summary),
+    /HYDRA_DB_API_KEY=MISSING/.test(summary) && /OPENROUTER_API_KEY=MISSING/.test(summary),
     `summary=${summary}`
   );
   check(
