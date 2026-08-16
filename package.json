@@ -6,10 +6,15 @@
     "graphyti": "./dist/index.js"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "npm run test:commands && npm run test:pipeline && npm run test:config && npm run test:docs",
     "dev": "ts-node src/index.ts",
     "build": "tsc",
+    "relink" : "npm unlink -g graphyti && npm run build && npm link ",
     "extract:test": "tsx src/extract/test-extract.ts",
+    "test:commands": "tsx src/scripts/test-command-allowlist.ts",
+    "test:pipeline": "tsx src/scripts/test-pipeline.ts",
+    "test:config": "tsx src/scripts/test-config.ts",
+    "test:docs": "tsx src/scripts/test-docs.ts",
     "init-graph": "tsx src/index.ts init-graph"
   },
   "keywords": [],
@@ -24,7 +29,7 @@
     "@types/dotenv": "^6.1.1",
     "@types/fs-extra": "^11.0.4",
     "@types/node": "^24.13.3",
-    "chalk": "^5.4.1",
+    "chalk": "^4.1.2",
     "commander": "^14.0.3",
     "dotenv": "^17.4.2",
     "fs-extra": "^11.3.0",
@@ -35,6 +40,7 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@types/diff": "^7.0.2",
     "tsx": "^4.23.12"
   }
 }

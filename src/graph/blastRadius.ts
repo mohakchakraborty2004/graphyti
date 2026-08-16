@@ -1,7 +1,9 @@
 import * as path from "path";
 import { HydraDBError } from "@hydradb/sdk";
 import { loadGraphMap, type GraphMap, type GraphMapEntry } from "./ingest";
-import { client, DATABASE, COLLECTION } from "./hydraClient";
+import { client } from "./hydraClient";
+import { requireHydraConfig } from "../config";
+import { success, warn, info, sym, accent, bold, visLen, pad } from "../cli/theme";
 
 // ---------------------------------------------------------------------------
 // Result types
@@ -11,8 +13,7 @@ export interface AffectedNode {
   id: string;
   name: string;
   filePath: string;
-  reason: string;   // human-readable: edge kind + node names, e.g.
-                    // "PostCard.tsx renders Post.title via /api/posts"
+  reason: string;
 }
 
 export interface BlastRadiusResult {
@@ -23,15 +24,9 @@ export interface BlastRadiusResult {
 }
 
 // ---------------------------------------------------------------------------
-// Reason-string helpers (edge kind → prose)
+// Reason-string helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Build a human-readable reason for why `neighborId` is affected by a change
- * to `originId`, given that `neighborEntry` was reached via an edge from
- * `originEntry`.  We reconstruct the edge direction from id prefixes because
- * the graph-map stores outgoing edges only.
- */
 function buildReason(
   originId: string,
   originEntry: GraphMapEntry,
@@ -41,77 +36,55 @@ function buildReason(
   const oKind = originEntry.kind;
   const nKind = neighborEntry.kind;
 
-  // Model → Field
   if (oKind === "PrismaModel" && nKind === "ModelField") {
     return `${neighborEntry.name} is a field on model ${originEntry.name}`;
   }
-  // Field → Model (relation)
   if (oKind === "ModelField" && nKind === "PrismaModel") {
     return `${originEntry.name} has a relation to model ${neighborEntry.name}`;
   }
-  // Route → Model / Field
   if (oKind === "ApiRoute" && nKind === "PrismaModel") {
     return `${originEntry.name} queries model ${neighborEntry.name}`;
   }
   if (oKind === "ApiRoute" && nKind === "ModelField") {
     return `route ${originEntry.name} uses field ${neighborEntry.name}`;
   }
-  // Component → Route / Field
   if (oKind === "Component" && nKind === "ApiRoute") {
     return `${originEntry.name} fetches data via ${neighborEntry.name}`;
   }
   if (oKind === "Component" && nKind === "ModelField") {
     return `${originEntry.name} renders field ${neighborEntry.name}`;
   }
-  // Anything → anything (reverse walk — a route/component has originId as a neighbor)
   if (nKind === "ApiRoute") {
     return `${neighborEntry.name} uses ${originEntry.name}`;
   }
   if (nKind === "Component") {
     return `${neighborEntry.name} depends on ${originEntry.name}`;
   }
-  // File imports
   if (nKind === "File") {
     return `${neighborEntry.name} imports from ${originEntry.name}`;
   }
   return `${neighborEntry.name} is connected to ${originEntry.name}`;
 }
 
-/**
- * Build a richer reason for a node reached via a multi-hop path.
- * pathIds is [changedNodeId, hop1, hop2, ..., nodeId].
- */
 function buildChainReason(pathIds: string[], map: GraphMap): string {
   const names = pathIds
     .map((id) => map[id]?.name ?? id)
     .filter(Boolean);
   if (names.length <= 1) return `directly affected`;
   if (names.length === 2) return buildReason(pathIds[0], map[pathIds[0]], pathIds[1], map[pathIds[1]]);
-  // Multi-hop: "A → B → C"
   return names.join(" → ");
 }
 
 // ---------------------------------------------------------------------------
-// BFS over the local graph-map (primary path, no network)
+// BFS over the local graph-map
 // ---------------------------------------------------------------------------
 
 const MAX_HOPS = 3;
 
-/**
- * BFS outward from `startId` through the graph-map adjacency, up to MAX_HOPS
- * deep.  Returns every reachable node id → the path taken to reach it (so we
- * can build a reason string).
- *
- * The graph-map stores outgoing edges only (model → fields, route → models,
- * component → routes/fields).  To catch "what routes USE this model?" we also
- * build a reverse index so that changes to a model surface upstream routes and
- * components.
- */
 function bfsReachable(
   startId: string,
   map: GraphMap
 ): Map<string, string[]> {
-  // Build reverse adjacency: target → [sources that point to it]
   const reverse = new Map<string, string[]>();
   for (const [id, entry] of Object.entries(map)) {
     for (const target of entry.edges) {
@@ -120,7 +93,7 @@ function bfsReachable(
     }
   }
 
-  const visited = new Map<string, string[]>(); // id → path from startId
+  const visited = new Map<string, string[]>();
   visited.set(startId, [startId]);
 
   const queue: Array<{ id: string; path: string[]; hops: number }> = [
@@ -134,9 +107,7 @@ function bfsReachable(
     const entry = map[id];
     if (!entry) continue;
 
-    // Forward edges (e.g. model → fields, component → routes)
     const forward = entry.edges ?? [];
-    // Reverse edges (e.g. routes that point at this model, components that point at this route)
     const backward = reverse.get(id) ?? [];
 
     for (const neighborId of [...forward, ...backward]) {
@@ -148,7 +119,7 @@ function bfsReachable(
     }
   }
 
-  visited.delete(startId); // don't include the changed node itself
+  visited.delete(startId);
   return visited;
 }
 
@@ -161,29 +132,34 @@ async function checkHydraConsistency(
   localNeighborIds: Set<string>
 ): Promise<void> {
   try {
-    const envelope = await client.context.relations({
-      database: DATABASE,
-      collection: COLLECTION || undefined,
-      id: changedNodeId,
-      type: "knowledge",
-    });
+    const { database, collection } = requireHydraConfig();
+
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("HydraDB relations request timed out")), 10_000)
+    );
+
+    const envelope = await Promise.race([
+      client.context.relations({
+        database,
+        collection,
+        id: changedNodeId,
+        type: "knowledge",
+      }),
+      timeoutPromise,
+    ]);
 
     if (!envelope.data?.relations) return;
 
-    // Collect the set of neighbor ids HydraDB knows about for this node
     const hydraIds = new Set<string>();
     for (const triplet of envelope.data.relations) {
       if (triplet.source?.entityId) hydraIds.add(triplet.source.entityId);
       if (triplet.target?.entityId) hydraIds.add(triplet.target.entityId);
     }
-    hydraIds.delete(changedNodeId); // exclude self
+    hydraIds.delete(changedNodeId);
 
-    // Direct neighbors only (hop-1) for the comparison
     const localDirect = new Set(
       (Object.entries(Object.fromEntries([[changedNodeId, { edges: [] as string[] }]]))[0]?.[1]?.edges ?? [])
     );
-    // Actually get direct neighbors from the map — pass them in via closure below
-    // (this function is called with localNeighborIds = direct neighbors of changedNodeId)
 
     const onlyLocal: string[] = [];
     const onlyHydra: string[] = [];
@@ -197,18 +173,18 @@ async function checkHydraConsistency(
 
     if (onlyLocal.length === 0 && onlyHydra.length === 0) {
       console.log(
-        `  ✅ [HydraDB consistency] local graph and HydraDB agree on neighbors of ${changedNodeId}`
+        `  ${sym.ok} ${info("[HydraDB]")} local graph and HydraDB agree on neighbors of ${changedNodeId}`
       );
     } else {
       if (onlyLocal.length > 0) {
         console.warn(
-          `  ⚠️  [HydraDB consistency] local graph has neighbors not in HydraDB for ${changedNodeId}: ${onlyLocal.join(", ")}`
+          `  ${warn("!")} ${info("[HydraDB]")} local graph has neighbors not in HydraDB for ${changedNodeId}: ${onlyLocal.join(", ")}`
         );
         console.warn(`      (run 'dbagent init-graph' to sync)`);
       }
       if (onlyHydra.length > 0) {
         console.warn(
-          `  ⚠️  [HydraDB consistency] HydraDB has neighbors not in local graph for ${changedNodeId}: ${onlyHydra.join(", ")}`
+          `  ${warn("!")} ${info("[HydraDB]")} HydraDB has neighbors not in local graph for ${changedNodeId}: ${onlyHydra.join(", ")}`
         );
       }
     }
@@ -220,12 +196,11 @@ async function checkHydraConsistency(
         err.rawResponse?.headers?.get("X-Request-Id") ??
         "unknown";
       console.warn(
-        `  ⚠️  [HydraDB consistency] check skipped — error_code=${code} request_id=${reqId}: ${err.message}`
+        `  ${warn("!")} ${info("[HydraDB]")} check skipped — error_code=${code} request_id=${reqId}: ${err.message}`
       );
     } else {
-      console.warn(`  ⚠️  [HydraDB consistency] check skipped — unexpected error:`, err);
+      console.warn(`  ${warn("!")} ${info("[HydraDB]")} check skipped — unexpected error:`, err);
     }
-    // Non-blocking: primary path is the local graph, so we continue regardless.
   }
 }
 
@@ -233,16 +208,6 @@ async function checkHydraConsistency(
 // Public API
 // ---------------------------------------------------------------------------
 
-/**
- * Compute the blast radius of a change to `changedNodeId`.
- *
- * Primary path: local BFS over .dbagent/graph-map.json (fast, no network).
- * Secondary: calls HydraDB relations() for the changed node's direct neighbors
- * and logs a consistency warning if there's a mismatch — non-blocking.
- *
- * @param changedNodeId - Graph node id, e.g. "model:Post" or "field:Post.title"
- * @param projectRoot   - Repo root (defaults to cwd)
- */
 export async function computeBlastRadius(
   changedNodeId: string,
   projectRoot: string = process.cwd()
@@ -251,7 +216,6 @@ export async function computeBlastRadius(
 
   const changedEntry = map[changedNodeId];
   if (!changedEntry) {
-    // Node not in graph — return empty result, not an error
     return {
       changedNode: { id: changedNodeId, name: changedNodeId, kind: "unknown", filePath: "" },
       affectedRoutes: [],
@@ -260,24 +224,11 @@ export async function computeBlastRadius(
     };
   }
 
-  // -------------------------------------------------------------------------
-  // 1. BFS — collect all reachable nodes and their paths
-  // -------------------------------------------------------------------------
   const reachable = bfsReachable(changedNodeId, map);
-
-  // Direct neighbors for the HydraDB consistency check
   const directNeighborIds = new Set(changedEntry.edges);
 
-  // -------------------------------------------------------------------------
-  // 2. HydraDB consistency check (fire-and-forget warn, non-blocking)
-  // -------------------------------------------------------------------------
-  // Don't await here — we run it in parallel with classifying results but
-  // still log before returning.
   const consistencyCheck = checkHydraConsistency(changedNodeId, directNeighborIds);
 
-  // -------------------------------------------------------------------------
-  // 3. Classify reachable nodes into buckets
-  // -------------------------------------------------------------------------
   const affectedRoutes: AffectedNode[] = [];
   const affectedComponents: AffectedNode[] = [];
   const affectedFiles: AffectedNode[] = [];
@@ -285,8 +236,6 @@ export async function computeBlastRadius(
   for (const [nodeId, pathIds] of reachable.entries()) {
     const entry = map[nodeId];
     if (!entry) continue;
-    // Don't include the changed node itself or its own kind=PrismaModel/ModelField siblings
-    // (those are already captured in the changedNode; we want downstream consumers)
 
     const reason = buildChainReason(pathIds, map);
 
@@ -307,12 +256,9 @@ export async function computeBlastRadius(
       case "File":
         affectedFiles.push(affected);
         break;
-      // ModelField and PrismaModel siblings are intentionally omitted from the
-      // output buckets — they're schema peers, not downstream consumers.
     }
   }
 
-  // Wait for the consistency check to finish logging before we return
   await consistencyCheck;
 
   return {
@@ -329,13 +275,46 @@ export async function computeBlastRadius(
 }
 
 // ---------------------------------------------------------------------------
-// CLI summary formatter (used by preWriteCheck and --dry-run)
+// CLI tree formatter — clean indented tree view
 // ---------------------------------------------------------------------------
 
+function formatNodeGroup(
+  label: string,
+  nodes: AffectedNode[],
+  colWidth: number
+): string[] {
+  if (nodes.length === 0) return [];
+  const lines: string[] = [];
+  lines.push(`  ${bold(label)}`);
+  for (const n of nodes) {
+    const nameCol = pad(accent(n.name), colWidth);
+    lines.push(`    ${sym.bullet} ${nameCol}  ${info(n.filePath)}`);
+    lines.push(`      ${info(n.reason)}`);
+  }
+  return lines;
+}
+
+/**
+ * Format blast-radius as a compact, scannable tree view.
+ *
+ * Output style:
+ *   Model: Post (PrismaModel)
+ *   prisma/schema.prisma
+ *
+ *   Routes
+ *     › /api/posts     src/app/api/posts/route.ts
+ *       queries model Post
+ *   Components
+ *     › PostCard.tsx    components/PostCard.tsx
+ *       renders field Post.title
+ */
 export function formatBlastRadius(result: BlastRadiusResult): string {
   const lines: string[] = [];
-  lines.push(`\n🔥 Blast radius for change to: ${result.changedNode.name} (${result.changedNode.kind})`);
-  lines.push(`   ${result.changedNode.filePath}`);
+
+  lines.push(
+    `  ${info("Model:")} ${accent(result.changedNode.name)} ${info(`(${result.changedNode.kind})`)}`
+  );
+  lines.push(`  ${info(result.changedNode.filePath)}`);
 
   const total =
     result.affectedRoutes.length +
@@ -343,39 +322,21 @@ export function formatBlastRadius(result: BlastRadiusResult): string {
     result.affectedFiles.length;
 
   if (total === 0) {
-    lines.push("   No downstream dependents found in the graph.");
+    lines.push(`  ${info("No downstream dependents found in the graph.")}`);
     return lines.join("\n");
   }
 
-  if (result.affectedRoutes.length > 0) {
-    lines.push("\n   Affected API routes:");
-    for (const n of result.affectedRoutes) {
-      lines.push(`     • ${n.name}  (${n.filePath})`);
-      lines.push(`       ↳ ${n.reason}`);
-    }
-  }
-  if (result.affectedComponents.length > 0) {
-    lines.push("\n   Affected components:");
-    for (const n of result.affectedComponents) {
-      lines.push(`     • ${n.name}  (${n.filePath})`);
-      lines.push(`       ↳ ${n.reason}`);
-    }
-  }
-  if (result.affectedFiles.length > 0) {
-    lines.push("\n   Affected files:");
-    for (const n of result.affectedFiles) {
-      lines.push(`     • ${n.name}  (${n.filePath})`);
-      lines.push(`       ↳ ${n.reason}`);
-    }
-  }
+  // Calculate column width for aligned name column
+  const allNodes = [...result.affectedRoutes, ...result.affectedComponents, ...result.affectedFiles];
+  const colWidth = Math.min(28, Math.max(12, ...allNodes.map((n) => visLen(n.name))));
+
+  lines.push(...formatNodeGroup("Routes", result.affectedRoutes, colWidth));
+  lines.push(...formatNodeGroup("Components", result.affectedComponents, colWidth));
+  lines.push(...formatNodeGroup("Files", result.affectedFiles, colWidth));
 
   return lines.join("\n");
 }
 
-/**
- * Render the blast-radius result as a compact instruction string to inject
- * into the code-generation prompt.
- */
 export function blastRadiusPromptSection(result: BlastRadiusResult): string {
   const total =
     result.affectedRoutes.length +

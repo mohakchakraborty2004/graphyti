@@ -12,8 +12,10 @@ import {
   type GraphMap,
   type GraphMapEntry,
 } from "./ingest";
-import { client, COLLECTION, DATABASE, hydraErrorMessage, waitForIndexed } from "./hydraClient";
+import { client, hydraErrorMessage, waitForIndexed } from "./hydraClient";
+import { requireHydraConfig } from "../config";
 import { HydraDBError } from "@hydradb/sdk";
+import { info, sym } from "../cli/theme";
 
 function entriesEqual(a: GraphMapEntry, b: GraphMapEntry): boolean {
   return (
@@ -32,6 +34,7 @@ function ownedIds(map: GraphMap, filePath: string): string[] {
 }
 
 export async function reingestFile(filePath: string, projectRoot: string): Promise<void> {
+  const { database, collection } = requireHydraConfig();
   const absRoot = path.resolve(projectRoot);
   const absFile = path.isAbsolute(filePath) ? path.resolve(filePath) : path.resolve(absRoot, filePath);
   const rel = toPosix(path.relative(absRoot, absFile));
@@ -55,7 +58,7 @@ export async function reingestFile(filePath: string, projectRoot: string): Promi
   });
 
   console.log(
-    `[reingest] ${rel}: ${toUpsert.length} upsert, ${toDelete.length} delete, ${extracted.nodes.length} current nodes`
+    `  ${info("›")} ${rel}: ${toUpsert.length} upsert, ${toDelete.length} delete, ${extracted.nodes.length} current nodes`
   );
 
   if (toDelete.length > 0) {
@@ -75,8 +78,8 @@ export async function reingestFile(filePath: string, projectRoot: string): Promi
     try {
       envelope = await client.context.ingest({
         type: "knowledge",
-        database: DATABASE,
-        collection: COLLECTION || undefined,
+        database,
+        collection,
         upsert: "true",
         appKnowledge: JSON.stringify(items),
       });
@@ -109,8 +112,8 @@ export async function reingestFile(filePath: string, projectRoot: string): Promi
 
   saveGraphMap(absRoot, map);
   if (ingestedIds.length > 0) {
-    console.log(`[reingest] waiting for indexing of ${ingestedIds.length} ids`);
+    console.log(`  ${info("›")} Waiting for indexing of ${ingestedIds.length} ids`);
     await waitForIndexed(ingestedIds);
   }
-  console.log(`[reingest] ${rel} done`);
+  console.log(`  ${sym.ok} ${rel} done`);
 }

@@ -1,7 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as readline from "readline";
-import { loadGraphMap } from "../graph/ingest";
 import { extractPrismaSchemaFromSource, type PrismaExtractResult } from "../extract/prismaExtractor";
 import type { ModelField } from "../extract/types";
 import {
@@ -10,6 +9,7 @@ import {
   blastRadiusPromptSection,
   type BlastRadiusResult,
 } from "../graph/blastRadius";
+import { success, error, warn, info, sym, bold } from "../cli/theme";
 
 // ---------------------------------------------------------------------------
 // Public-facing types
@@ -47,13 +47,13 @@ interface FieldChange {
   modelName: string;
   fieldName: string;
   kind: ChangeKind;
-  detail: string; // e.g. "added", "removed", "type String→Int", "renamed title→heading"
+  detail: string;
 }
 
 interface SchemaDiff {
   breaking: FieldChange[];
   additive: FieldChange[];
-  /** model:X ids for every model that has at least one BREAKING change */
+  /** Model ids for every model that has at least one BREAKING change */
   affectedModelIds: string[];
 }
 
@@ -64,9 +64,10 @@ interface SchemaDiff {
 /**
  * A generated schema is plausible only if it has at least as many models as
  * the one on disk. Fewer models means the LLM produced a truncated or
- * malformed schema — treat this as a parse failure rather than interpreting
- * every missing model's fields as "removed", which would flood breakingFieldNames
- * with every field in the database and trigger a full-codebase blast radius.
+ * malformed schema — treat this as a parse failure.
+ *
+ * Relaxed: we still run the diff even when models are equal count (the common
+ * rename case). Only bail on gross truncation (< old count).
  */
 function isPlausibleNewSchema(
   oldParsed: PrismaExtractResult,
@@ -76,41 +77,63 @@ function isPlausibleNewSchema(
 }
 
 // ---------------------------------------------------------------------------
-// Field-level diff
+// Bidirectional field-level diff
+//
+// For each model we compute three sets:
+//   addedFields   — present in new, absent from old  (ADDITIVE)
+//   removedFields — present in old, absent from new  (BREAKING)
+//   typeChanges   — present in both, type differs    (BREAKING)
+//
+// When removedFields is non-empty we treat the entire model as BREAKING
+// regardless of what was added at the same time, because removals are
+// what consumers break on. This catches renames (old gone + new present).
 // ---------------------------------------------------------------------------
 
-/**
- * Diff two field lists for a single model.
- * Key by fieldName — a missing key is a removal/addition, a changed type is breaking.
- * We intentionally do NOT diff optionality or @default changes because those are
- * non-breaking from the perspective of existing code that reads the field.
- */
+interface FieldDiffResult {
+  breaking: FieldChange[];
+  additive: FieldChange[];
+}
+
 function diffPrismaFields(
   modelName: string,
   before: ModelField[],
   after: ModelField[]
-): { breaking: FieldChange[]; additive: FieldChange[] } {
+): FieldDiffResult {
   const breaking: FieldChange[] = [];
   const additive: FieldChange[] = [];
 
   const beforeMap = new Map(before.map((f) => [f.fieldName, f]));
   const afterMap  = new Map(after.map((f)  => [f.fieldName, f]));
 
-  // Fields present in after but not before → ADDITIVE
-  for (const [name, af] of afterMap) {
-    if (!beforeMap.has(name)) {
-      additive.push({ modelName, fieldName: name, kind: "ADDITIVE", detail: "added" });
-    }
-  }
-
-  // Fields present in before but not after → BREAKING (removed)
+  // ── 1. Removed fields (BREAKING) ──────────────────────────────────────
+  // Fields in old but not in new. This is the primary breaking signal —
+  // any consumer referencing the old field name will break.
   for (const [name, bf] of beforeMap) {
     if (!afterMap.has(name)) {
-      breaking.push({ modelName, fieldName: name, kind: "BREAKING", detail: "removed" });
+      breaking.push({
+        modelName,
+        fieldName: name,
+        kind: "BREAKING",
+        detail: "removed",
+      });
     }
   }
 
-  // Fields present in both — check type change (breaking), ignore optionality/list changes
+  // ── 2. Added fields (ADDITIVE) ────────────────────────────────────────
+  // Fields in new but not in old. Additive by themselves, but when
+  // combined with removals in the same model it signals a rename.
+  for (const [name, af] of afterMap) {
+    if (!beforeMap.has(name)) {
+      additive.push({
+        modelName,
+        fieldName: name,
+        kind: "ADDITIVE",
+        detail: "added",
+      });
+    }
+  }
+
+  // ── 3. Type changes on existing fields (BREAKING) ─────────────────────
   for (const [name, bf] of beforeMap) {
     const af = afterMap.get(name);
     if (!af) continue; // already recorded as removed above
@@ -119,7 +142,7 @@ function diffPrismaFields(
         modelName,
         fieldName: name,
         kind: "BREAKING",
-        detail: `type ${bf.type}→${af.type}`,
+        detail: `type ${bf.type} → ${af.type}`,
       });
     }
   }
@@ -131,15 +154,6 @@ function diffPrismaFields(
 // Schema-level diff: read old from disk, parse new from the pending content
 // ---------------------------------------------------------------------------
 
-/**
- * For a pending file write item that touches a Prisma schema:
- *   - Read the existing file from disk (if it exists)
- *   - Parse both old and new with extractPrismaSchemaFromSource
- *   - Diff every model's fields
- *   - Return a SchemaDiff with breaking/additive changes and affected model ids
- *
- * Returns null if the file doesn't exist yet (net-new schema → no blast radius).
- */
 function diffSchema(item: CodeGenItem, projectRoot: string): SchemaDiff | null {
   const fullPath = path.join(item.directory, item.fileName);
   const absPath = path.isAbsolute(fullPath)
@@ -162,7 +176,7 @@ function diffSchema(item: CodeGenItem, projectRoot: string): SchemaDiff | null {
   // so we don't misinterpret every missing model's fields as "removed".
   if (!isPlausibleNewSchema(oldParsed, newParsed)) {
     console.warn(
-      `  ⚠️  Generated schema has fewer models than current ` +
+      `  ${warn("!")} Generated schema has fewer models than current ` +
       `(${newParsed.models.length} vs ${oldParsed.models.length}) — ` +
       `looks malformed or truncated, skipping diff to avoid false blast-radius`
     );
@@ -211,23 +225,41 @@ function diffSchema(item: CodeGenItem, projectRoot: string): SchemaDiff | null {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Resolve which pending items are Prisma schema writes and return their diffs. */
 function collectSchemaDiffs(
   items: CodeGenItem[],
   projectRoot: string
-): SchemaDiff[] {
+): { diffs: SchemaDiff[]; truncated: boolean } {
   const diffs: SchemaDiff[] = [];
+  let truncated = false;
 
   for (const item of items) {
     if (item.type !== "file") continue;
     if (item.fileName !== "schema.prisma") continue;
 
     const diff = diffSchema(item, projectRoot);
-    if (diff !== null) diffs.push(diff);
-    // null means net-new file — no diff to record
+    if (diff !== null) {
+      diffs.push(diff);
+    } else {
+      // Check if this was a truncation (existing file with fewer models)
+      const fullPath = path.join(item.directory, item.fileName);
+      const absPath = path.isAbsolute(fullPath)
+        ? fullPath
+        : path.resolve(projectRoot, fullPath);
+      if (fs.existsSync(absPath)) {
+        const oldSource = fs.readFileSync(absPath, "utf-8");
+        const newSource = item.content.replace(/\\n/g, "\n");
+        const relPath = path.relative(projectRoot, absPath).replace(/\\/g, "/");
+        const oldParsed = extractPrismaSchemaFromSource(oldSource, relPath);
+        const newParsed = extractPrismaSchemaFromSource(newSource, relPath);
+        if (!isPlausibleNewSchema(oldParsed, newParsed)) {
+          truncated = true;
+        }
+      }
+      // null also means net-new file — no diff to record
+    }
   }
 
-  return diffs;
+  return { diffs, truncated };
 }
 
 function askConfirm(question: string): Promise<boolean> {
@@ -248,13 +280,23 @@ export async function preWriteCheck(
   items: CodeGenItem[],
   yes: boolean,
   dryRun: boolean,
-  projectRoot: string = process.cwd()
+  projectRoot: string = process.cwd(),
+  onBeforeConfirm?: () => void
 ): Promise<PreWriteCheckResult> {
 
   // -------------------------------------------------------------------------
   // 1. Diff every schema.prisma write against what's on disk
   // -------------------------------------------------------------------------
-  const diffs = collectSchemaDiffs(items, projectRoot);
+  const { diffs, truncated } = collectSchemaDiffs(items, projectRoot);
+
+  if (truncated) {
+    console.error(
+      `\n  ${error("✗")} Generated schema has fewer models than current — ` +
+      `looks truncated or malformed. Aborting to prevent data loss.\n` +
+      `  Re-run with a more specific prompt or fix the schema manually.`
+    );
+    return { blastResults: [], promptInjection: "", confirmed: false, breakingFieldNamesPerModel: [] };
+  }
 
   if (diffs.length === 0) {
     // No schema writes, or all schema writes are net-new files
@@ -270,7 +312,7 @@ export async function preWriteCheck(
   // 2. Print additive changes — informational only, never blocks
   // -------------------------------------------------------------------------
   for (const c of allAdditive) {
-    console.log(`  ℹ️  Added ${c.modelName}.${c.fieldName} (additive — no confirmation needed)`);
+    console.log(`    ${info("+")} ${c.modelName}.${c.fieldName} ${info("(additive)")}`);
   }
 
   // -------------------------------------------------------------------------
@@ -281,11 +323,15 @@ export async function preWriteCheck(
   }
 
   // -------------------------------------------------------------------------
-  // 4. Print breaking changes
+  // 4. Print breaking changes with +/- diff style
   // -------------------------------------------------------------------------
-  console.log("\n⚠️  Breaking schema changes detected:");
+  console.log(`\n  ${warn("!")} ${bold("Breaking changes:")}`);
   for (const c of allBreaking) {
-    console.log(`     • ${c.modelName}.${c.fieldName} — ${c.detail}`);
+    if (c.detail === "removed") {
+      console.log(`    ${error("−")} ${c.modelName}.${c.fieldName} ${error("removed")}`);
+    } else {
+      console.log(`    ${error("−")} ${c.modelName}.${c.fieldName} ${info(c.detail)}`);
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -296,6 +342,7 @@ export async function preWriteCheck(
   );
 
   for (const result of blastResults) {
+    console.log();
     console.log(formatBlastRadius(result));
   }
 
@@ -310,7 +357,7 @@ export async function preWriteCheck(
   // Build per-model breaking field names, index-aligned with blastResults[].
   // Each entry contains only fields that changed for that specific model so
   // the verifier can check each blast radius independently — no cross-model
-  // false positives (e.g. "author" from Post leaking into User's verify pass).
+  // false positives.
   const breakingFieldNamesPerModel = blastResults.map((br) => {
     const modelName = br.changedNode.id.replace(/^model:/, "");
     return allBreaking
@@ -322,15 +369,16 @@ export async function preWriteCheck(
   // 7. Confirm (or skip under --yes / --dry-run)
   // -------------------------------------------------------------------------
   if (dryRun || yes) {
-    console.log(`\n  ℹ️  Skipping confirmation (${dryRun ? "--dry-run" : "--yes"} flag set)`);
+    console.log(`\n  ${info("ℹ")} Skipping confirmation (${dryRun ? "--dry-run" : "--yes"} flag set)`);
     return { blastResults, promptInjection, confirmed: true, breakingFieldNamesPerModel };
   }
 
+  if (onBeforeConfirm) onBeforeConfirm();
   const confirmed = await askConfirm(
-    `\n⚠️  The above files will be affected. Proceed with write? [y/N] `
+    `\n${warn("!")} Proceed with write? [y/N] `
   );
 
-  if (!confirmed) console.log("  ✋ Write aborted by user.");
+  if (!confirmed) console.log(`  ${warn("!")} Write aborted by user.`);
 
   return { blastResults, promptInjection, confirmed, breakingFieldNamesPerModel };
 }

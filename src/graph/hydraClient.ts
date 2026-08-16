@@ -1,16 +1,10 @@
-import dotenv from "dotenv";
-import path from "path";
 import { HydraDBClient, HydraDBError } from "@hydradb/sdk";
+import { env, requireHydraConfig } from "../config";
 
-// Resolve .env from the tool's own root regardless of cwd.
-// Compiled entrypoint sits at dist/index.js; hydraClient.js is at dist/graph/hydraClient.js
-// — two levels up from __dirname lands at the package root where .env lives.
-dotenv.config({ path: path.join(__dirname, "..", "..", ".env") });
-
-export const client = new HydraDBClient({ token: process.env.HYDRA_DB_API_KEY });
-
-export const DATABASE = process.env.HYDRA_DB_DATABASE ?? "";
-export const COLLECTION = process.env.HYDRA_DB_COLLECTION ?? "";
+// ../config loads .env from the package root before this module's body runs.
+// The token is read unvalidated so that importing this module never throws;
+// every operation below gates on requireHydraConfig() instead.
+export const client = new HydraDBClient({ token: env.hydraDbApiKey });
 
 const POLL_MS = 2000;
 const MAX_WAIT_MS = 60_000;
@@ -44,7 +38,7 @@ export function hydraErrorMessage(
 
 export async function waitForIndexed(ids: string[]): Promise<void> {
   if (ids.length === 0) return;
-  if (!DATABASE) throw new Error("HYDRA_DB_DATABASE is not set");
+  const { database, collection } = requireHydraConfig();
 
   const pending = new Set(ids);
   const started = Date.now();
@@ -59,8 +53,8 @@ export async function waitForIndexed(ids: string[]): Promise<void> {
     let envelope;
     try {
       envelope = await client.context.status({
-        database: DATABASE,
-        collection: COLLECTION || undefined,
+        database,
+        collection,
         ids: [...pending],
       });
     } catch (err) {

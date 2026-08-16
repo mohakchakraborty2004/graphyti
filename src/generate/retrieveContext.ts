@@ -1,6 +1,8 @@
 import { HydraDBError } from "@hydradb/sdk";
 import { buildString } from "@hydradb/sdk/helpers";
-import { client, DATABASE, COLLECTION } from "../graph/hydraClient";
+import { client } from "../graph/hydraClient";
+import { requireHydraConfig } from "../config";
+import { error as themeError } from "../cli/theme";
 
 /**
  * Retrieve graph-grounded context from HydraDB for a given user query.
@@ -15,9 +17,10 @@ import { client, DATABASE, COLLECTION } from "../graph/hydraClient";
  */
 export async function retrieveContext(userQuery: string): Promise<string | null> {
   try {
+    const { database, collection } = requireHydraConfig();
     const result = await client.query({
-      database: DATABASE,
-      collection: COLLECTION,
+      database,
+      collection,
       query: userQuery,
       type: "knowledge",
       queryBy: "hybrid",
@@ -31,19 +34,17 @@ export async function retrieveContext(userQuery: string): Promise<string | null>
     return buildString(result);
   } catch (err) {
     if (err instanceof HydraDBError) {
-      // Log the error code and request id per HydraDB error-handling docs,
-      // then return null so the caller can fall back to legacy context.json.
       const errorCode = err.statusCode ?? "unknown";
       const requestId =
         err.rawResponse?.headers?.get("x-request-id") ??
         err.rawResponse?.headers?.get("X-Request-Id") ??
         "unknown";
       console.error(
-        `❌ HydraDB retrieval failed — error_code=${errorCode} request_id=${requestId}:`,
+        `${themeError("✗")} HydraDB retrieval failed — error_code=${errorCode} request_id=${requestId}:`,
         err.message
       );
     } else {
-      console.error("❌ Unexpected error during HydraDB retrieval:", err);
+      console.error(`${themeError("✗")} Unexpected error during HydraDB retrieval:`, err);
     }
     return null;
   }
