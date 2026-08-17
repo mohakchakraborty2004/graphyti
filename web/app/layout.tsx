@@ -25,8 +25,9 @@ const firaCode = Fira_Code({
 });
 
 export const metadata: Metadata = {
-  title: 'Graphyti - Structure you can trust, not guess',
-  description: "A CLI coding agent that builds a deterministic code graph and verifies every AI-generated structural change before writing to disk.",
+  title: 'Graphyti — Code that verifies itself',
+  description:
+    'A CLI coding agent that builds a deterministic code graph and checks every AI-generated change against it before anything is written to disk.',
 };
 
 export default function RootLayout({
