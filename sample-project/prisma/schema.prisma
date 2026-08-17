@@ -13,6 +13,10 @@ model User {
   name     String?
   posts    Post[]
   password String
+  username  String
+  phone  String
+  bio      String?
+ 
 }
 
 model Post {
@@ -37,3 +41,4 @@ model Comment {
   postId  Int
   post    Post    @relation(fields: [postId], references: [id])
 }
+

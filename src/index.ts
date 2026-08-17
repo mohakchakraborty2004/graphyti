@@ -1,7 +1,6 @@
-#!/usr/bin/env node
-
 import * as path from "path";
 import * as fs from "fs";
+import { fileURLToPath } from "url";
 import { Command } from "commander";
 import ContextGen, { formatLegacyContext } from "./utils/context";
 import { codeGen } from "./utils/agent";
@@ -25,7 +24,35 @@ import {
 } from "./cli/theme";
 import ora from "ora";
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+function getGraphytiPackageJson() {
+  const candidates = [
+    path.join(__dirname, "package.json"),
+    path.join(__dirname, "..", "package.json"),
+    path.join(__dirname, "..", "..", "package.json"),
+    path.join(process.cwd(), "package.json"),
+  ];
+
+  for (const pkgPath of candidates) {
+    if (!fs.existsSync(pkgPath)) continue;
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+    if (pkg.name === "graphyti") return pkg;
+  }
+
+  throw new Error("Could not find graphyti package.json");
+}
+
+const pkg = getGraphytiPackageJson();
+
 const program = new Command();
+
+// Check if arguments were provided (excluding node and script path)
+const args = process.argv.slice(2);
+const hasArgs = args.length > 0 && !args[0].startsWith("-");
+const isHelp = args.includes("--help") || args.includes("-h");
+const isTui = !hasArgs && !isHelp;
 
 function spinner(text: string) {
   return ora({ text, color: "cyan", isEnabled: !isJsonMode() });
@@ -89,15 +116,32 @@ program
   });
 
 // ---------------------------------------------------------------------------
-// default command — code generation
+// TUI mode — launch when no arguments provided
 // ---------------------------------------------------------------------------
-program
-  .argument("<query>", "natural language request")
-  .option("--legacy-context", "FALLBACK ONLY — force the old flat .dbagent/context.json path instead of the graph")
-  .option("--dry-run", "Show blast radius and generated code without writing any files")
-  .option("--yes", "Skip the blast-radius and command confirmation prompts and auto-confirm all writes")
-  .option("--json", "Output machine-readable JSON (no spinners, no ANSI)")
-  .action(async (query: string, options: Record<string, boolean>) => {
+if (isTui) {
+  (async () => {
+    const { launchTui } = await import("./tui");
+    const dryRun = args.includes("--dry-run");
+    const autoConfirm = args.includes("--yes");
+    const legacyContext = args.includes("--legacy-context");
+
+    await launchTui({ dryRun, autoConfirm, legacyContext });
+    process.exit(0);
+  })();
+} else {
+  // ---------------------------------------------------------------------------
+  // default command — code generation
+  // ---------------------------------------------------------------------------
+  program
+    .argument("[query]", "natural language request")
+    .option("--legacy-context", "FALLBACK ONLY — force the old flat .dbagent/context.json path instead of the graph")
+    .option("--dry-run", "Show blast radius and generated code without writing any files")
+    .option("--yes", "Skip the blast-radius and command confirmation prompts and auto-confirm all writes")
+    .option("--json", "Output machine-readable JSON (no spinners, no ANSI)")
+    .action(async (query: string | undefined, options: Record<string, boolean>) => {
+    if (!query) {
+      program.help();
+    }
     const dryRun = options.dryRun ?? false;
     const yes    = options.yes    ?? false;
     const jsonOut = options.json ?? false;
@@ -118,7 +162,7 @@ program
 
     // ── Header ─────────────────────────────────────────────────────────────
     print(rule());
-    print(`  ${bold("graphyti")} ${info("v" + require("../package.json").version)}`);
+    print(`  ${bold("graphyti")} ${info("v" + pkg.version)}`);
     print(rule());
     print(row("Query", accent(query)));
     if (dryRun) print(row("Mode", info("dry-run")));
@@ -138,7 +182,7 @@ program
       context = formatLegacyContext(loadContext());
     } else {
       try {
-        context = (await retrieveContext(query)) ?? (() => {
+        context = (await retrieveContext(query ?? "")) ?? (() => {
           ctxSpin.warn("HydraDB retrieval returned null — falling back to .dbagent/context.json");
           return formatLegacyContext(loadContext());
         })();
@@ -184,7 +228,7 @@ program
     const classStart = Date.now();
     let classification: Classification;
     try {
-      classification = await classifyQueryWithRetry(query, context);
+      classification = await classifyQueryWithRetry(query ?? "", context);
     } catch (err) {
       classSpin.fail("Classification failed");
       throw err;
@@ -200,8 +244,8 @@ program
       // Run the full pipeline for this single step
       const stepResult = await runStep({
         stepIndex: 0,
-        description: query,
-        query,
+        description: query ?? "",
+        query: query ?? "",
         context,
         projectRoot,
         dryRun,
@@ -228,7 +272,8 @@ program
     print();
 
     if (!dryRun && !yes) {
-      const rl = require("readline").createInterface({ input: process.stdin, output: process.stdout });
+      const readline = await import("readline");
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
       const confirmed = await new Promise<boolean>((resolve) => {
         rl.question(`  Proceed with all ${classification.steps.length} steps? (y/N) `, (answer: string) => {
           rl.close();
@@ -333,6 +378,7 @@ program
   });
 
 program.parse();
+} // end else (hasArgs)
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -437,7 +483,13 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
   print(`    ${info("Operations")}:`);
   for (const op of editPlan) {
     if (op.type === "schema") {
-      print(`      ${sym.bullet} ${bold("schema")}  ${op.op} on ${op.model}.${op.fieldName ?? ""}`);
+      if (op.op === "create_model") {
+        print(`      ${sym.bullet} ${bold("schema")}  ${bold("create_model")} ${op.model}`);
+      } else if (op.op === "remove_model") {
+        print(`      ${sym.bullet} ${bold("schema")}  ${bold("remove_model")} ${op.model}`);
+      } else {
+        print(`      ${sym.bullet} ${bold("schema")}  ${op.op} on ${op.model}.${op.fieldName ?? ""}`);
+      }
     } else if (op.type === "file") {
       const editCount = op.edits.length;
       print(`      ${sym.bullet} ${bold("file")}    ${op.filePath} ${info(`(${editCount} edit${editCount > 1 ? "s" : ""})`)}`);
@@ -484,11 +536,61 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
     action.edits = [{ filePath: action.filePath, oldText: "", newText: fullContent }];
   }
 
+  // ── Post-process: inject prisma migrate + generate after schema edits ──
+  const hasSchemaEdits = actions.some((a) => a.type === "schema");
+  if (hasSchemaEdits) {
+    // Generate a migration name from the schema changes
+    const schemaOps = actions.filter((a) => a.type === "schema");
+    const migrationName = schemaOps
+      .map((op) => {
+        if (op.type !== "schema") return "";
+        const field = op.fieldName ?? op.model;
+        switch (op.op) {
+          case "add_field": return `add_${field}`;
+          case "remove_field": return `remove_${field}`;
+          case "rename_field": return `rename_${field}`;
+          case "change_type": return `change_${field}`;
+          case "create_model": return `create_${op.model}`;
+          case "remove_model": return `drop_${op.model}`;
+          default: return op.op;
+        }
+      })
+      .join("_")
+      .slice(0, 64); // Prisma migration name limit
+
+    // Only inject if not already present
+    const hasMigrate = actions.some(
+      (a) => a.type === "command" && a.command.includes("prisma migrate")
+    );
+    const hasGenerate = actions.some(
+      (a) => a.type === "command" && a.command.includes("prisma generate")
+    );
+
+    if (!hasMigrate) {
+      actions.push({
+        type: "command",
+        command: `npx prisma migrate dev --name ${migrationName}`,
+      });
+    }
+    if (!hasGenerate) {
+      actions.push({
+        type: "command",
+        command: "npx prisma generate",
+      });
+    }
+  }
+
   // Show what will be applied
   print(`    ${info("Actions")}:`);
   for (const action of actions) {
     if (action.type === "schema") {
-      print(`      ${sym.bullet} ${bold("schema")}  ${action.op} on ${action.model}.${action.fieldName ?? ""}`);
+      if (action.op === "create_model") {
+        print(`      ${sym.bullet} ${bold("schema")}  ${bold("create_model")} ${action.model}`);
+      } else if (action.op === "remove_model") {
+        print(`      ${sym.bullet} ${bold("schema")}  ${bold("remove_model")} ${action.model}`);
+      } else {
+        print(`      ${sym.bullet} ${bold("schema")}  ${action.op} on ${action.model}.${action.fieldName ?? ""}`);
+      }
     } else if (action.type === "file") {
       const editCount = action.edits.length;
       print(`      ${sym.bullet} ${bold("file")}    ${action.filePath} ${info(`(${editCount} edit${editCount > 1 ? "s" : ""})`)}`);
@@ -503,7 +605,7 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
   // ── 5. Blast Radius ───────────────────────────────────────────────
   const schemaEdits = actions.filter((a) => a.type === "schema");
   const isBreaking = (op: typeof schemaEdits[number]) =>
-    op.type === "schema" && (op.op === "remove_field" || op.op === "rename_field" || op.op === "change_type");
+    op.type === "schema" && (op.op === "remove_field" || op.op === "rename_field" || op.op === "change_type" || op.op === "remove_model");
   const breakingEdits = schemaEdits.filter(isBreaking);
 
   let blastResults: BlastRadiusResult[] = [];
@@ -571,7 +673,8 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
 
     // ── Confirmation ───────────────────────────────────────────────
     if (!dryRun && !yes) {
-      const rl = require("readline").createInterface({ input: process.stdin, output: process.stdout });
+      const readline = await import("readline");
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
       const confirmed = await new Promise<boolean>((resolve) => {
         rl.question(`${warn("!")} Proceed with write? [y/N] `, (answer: string) => {
           rl.close();

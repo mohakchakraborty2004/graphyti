@@ -268,7 +268,16 @@ export async function handleAgentOutput(
 
     if (dryRun) {
       console.log(`\n  ${bold(relSchemaPath)} — schema edit: ${schemaEdit.op} on ${schemaEdit.model}.${schemaEdit.fieldName ?? ""}`);
-      if (schemaEdit.op === "add_field") {
+      if (schemaEdit.op === "create_model") {
+        console.log(`    ${info("+")} new model ${bold(schemaEdit.model)}`);
+        if (schemaEdit.modelBody) {
+          for (const line of schemaEdit.modelBody.split("\n")) {
+            console.log(`    ${info("│")} ${line}`);
+          }
+        }
+      } else if (schemaEdit.op === "remove_model") {
+        console.log(`    ${error("−")} model ${bold(schemaEdit.model)} ${error("removed")}`);
+      } else if (schemaEdit.op === "add_field") {
         console.log(`    ${info("+")} ${schemaEdit.model}.${schemaEdit.fieldName} ${schemaEdit.fieldType}`);
       } else if (schemaEdit.op === "remove_field") {
         console.log(`    ${error("−")} ${schemaEdit.model}.${schemaEdit.fieldName} removed`);

@@ -24,11 +24,12 @@ const ScopedEditSchema = z.object({
 const SchemaEditSchema = z.object({
   type: z.literal("schema"),
   model: z.string().min(1),
-  op: z.enum(["add_field", "remove_field", "rename_field", "change_type"]),
+  op: z.enum(["add_field", "remove_field", "rename_field", "change_type", "create_model", "remove_model"]),
   fieldName: z.string().optional(),
   newFieldName: z.string().optional(),
   fieldType: z.string().optional(),
   newFieldType: z.string().optional(),
+  modelBody: z.string().optional(),
 });
 
 const FileEditSchema = z.object({
@@ -98,6 +99,7 @@ function normalizeEditPlan(raw: unknown): unknown {
       normalized.newFieldName = normalized.newFieldName ?? undefined;
       normalized.fieldType = normalized.fieldType ?? undefined;
       normalized.newFieldType = normalized.newFieldType ?? undefined;
+      normalized.modelBody = normalized.modelBody ?? undefined;
     }
 
     // Normalize CommandAction
@@ -323,11 +325,12 @@ For schema changes (Prisma, database models):
 {
   "type": "schema",
   "model": "<ModelName>",
-  "op": "add_field" | "remove_field" | "rename_field" | "change_type",
+  "op": "add_field" | "remove_field" | "rename_field" | "change_type" | "create_model" | "remove_model",
   "fieldName": "<existing field name, required for remove/rename/change_type>",
   "newFieldName": "<new field name, required for rename>",
   "fieldType": "<current type, required for change_type>",
-  "newFieldType": "<new type, required for change_type>"
+  "newFieldType": "<new type, required for change_type>",
+  "modelBody": "<full model body for create_model, e.g. 'id Int @id @default(autoincrement())\\nname String?\\nposts Post[]'>"
 }
 
 For code changes (routes, components, utilities — both NEW and EXISTING files):
@@ -358,7 +361,9 @@ RULES:
 - The system will detect oldText = "" and create the file automatically.
 - Never modify code or fields unrelated to the request.
 - If the user asks for multiple unrelated changes, return multiple separate operations.
-- For schema operations: only include the model and field that change. Do not describe the rest of the schema.`;
+- For schema operations: only include the model and field that change. Do not describe the rest of the schema.
+- For "create_model": include the full model body with fields in "modelBody". The model name goes in "model".
+- For "remove_model": only include the model name, no field needed.`;
 
 /**
  * Extract the user's intent as a structured EditPlan via a narrow LLM call.
@@ -400,6 +405,7 @@ export async function extractIntent(
             newFieldName: { type: Type.STRING },
             fieldType: { type: Type.STRING },
             newFieldType: { type: Type.STRING },
+            modelBody: { type: Type.STRING },
             filePath: { type: Type.STRING },
             edits: {
               type: Type.ARRAY,
@@ -422,6 +428,7 @@ export async function extractIntent(
             "newFieldName",
             "fieldType",
             "newFieldType",
+            "modelBody",
             "filePath",
             "edits",
             "command",
@@ -560,6 +567,48 @@ export function applySchemaEdit(
   schemaPath: string,
   projectRoot: string
 ): string {
+  // ── create_model: append a new model block before the final newline ──
+  if (edit.op === "create_model") {
+    const body = edit.modelBody ?? "";
+    const newBlock = `\nmodel ${edit.model} {\n${body}\n}`;
+    const mutated = existingSource.trimEnd() + "\n" + newBlock + "\n";
+    const absSchemaPath = path.isAbsolute(schemaPath)
+      ? schemaPath
+      : path.resolve(projectRoot, schemaPath);
+    fs.writeFileSync(absSchemaPath, mutated, "utf-8");
+    return formatPrismaSchema(absSchemaPath, projectRoot);
+  }
+
+  // ── remove_model: drop the entire model block ──
+  if (edit.op === "remove_model") {
+    const lines = existingSource.split("\n");
+    const result: string[] = [];
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i];
+      const modelMatch = line.match(/^\s*model\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{/);
+      if (modelMatch && modelMatch[1] === edit.model) {
+        // Skip the entire model block
+        let depth = 1;
+        i++;
+        while (i < lines.length && depth > 0) {
+          if (lines[i].includes("{")) depth++;
+          if (lines[i].includes("}")) depth--;
+          i++;
+        }
+        continue;
+      }
+      result.push(line);
+      i++;
+    }
+    const mutated = result.join("\n");
+    const absSchemaPath = path.isAbsolute(schemaPath)
+      ? schemaPath
+      : path.resolve(projectRoot, schemaPath);
+    fs.writeFileSync(absSchemaPath, mutated, "utf-8");
+    return formatPrismaSchema(absSchemaPath, projectRoot);
+  }
+
   const lines = existingSource.split("\n");
   const result: string[] = [];
 
@@ -708,6 +757,8 @@ For each operation in the plan, produce the actual code changes. You have three 
 
 1. SCHEMA EDITS (type: "schema"):
    These are handled deterministically — you do NOT produce schema code. Just pass through the schema edit descriptor as-is.
+   For "create_model": pass through the full descriptor including modelBody.
+   For "remove_model": pass through the descriptor with just the model name.
 
 2. FILE EDITS (type: "file"):
    For each file edit, you MUST:
@@ -747,7 +798,9 @@ FRONTEND RULES:
 
 OUTPUT FORMAT:
 Return a JSON array where each element is one of:
-  { "type": "schema", "model": "...", "op": "...", ... }
+  { "type": "schema", "model": "...", "op": "create_model", "modelBody": "..." }
+  { "type": "schema", "model": "...", "op": "remove_model" }
+  { "type": "schema", "model": "...", "op": "add_field", "fieldName": "...", "fieldType": "..." }
   { "type": "file", "filePath": "...", "edits": [{ "filePath": "...", "oldText": "...", "newText": "..." }, ...] }
   { "type": "command", "command": "..." }
 
@@ -796,6 +849,7 @@ Remember: for file edits, provide EXACT oldText (verbatim from current file) and
             newFieldName: { type: Type.STRING },
             fieldType: { type: Type.STRING },
             newFieldType: { type: Type.STRING },
+            modelBody: { type: Type.STRING },
             filePath: { type: Type.STRING },
             edits: {
               type: Type.ARRAY,
@@ -818,6 +872,7 @@ Remember: for file edits, provide EXACT oldText (verbatim from current file) and
             "newFieldName",
             "fieldType",
             "newFieldType",
+            "modelBody",
             "filePath",
             "edits",
             "command",
