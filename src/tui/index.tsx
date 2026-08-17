@@ -33,6 +33,22 @@ function readVersion(): string {
   return "0.0.0";
 }
 
+/**
+ * Check if the code graph has been initialized. If not, run init-graph
+ * automatically so the TUI has context available for queries.
+ */
+async function ensureGraphInitialized(projectRoot: string): Promise<void> {
+  const graphMapPath = path.join(projectRoot, ".dbagent", "graph-map.json");
+
+  if (fs.existsSync(graphMapPath)) {
+    return; // Already initialized
+  }
+
+  // Graph not found — run init-graph silently
+  const { runInitGraph } = await import("../cli/init-graph");
+  await runInitGraph(projectRoot);
+}
+
 export async function launchTui(options: TuiOptions) {
   if (!process.stdin.isTTY) {
     console.error(
@@ -42,6 +58,11 @@ export async function launchTui(options: TuiOptions) {
     );
     process.exit(1);
   }
+
+  const projectRoot = process.cwd();
+
+  // Ensure the code graph is initialized before launching the TUI
+  await ensureGraphInitialized(projectRoot);
 
   const { waitUntilExit } = render(
     <App

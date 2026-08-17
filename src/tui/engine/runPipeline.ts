@@ -23,6 +23,8 @@ import {
 } from "./captureConsole";
 import type { PermissionRequest, ToolCall, ToolKind } from "../state/types";
 import type { StatusKind } from "../theme/tokens";
+import type { BlastRadiusResult } from "../../graph/blastRadius";
+import type { ExpectedDelta } from "../../graph/expectedDelta";
 
 export interface PipelineOptions {
   dryRun: boolean;
@@ -246,15 +248,20 @@ async function executeStep(
   }
 
   // ── Blast radius ───────────────────────────────────────────────────────────
-  // Only these three schema operations can break existing call sites; adding a
-  // field or a model cannot, so they do not warrant a blast-radius pass.
+  // Schema operations that can break existing call sites: removing or renaming
+  // fields, changing types, and removing models entirely.
   const breaking = actions.filter(
     (action): action is Extract<(typeof actions)[number], { type: "schema" }> =>
       action.type === "schema" &&
       (action.op === "remove_field" ||
         action.op === "rename_field" ||
-        action.op === "change_type")
+        action.op === "change_type" ||
+        action.op === "remove_model")
   );
+
+  let blastResults: BlastRadiusResult[] = [];
+  let breakingFieldNames: string[] = [];
+  let expectedDeltas: ExpectedDelta[] = [];
 
   if (breaking.length > 0) {
     events.state("tool_running");
@@ -265,12 +272,12 @@ async function executeStep(
     const { computeBlastRadius } = await import("../../graph/blastRadius");
     const modelIds = [...new Set(breaking.map((op) => `model:${op.model}`))];
 
-    const results = await Promise.all(
+    blastResults = await Promise.all(
       modelIds.map((id) => computeBlastRadius(id, projectRoot))
     );
     throwIfAborted(signal);
 
-    const size = results.reduce(
+    const size = blastResults.reduce(
       (sum, r) =>
         sum +
         (r.affectedRoutes?.length ?? 0) +
@@ -287,13 +294,39 @@ async function executeStep(
     });
 
     events.blast(
-      results.map((r) => ({
+      blastResults.map((r) => ({
         modelName: r.changedNode?.id?.replace(/^model:/, "") ?? r.changedNode?.name ?? "unknown",
         routes: r.affectedRoutes ?? [],
         components: r.affectedComponents ?? [],
         files: r.affectedFiles ?? [],
       }))
     );
+
+    // Collect breaking field names per model for verification
+    breakingFieldNames = breaking
+      .filter((op): op is Extract<typeof op, { type: "schema" }> => op.type === "schema")
+      .map((op) => op.fieldName ?? "")
+      .filter(Boolean);
+
+    // Compute expected structural deltas for graph verification
+    const { computeExpectedDelta } = await import("../../graph/expectedDelta");
+    expectedDeltas = breaking
+      .filter((op): op is import("../../generate/scopedEdit").SchemaEdit => op.type === "schema")
+      .map((op) => {
+        const blast = blastResults.find(
+          (br) => br.changedNode.id === `model:${op.model}`
+        );
+        return computeExpectedDelta(
+          op,
+          blast ?? {
+            changedNode: { id: `model:${op.model}`, name: op.model, kind: "PrismaModel", filePath: "" },
+            affectedRoutes: [],
+            affectedComponents: [],
+            affectedFiles: [],
+          },
+          projectRoot
+        );
+      });
 
     if (size > 0 && !options.dryRun && !options.autoConfirm) {
       const approved = await events.confirm({
@@ -305,6 +338,305 @@ async function executeStep(
       throwIfAborted(signal);
       if (!approved) throw new CancelledError();
     }
+
+    // ── Re-generate for blast-radius-affected files ──────────────────
+    if (size > 0 && !options.dryRun) {
+      const affectedFilePaths = [...new Set(
+        blastResults.flatMap((r) => [
+          ...r.affectedRoutes.map((n) => n.filePath),
+          ...r.affectedComponents.map((n) => n.filePath),
+          ...r.affectedFiles.map((n) => n.filePath),
+        ])
+      )];
+
+      const existingEditedPaths = new Set(
+        actions
+          .filter((a) => a.type === "file")
+          .map((a) => {
+            const fe = a as { filePath: string };
+            const abs = path.isAbsolute(fe.filePath) ? fe.filePath : path.resolve(projectRoot, fe.filePath);
+            return path.relative(projectRoot, abs).replace(/\\/g, "/");
+          })
+      );
+      const uncoveredPaths = affectedFilePaths.filter((p) => !existingEditedPaths.has(p));
+
+      if (uncoveredPaths.length > 0) {
+        events.state("tool_running");
+        events.activity(`Generating edits for ${uncoveredPaths.length} affected file(s)`);
+        const reGenTool = events.toolStart("edit", `${uncoveredPaths.length} affected file(s)`);
+        const reGenStart = Date.now();
+
+        const { scopedCodeGen, validateEditPlan } = await import("../../generate/scopedEdit");
+
+        const schemaOpDesc = breaking
+          .map((op) => {
+            if (op.type !== "schema") return "";
+            if (op.op === "rename_field") return `${op.model}.${op.fieldName} was renamed to ${op.newFieldName}`;
+            if (op.op === "remove_field") return `${op.model}.${op.fieldName} was removed`;
+            if (op.op === "change_type") return `${op.model}.${op.fieldName} type changed from ${op.fieldType} to ${op.newFieldType}`;
+            if (op.op === "remove_model") return `model ${op.model} was removed`;
+            return "";
+          })
+          .filter(Boolean)
+          .join("; ");
+
+        for (const filePath of uncoveredPaths) {
+          const absPath = path.isAbsolute(filePath)
+            ? filePath
+            : path.resolve(projectRoot, filePath);
+          if (!fs.existsSync(absPath)) continue;
+          const content = fs.readFileSync(absPath, "utf-8");
+          const lines = content.split("\n");
+          const snippet = lines.slice(0, 80).join("\n") + (lines.length > 80 ? `\n... (${lines.length - 80} more lines)` : "");
+
+          const singleQuery =
+            `The schema had this change: ${schemaOpDesc}.\n` +
+            `Update the file "${filePath}" to stay consistent with this schema change.\n` +
+            `Produce MINIMAL oldText/newText edits. oldText must be a verbatim snippet (2-5 lines) from the file.\n` +
+            `Do NOT modify anything unrelated to the schema change. Return ONLY file edits.\n` +
+            `If the file does not need any changes, return an empty edits array [].`;
+
+          const singlePlan: import("../../generate/scopedEdit").EditPlan = [{
+            type: "file",
+            filePath,
+            edits: [{ filePath, oldText: "", newText: "" }],
+          }];
+
+          try {
+            const fileActions = await scopedCodeGen(singleQuery, context, singlePlan, 60_000);
+            const check = validateEditPlan(fileActions);
+            if (check.ok) {
+              for (const action of check.plan) {
+                if (action.type === "file" && action.edits.some((e) => e.oldText !== "")) {
+                  actions.push(action as typeof actions[number]);
+                }
+              }
+            }
+          } catch {
+            // LLM errors during re-generation are non-fatal
+          }
+        }
+
+        events.toolUpdate(reGenTool, {
+          status: "success",
+          result: `re-generated for ${uncoveredPaths.length} file(s)`,
+          elapsedMs: Date.now() - reGenStart,
+        });
+      }
+    }
+  }
+
+  // ── Structural Verification ────────────────────────────────────────────────
+  let verifiedActions = actions;
+
+  if (blastResults.length > 0 && !options.dryRun) {
+    events.state("tool_running");
+    events.activity("Running structural verification");
+    const verifyTool = events.toolStart("analyze", "structural verification");
+    const verifyStart = Date.now();
+
+    const { runUnifiedValidation } = await import("../../verify/unifiedValidation");
+    const { applyScopedEdits, applySchemaEdit } = await import("../../generate/scopedEdit");
+
+    // Collect all affected node IDs for graph check
+    const allAffectedNodeIds = [
+      ...blastResults.flatMap((r) => [
+        ...r.affectedRoutes.map((n) => n.id),
+        ...r.affectedComponents.map((n) => n.id),
+        ...r.affectedFiles.map((n) => n.id),
+      ]),
+    ];
+
+    // Build generatedFiles for validation
+    const generatedFilesForValidation: import("../../verify/verifyChange").GeneratedFile[] = [];
+    for (const action of actions) {
+      if (action.type !== "file") continue;
+      const fe = action as { filePath: string; edits: Array<{ oldText: string; newText: string }> };
+      const absPath = path.isAbsolute(fe.filePath)
+        ? fe.filePath
+        : path.resolve(projectRoot, fe.filePath);
+      if (!fs.existsSync(absPath)) continue;
+      try {
+        const current = fs.readFileSync(absPath, "utf-8");
+        const content = applyScopedEdits(current, fe.edits, fe.filePath);
+        generatedFilesForValidation.push({ path: absPath, content });
+      } catch {
+        // If edits can't be applied, skip this file
+      }
+    }
+
+    // Build proposed schema source for graph check
+    const schemaEdit = actions.find((a): a is import("../../generate/scopedEdit").SchemaEdit => a.type === "schema");
+    let proposedSchemaSource: string | undefined;
+    if (schemaEdit) {
+      const schema = findSchema(projectRoot);
+      if (schema) {
+        const currentSchema = fs.readFileSync(schema, "utf-8");
+        try {
+          proposedSchemaSource = applySchemaEdit(currentSchema, schemaEdit, schema, projectRoot);
+        } catch {
+          // Could not compute proposed schema — non-fatal
+        }
+      }
+    }
+
+    let unifiedResult: import("../../verify/unifiedValidation").UnifiedValidationResult;
+    try {
+      unifiedResult = await runUnifiedValidation({
+        blastRadius: blastResults[0],
+        breakingFieldNames,
+        generatedFiles: generatedFilesForValidation,
+        expectedDeltas,
+        blastRadiusAffectedNodeIds: allAffectedNodeIds,
+        projectRoot,
+        proposedSchemaSource,
+      });
+    } catch (err) {
+      unifiedResult = {
+        localCheck: { addressed: 0, missed: 0, report: { addressed: [], missed: [], retryPrompt: "" } },
+        graphCheck: { addressed: 0, missed: 1, staleNodesFound: 0, report: { graphAddressed: [], graphMissed: [{ nodeId: "unknown", reason: err instanceof Error ? err.message : String(err) }], staleNodesFound: [] } },
+        graphCheckSkipped: false,
+        overallPassed: false,
+        summary: `Structural validation FAILED: ${err instanceof Error ? err.message : err}`,
+        resolutionReason: `ERROR: ${err instanceof Error ? err.message : err}`,
+      };
+    }
+
+    const verifyElapsed = Date.now() - verifyStart;
+
+    events.toolUpdate(verifyTool, {
+      status: unifiedResult.overallPassed ? "success" : "error",
+      result: unifiedResult.summary,
+      elapsedMs: verifyElapsed,
+    });
+
+    // ── Retry mechanism: if local check failed, re-prompt once ──────
+    if (!unifiedResult.overallPassed && unifiedResult.localCheck.missed > 0) {
+      const retryPrompt = unifiedResult.localCheck.report.retryPrompt;
+      if (retryPrompt) {
+        events.activity(`Retrying for ${unifiedResult.localCheck.missed} missed file(s)`);
+        const retryTool = events.toolStart("edit", "retry missed files");
+        const retryStart = Date.now();
+
+        const { extractIntentWithRetry } = await import("../../generate/scopedEdit");
+        const { codeGen } = await import("../../utils/agent");
+
+        const retryQuery = stepQuery + retryPrompt;
+
+        try {
+          const retryPlan = await extractIntentWithRetry(retryQuery, context);
+          const retryActions = await codeGen(retryPlan, retryQuery, context);
+
+          if (retryActions?.length) {
+            // Build generated files for retry verification
+            const retryGeneratedFiles: import("../../verify/verifyChange").GeneratedFile[] = [...generatedFilesForValidation];
+            for (const action of retryActions) {
+              if (action.type !== "file") continue;
+              const fe = action as { filePath: string; edits: Array<{ oldText: string; newText: string }> };
+              const absPath = path.isAbsolute(fe.filePath)
+                ? fe.filePath
+                : path.resolve(projectRoot, fe.filePath);
+              if (!fs.existsSync(absPath)) continue;
+              try {
+                const current = fs.readFileSync(absPath, "utf-8");
+                const content = applyScopedEdits(current, fe.edits, fe.filePath);
+                const rel = path.relative(projectRoot, absPath).replace(/\\/g, "/");
+                const existingIdx = retryGeneratedFiles.findIndex((f) => {
+                  const fRel = path.relative(projectRoot, f.path).replace(/\\/g, "/");
+                  return fRel === rel;
+                });
+                if (existingIdx >= 0) {
+                  retryGeneratedFiles[existingIdx] = { path: absPath, content };
+                } else {
+                  retryGeneratedFiles.push({ path: absPath, content });
+                }
+              } catch {
+                // If edits can't be applied, skip this file
+              }
+            }
+
+            // Re-run local verification with retry results
+            const retryResult = await runUnifiedValidation({
+              blastRadius: blastResults[0],
+              breakingFieldNames,
+              generatedFiles: retryGeneratedFiles,
+              expectedDeltas: [],
+              blastRadiusAffectedNodeIds: allAffectedNodeIds,
+              projectRoot,
+              proposedSchemaSource,
+            });
+
+            if (retryResult.localCheck.missed === 0) {
+              // Retry succeeded — merge first-pass + retry actions
+              const missedFilePaths = new Set(
+                unifiedResult.localCheck.report.missed.map((m) => m.filePath)
+              );
+              const mergedActions = actions.filter((a) => {
+                if (a.type !== "file") return true;
+                const fe = a as { filePath: string };
+                const abs = path.isAbsolute(fe.filePath)
+                  ? fe.filePath
+                  : path.resolve(projectRoot, fe.filePath);
+                const rel = path.relative(projectRoot, abs).replace(/\\/g, "/");
+                return !missedFilePaths.has(rel);
+              });
+              mergedActions.push(...retryActions);
+              verifiedActions = mergedActions;
+
+              events.toolUpdate(retryTool, {
+                status: "success",
+                result: `retry succeeded — all ${retryResult.localCheck.addressed + retryResult.localCheck.missed} files verified`,
+                elapsedMs: Date.now() - retryStart,
+              });
+            } else {
+              // Retry still failed — block
+              events.toolUpdate(retryTool, {
+                status: "error",
+                error: `retry still missed ${retryResult.localCheck.missed} file(s)`,
+                elapsedMs: Date.now() - retryStart,
+              });
+              throwIfAborted(signal);
+              throw new CancelledError();
+            }
+          } else {
+            events.toolUpdate(retryTool, {
+              status: "error",
+              error: "retry returned no actions",
+              elapsedMs: Date.now() - retryStart,
+            });
+            throwIfAborted(signal);
+            throw new CancelledError();
+          }
+        } catch (err) {
+          if (err instanceof CancelledError) throw err;
+          events.toolUpdate(retryTool, {
+            status: "error",
+            error: err instanceof Error ? err.message : String(err),
+            elapsedMs: Date.now() - retryStart,
+          });
+          throwIfAborted(signal);
+          throw new CancelledError();
+        }
+      } else {
+        // No retry prompt available — block
+        events.toolUpdate(verifyTool, {
+          status: "error",
+          error: unifiedResult.resolutionReason,
+          elapsedMs: verifyElapsed,
+        });
+        throwIfAborted(signal);
+        throw new CancelledError();
+      }
+    } else if (!unifiedResult.overallPassed) {
+      // Failed but no missed files (e.g. stale nodes) — block
+      events.toolUpdate(verifyTool, {
+        status: "error",
+        error: unifiedResult.resolutionReason,
+        elapsedMs: verifyElapsed,
+      });
+      throwIfAborted(signal);
+      throw new CancelledError();
+    }
   }
 
   // ── Write ──────────────────────────────────────────────────────────────────
@@ -315,11 +647,11 @@ async function executeStep(
   // shown to the user is the real before/after rather than a re-derivation. The
   // pipeline logs its own diffs to stdout, but those are pre-coloured strings
   // that cannot enter the line model.
-  const targets = collectTargets(actions, projectRoot);
+  const targets = collectTargets(verifiedActions, projectRoot);
   const before = snapshotFiles(targets);
 
   const { handleAgentOutput } = await import("../../agentPipeline");
-  const writeResult = await handleAgentOutput(actions, {
+  const writeResult = await handleAgentOutput(verifiedActions, {
     dryRun: options.dryRun,
     // Command execution asks through our own permission prompt, so the pipeline's
     // readline-based confirm must never engage: it would read from the same stdin
@@ -331,7 +663,7 @@ async function executeStep(
 
   if (options.dryRun) {
     // Nothing was written, so project the result in memory to preview it.
-    for (const preview of await previewDiffs(actions, before, projectRoot)) {
+    for (const preview of await previewDiffs(verifiedActions, before, projectRoot)) {
       events.diff(preview.relativePath, preview.patch);
     }
   } else {

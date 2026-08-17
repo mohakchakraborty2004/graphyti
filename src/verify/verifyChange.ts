@@ -1,4 +1,5 @@
 import * as path from "path";
+import * as fs from "fs";
 import { extractPrismaSchemaFromSource } from "../extract/prismaExtractor";
 import { extractTypeScriptFromSource } from "../extract/tsExtractor";
 import { findPrismaSchemas, extractPrismaSchema } from "../extract/prismaExtractor";
@@ -106,7 +107,18 @@ function verifyRoute(
   projectRoot: string
 ): "addressed" | "missed" | "not-generated" {
   const content = genMap.get(node.filePath);
-  if (content === undefined) return "not-generated";
+  if (content === undefined) {
+    // File wasn't regenerated — check on-disk content to see if it actually
+    // references the removed field. If not, no changes are needed.
+    const absPath = path.resolve(projectRoot, node.filePath);
+    if (!fs.existsSync(absPath)) return "not-generated";
+    const diskContent = fs.readFileSync(absPath, "utf-8");
+    for (const oldField of oldFields) {
+      const re = new RegExp(`\\b${escapeRegex(oldField)}\\b`);
+      if (re.test(diskContent)) return "not-generated";  // References removed field but wasn't updated
+    }
+    return "addressed";  // Doesn't reference removed field — no changes needed
+  }
 
   const absPath = path.resolve(projectRoot, node.filePath);
   const result = extractTypeScriptFromSource(projectRoot, absPath, content, models);
@@ -136,7 +148,17 @@ function verifyComponent(
   projectRoot: string
 ): "addressed" | "missed" | "not-generated" {
   const content = genMap.get(node.filePath);
-  if (content === undefined) return "not-generated";
+  if (content === undefined) {
+    // File wasn't regenerated — check on-disk content
+    const absPath = path.resolve(projectRoot, node.filePath);
+    if (!fs.existsSync(absPath)) return "not-generated";
+    const diskContent = fs.readFileSync(absPath, "utf-8");
+    for (const oldField of oldFields) {
+      const re = new RegExp(`\\b${escapeRegex(oldField)}\\b`);
+      if (re.test(diskContent)) return "not-generated";
+    }
+    return "addressed";
+  }
 
   const absPath = path.resolve(projectRoot, node.filePath);
   const result = extractTypeScriptFromSource(projectRoot, absPath, content, models);
@@ -164,7 +186,16 @@ function verifyFile(
   genMap: Map<string, string>
 ): "addressed" | "missed" | "not-generated" {
   const content = genMap.get(node.filePath);
-  if (content === undefined) return "not-generated";
+  if (content === undefined) {
+    // File wasn't regenerated — check on-disk content
+    if (!fs.existsSync(node.filePath)) return "not-generated";
+    const diskContent = fs.readFileSync(node.filePath, "utf-8");
+    for (const oldField of oldFields) {
+      const re = new RegExp(`\\b${escapeRegex(oldField)}\\b`);
+      if (re.test(diskContent)) return "not-generated";
+    }
+    return "addressed";
+  }
 
   // Word-boundary search: look for field name used as an identifier
   for (const oldField of oldFields) {

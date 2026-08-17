@@ -383,6 +383,43 @@ export function App({
           });
           return;
         }
+        case "/init-graph": {
+          // Run init-graph asynchronously
+          dispatch({ type: "state", state: "thinking" });
+          dispatch({ type: "activity", activity: "Re-initializing code graph" });
+
+          const projectRoot = process.cwd();
+          import("../../cli/init-graph")
+            .then(({ runInitGraph }) => runInitGraph(projectRoot))
+            .then(() => {
+              dispatch({
+                type: "appendHistory",
+                block: {
+                  kind: "system",
+                  id: id("sys"),
+                  text: "Code graph re-initialized successfully.",
+                },
+              });
+              dispatch({ type: "state", state: "idle" });
+            })
+            .catch((err) => {
+              dispatch({
+                type: "appendHistory",
+                block: {
+                  kind: "error",
+                  id: id("error"),
+                  title: "init-graph failed",
+                  detail: err instanceof Error ? err.message : String(err),
+                  hint: "Check that HydraDB credentials are configured in .env",
+                },
+              });
+              dispatch({ type: "state", state: "error" });
+            })
+            .finally(() => {
+              dispatch({ type: "activity", activity: null });
+            });
+          return;
+        }
         case "/exit":
           exit();
           return;

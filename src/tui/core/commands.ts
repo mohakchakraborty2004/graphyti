@@ -15,6 +15,7 @@ export const COMMANDS: Command[] = [
   { name: "/dry-run", description: "Toggle preview-only mode", aliases: ["dryrun", "preview"] },
   { name: "/debug", description: "Toggle internal detail" },
   { name: "/doctor", description: "Check environment and credentials" },
+  { name: "/init-graph", description: "Re-initialize the code graph", aliases: ["init", "refresh"] },
   { name: "/exit", description: "Quit graphyti", aliases: ["quit"] },
 ];
 
