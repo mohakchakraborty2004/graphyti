@@ -3,3 +3,6 @@ node_modules
 .dbagent
 dist
 .run-esm-*
+.tmp-npm-cache
+web/.next
+web/tsconfig.tsbuildinfo

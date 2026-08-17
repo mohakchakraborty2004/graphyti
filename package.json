@@ -21,7 +21,11 @@
     "test:tui-layout": "tsx src/scripts/test-tui-layout.ts",
     "tui:snapshot": "node run-esm.mjs src/scripts/tui-snapshot.tsx",
     "test:tui-live": "node run-esm.mjs src/scripts/test-tui-live.tsx",
-    "test:tui": "npm run test:tui-text && npm run test:tui-layout && npm run test:tui-live"
+    "test:tui": "npm run test:tui-text && npm run test:tui-layout && npm run test:tui-live",
+    "dev:web": "vite --config web/vite.config.ts",
+    "build:web": "vite build --config web/vite.config.ts",
+    "dev:next": "next dev web -p 3000",
+    "build:next": "next build web"
   },
   "keywords": [],
   "author": "",
@@ -46,6 +50,8 @@
     "ink": "^7.1.1",
     "ink-spinner": "^5.0.0",
     "ink-text-input": "^6.0.0",
+    "lucide-react": "^0.475.0",
+    "next": "^15.1.7",
     "ora": "^8.2.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
@@ -58,6 +64,11 @@
     "@swc-node/register": "^1.12.1",
     "@swc/core": "^1.16.0",
     "@types/diff": "^7.0.2",
-    "tsx": "^4.23.12"
+    "@vitejs/plugin-react": "^4.3.4",
+    "tsx": "^4.23.12",
+    "vite": "^6.1.0"
+  },
+  "optionalDependencies": {
+    "@next/swc-win32-x64-msvc": "^15.5.23"
   }
 }
