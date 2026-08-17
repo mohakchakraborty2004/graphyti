@@ -44,7 +44,7 @@ export const env = {
   hydraDbApiKey: normalize(process.env.HYDRA_DB_API_KEY),
   hydraDbDatabase: normalize(process.env.HYDRA_DB_DATABASE),
   hydraDbCollection: normalize(process.env.HYDRA_DB_COLLECTION),
-  geminiApiKey: normalize(process.env.GEMINI_API_KEY),
+  openrouterApiKey: normalize(process.env.OPENROUTER_API_KEY),
 } as const;
 
 export interface HydraConfig {
@@ -62,8 +62,8 @@ const hydraSchema = z.object({
   HYDRA_DB_DATABASE: z.string().min(1),
 });
 
-const geminiSchema = z.object({
-  GEMINI_API_KEY: z.string().min(1),
+const openrouterSchema = z.object({
+  OPENROUTER_API_KEY: z.string().min(1),
 });
 
 /** Name every missing variable in one message instead of failing on the first. */
@@ -102,12 +102,12 @@ export function requireHydraConfig(): HydraConfig {
 }
 
 /**
- * @throws if GEMINI_API_KEY is missing.
+ * @throws if OPENROUTER_API_KEY is missing.
  */
-export function requireGeminiApiKey(): string {
-  const parsed = geminiSchema.safeParse({ GEMINI_API_KEY: env.geminiApiKey });
+export function requireOpenRouterApiKey(): string {
+  const parsed = openrouterSchema.safeParse({ OPENROUTER_API_KEY: env.openrouterApiKey });
   if (!parsed.success) throw missingConfigError(parsed.error);
-  return parsed.data.GEMINI_API_KEY;
+  return parsed.data.OPENROUTER_API_KEY;
 }
 
 /** Human-readable config state for debug logs. Never prints secret values. */
@@ -117,6 +117,6 @@ export function configSummary(): string {
     `database=${env.hydraDbDatabase ?? "MISSING"}`,
     `collection=${env.hydraDbCollection ?? "(default)"}`,
     `HYDRA_DB_API_KEY=${secret(env.hydraDbApiKey)}`,
-    `GEMINI_API_KEY=${secret(env.geminiApiKey)}`,
+    `OPENROUTER_API_KEY=${secret(env.openrouterApiKey)}`,
   ].join(" ");
 }

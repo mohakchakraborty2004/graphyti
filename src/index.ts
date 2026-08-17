@@ -8,9 +8,12 @@ import { loadContext } from "./utils/StrAnalyzer";
 import { handleAgentOutput, StaleEditError, AmbiguousEditError } from "./agentPipeline";
 import { runInitGraph } from "./cli/init-graph";
 import { retrieveContext } from "./generate/retrieveContext";
-import { extractIntentWithRetry, applyScopedEdits, scopedCodeGen, validateEditPlan, classifyQueryWithRetry, type EditPlan, type FileEdit, type CreateFile, type Classification, type Step } from "./generate/scopedEdit";
-import { verifyBlastRadiusAddressed, type GeneratedFile } from "./verify/verifyChange";
+import { extractIntentWithRetry, applyScopedEdits, applySchemaEdit, scopedCodeGen, validateEditPlan, classifyQueryWithRetry, type EditPlan, type FileEdit, type CreateFile, type Classification, type Step, type SchemaEdit } from "./generate/scopedEdit";
+import { type GeneratedFile } from "./verify/verifyChange";
+import { runUnifiedValidation, type UnifiedValidationResult } from "./verify/unifiedValidation";
 import { reingestFile } from "./graph/incremental";
+import { computeExpectedDelta, type ExpectedDelta } from "./graph/expectedDelta";
+
 import {
   computeBlastRadius,
   formatBlastRadius,
@@ -159,6 +162,8 @@ if (isTui) {
       elapsedMs: 0,
       exitCode: 0,
     };
+
+    try {
 
     // ── Header ─────────────────────────────────────────────────────────────
     print(rule());
@@ -375,6 +380,45 @@ if (isTui) {
     jsonResult.elapsedMs = Date.now() - startTime;
     if (jsonOut) print(JSON.stringify(jsonResult, null, 2));
     return;
+
+    } catch (err) {
+      // ── StepError: expected/handled failure (verification block, write failure, etc.) ──
+      if (err instanceof StepError) {
+        print();
+        print(section("Failed"));
+        print(summaryBox([
+          ["Step", `${err.stepIndex + 1}: ${err.description}`],
+          ["Reason", error(err.reason)],
+          ["Files written", info(`${err.writtenPaths.length}`)],
+          ["Files created", info(`${err.createdPaths.length}`)],
+          ["Elapsed", accent.bold(fmtElapsed(Date.now() - startTime))],
+        ]));
+        if (err.writtenPaths.length === 0 && err.createdPaths.length === 0) {
+          print(`  ${sym.ok} Nothing was written to disk — operation fully rolled back`);
+        }
+        jsonResult.exitCode = 1;
+        jsonResult.filesWritten = err.writtenPaths.map((p) => path.relative(projectRoot, p));
+        jsonResult.elapsedMs = Date.now() - startTime;
+        if (jsonOut) print(JSON.stringify(jsonResult, null, 2));
+        process.exitCode = 1;
+        return;
+      }
+
+      // ── Unexpected crash: genuine internal error ──
+      print();
+      print(section("Unexpected Error"));
+      print(summaryBox([
+        ["Error", error(err instanceof Error ? err.message : String(err))],
+        ["Elapsed", accent.bold(fmtElapsed(Date.now() - startTime))],
+      ]));
+      print(`  ${warn("!")} This is an unexpected internal error, not a verification block.`);
+      print(`  ${info("Stack")}: ${err instanceof Error ? err.stack : "N/A"}`);
+      jsonResult.exitCode = 2;
+      jsonResult.elapsedMs = Date.now() - startTime;
+      if (jsonOut) print(JSON.stringify(jsonResult, null, 2));
+      process.exitCode = 2;
+      return;
+    }
   });
 
 program.parse();
@@ -612,6 +656,7 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
   let promptInjection = "";
   let breakingFieldNamesPerModel: string[][] = [];
   const llmProcessedFiles = new Set<string>();
+  let expectedDeltas: ExpectedDelta[] = [];
 
   if (breakingEdits.length > 0) {
     print(section("Blast Radius"));
@@ -670,6 +715,25 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
     jsonResult.blastRadiusSize = blastSize;
     checkSpin.succeed(`Blast radius computed ${info(fmtElapsed(checkElapsed))}`);
     print();
+
+    // ── Expected structural delta (for HydraDB verification) ───────
+    expectedDeltas = breakingEdits
+      .filter((op): op is SchemaEdit => op.type === "schema")
+      .map((op) => {
+        const blast = blastResults.find(
+          (br) => br.changedNode.id === `model:${op.model}`
+        );
+        return computeExpectedDelta(
+          op,
+          blast ?? {
+            changedNode: { id: `model:${op.model}`, name: op.model, kind: "PrismaModel", filePath: "" },
+            affectedRoutes: [],
+            affectedComponents: [],
+            affectedFiles: [],
+          },
+          projectRoot
+        );
+      });
 
     // ── Confirmation ───────────────────────────────────────────────
     if (!dryRun && !yes) {
@@ -793,76 +857,280 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
     }
   }
 
-  // ── 6. Verification ───────────────────────────────────────────────
+  // ── 6. Unified Structural Verification ─────────────────────────────
   let verifiedActions = actions;
-  let verifyReport = { addressed: [] as any[], missed: [] as any[], retryPrompt: "" };
 
   if (blastResults.length > 0 && !dryRun) {
-    print(section("Verification"));
+    print(section("Structural Verification"));
 
-    const allAffectedPaths = [...new Set(
-      blastResults.flatMap((r) => [
-        ...r.affectedRoutes.map((n) => n.filePath),
-        ...r.affectedComponents.map((n) => n.filePath),
-        ...r.affectedFiles.map((n) => n.filePath),
-      ])
-    )];
+    // Collect all affected node IDs for graph check
+    const allAffectedNodeIds = [
+      ...blastResults.flatMap((r) => [
+        ...r.affectedRoutes.map((n) => n.id),
+        ...r.affectedComponents.map((n) => n.id),
+        ...r.affectedFiles.map((n) => n.id),
+      ]),
+    ];
 
-    const planEditedPaths = new Set(
-      actions
-        .filter((a) => a.type === "file")
-        .map((a) => {
-          const fe = a as FileEdit;
-          const abs = path.isAbsolute(fe.filePath) ? fe.filePath : path.resolve(projectRoot, fe.filePath);
-          return path.relative(projectRoot, abs).replace(/\\/g, "/");
-        })
-    );
-
-    for (const f of llmProcessedFiles) {
-      const abs = path.isAbsolute(f) ? f : path.resolve(projectRoot, f);
-      planEditedPaths.add(path.relative(projectRoot, abs).replace(/\\/g, "/"));
-    }
-
-    const allMissed: any[] = [];
-    const allAddressed: any[] = [];
-
-    for (const affectedPath of allAffectedPaths) {
-      if (planEditedPaths.has(affectedPath)) {
-        allAddressed.push({ filePath: affectedPath, reason: "covered by edit plan" });
-      } else {
-        const blastEntry = blastResults
-          .flatMap((r) => [...r.affectedRoutes, ...r.affectedComponents, ...r.affectedFiles])
-          .find((n) => n.filePath === affectedPath);
-        allMissed.push({
-          filePath: affectedPath,
-          reason: blastEntry?.reason ?? "in blast radius but no edit generated",
-        });
+    // Build generatedFiles for both checks
+    const generatedFilesForValidation: GeneratedFile[] = [];
+    for (const action of actions) {
+      if (action.type !== "file") continue;
+      const fe = action as FileEdit;
+      const absPath = path.isAbsolute(fe.filePath)
+        ? fe.filePath
+        : path.resolve(projectRoot, fe.filePath);
+      if (!fs.existsSync(absPath)) continue;
+      try {
+        const current = fs.readFileSync(absPath, "utf-8");
+        const content = applyScopedEdits(current, fe.edits, fe.filePath);
+        generatedFilesForValidation.push({ path: absPath, content });
+      } catch {
+        // If edits can't be applied, skip this file
       }
     }
 
-    verifyReport = {
-      addressed: allAddressed,
-      missed: allMissed,
-      retryPrompt: "",
-    };
+    // Build proposed schema source for graph check
+    const schemaEdit = actions.find((a): a is SchemaEdit => a.type === "schema");
+    let proposedSchemaSource: string | undefined;
+    if (schemaEdit) {
+      const schemaPath = findSchemaPath(projectRoot);
+      if (schemaPath) {
+        const currentSchema = fs.readFileSync(schemaPath, "utf-8");
+        try {
+          proposedSchemaSource = applySchemaEdit(currentSchema, schemaEdit, schemaPath, projectRoot);
+        } catch {
+          print(`  ${warn("!")} Could not compute proposed schema for graph verification`);
+        }
+      }
+    }
 
-    if (allMissed.length > 0) {
-      printErr(`  ${error("✗")} ${allMissed.length} blast-radius file(s) not addressed:`);
-      for (const m of allMissed) {
+    const verifySpin = spinner("Running unified structural validation...");
+    verifySpin.start();
+    const verifyStart = Date.now();
+
+    let unifiedResult: UnifiedValidationResult;
+    try {
+      unifiedResult = await runUnifiedValidation({
+        blastRadius: blastResults[0],
+        breakingFieldNames: breakingFieldNamesPerModel.flat(),
+        generatedFiles: generatedFilesForValidation,
+        expectedDeltas,
+        blastRadiusAffectedNodeIds: allAffectedNodeIds,
+        projectRoot,
+        proposedSchemaSource,
+      });
+    } catch (err) {
+      unifiedResult = {
+        localCheck: { addressed: 0, missed: 0, report: { addressed: [], missed: [], retryPrompt: "" } },
+        graphCheck: { addressed: 0, missed: 1, staleNodesFound: 0, report: { graphAddressed: [], graphMissed: [{ nodeId: "unknown", reason: err instanceof Error ? err.message : String(err) }], staleNodesFound: [] } },
+        graphCheckSkipped: false,
+        overallPassed: false,
+        summary: `Structural validation FAILED: ${err instanceof Error ? err.message : err}`,
+        resolutionReason: `ERROR: ${err instanceof Error ? err.message : err}`,
+      };
+    }
+
+    const verifyElapsed = Date.now() - verifyStart;
+
+    if (unifiedResult.overallPassed) {
+      verifySpin.succeed(`Structural verification passed ${info(fmtElapsed(verifyElapsed))}`);
+    } else {
+      verifySpin.fail(`Structural verification failed ${info(fmtElapsed(verifyElapsed))}`);
+    }
+
+    // Display both checks distinctly
+    const totalAffected = unifiedResult.localCheck.addressed + unifiedResult.localCheck.missed;
+    const localStatus = unifiedResult.localCheck.missed === 0 ? success("PASSED") : error("FAILED");
+
+    // Graph check line: show SKIPPED when it was short-circuited, otherwise show real result
+    let graphLine: string;
+    if (unifiedResult.graphCheckSkipped) {
+      graphLine = `  Graph structural check: ${info("SKIPPED")} (local check failed first)`;
+    } else {
+      const graphStatus = unifiedResult.graphCheck.staleNodesFound > 0
+        ? error("FAILED (stale nodes)")
+        : unifiedResult.graphCheck.missed > 0
+          ? warn("PASSED (with warnings)")
+          : success("PASSED");
+      graphLine = `  Graph structural check: ${graphStatus} (${unifiedResult.graphCheck.addressed} relations confirmed, ${unifiedResult.graphCheck.staleNodesFound} stale nodes)`;
+    }
+
+    print(`  Local structural check: ${localStatus} (${unifiedResult.localCheck.addressed}/${totalAffected} files verified)`);
+    print(graphLine);
+
+    if (unifiedResult.localCheck.missed > 0) {
+      printErr(`\n  ${error("✗")} Local check — missed files:`);
+      for (const m of unifiedResult.localCheck.report.missed) {
         printErr(`    ${sym.bullet} ${m.filePath}`);
         printErr(`      ${m.reason}`);
       }
+    }
+
+    if (!unifiedResult.graphCheckSkipped && unifiedResult.graphCheck.staleNodesFound > 0) {
+      printErr(`\n  ${error("✗")} Graph check — stale nodes (invisible to local re-parsing):`);
+      for (const stale of unifiedResult.graphCheck.report.staleNodesFound) {
+        printErr(`    ${sym.bullet} ${stale.nodeId} — still references stale node ${stale.staleRef}`);
+      }
+    }
+
+    if (!unifiedResult.graphCheckSkipped && unifiedResult.graphCheck.missed > 0 && unifiedResult.graphCheck.staleNodesFound === 0) {
+      print(`\n  ${warn("!")} Graph check — ${unifiedResult.graphCheck.missed} relation(s) differ (likely inferred, not blocking):`);
+      for (const miss of unifiedResult.graphCheck.report.graphMissed) {
+        print(`    ${sym.bullet} ${miss.nodeId}: ${miss.reason}`);
+      }
+    }
+
+    print(`  ${info("Resolution")}: ${unifiedResult.resolutionReason}`);
+
+    // ── 6b. Retry mechanism: if local check failed, re-prompt once ──
+    if (!unifiedResult.overallPassed && unifiedResult.localCheck.missed > 0) {
+      const retryPrompt = unifiedResult.localCheck.report.retryPrompt;
+      if (retryPrompt) {
+        print();
+        print(`  ${warn("!")} Attempting one retry to fix ${unifiedResult.localCheck.missed} missed file(s)...`);
+        const retrySpin = spinner("Re-generating for missed files...");
+        retrySpin.start();
+        const retryStart = Date.now();
+
+        // Build the retry query with missed files appended
+        const retryQuery = query + retryPrompt;
+
+        try {
+          const retryPlan = await extractIntentWithRetry(retryQuery, context);
+          const retryActions = await codeGen(retryPlan, retryQuery, context);
+
+          if (retryActions?.length) {
+            // Build generated files for retry verification: first-pass verified + retry-generated
+            // This ensures the retry check sees the union, not just the retry output
+            const retryGeneratedFiles: GeneratedFile[] = [...generatedFilesForValidation];
+            for (const action of retryActions) {
+              if (action.type !== "file") continue;
+              const fe = action as FileEdit;
+              const absPath = path.isAbsolute(fe.filePath)
+                ? fe.filePath
+                : path.resolve(projectRoot, fe.filePath);
+              if (!fs.existsSync(absPath)) continue;
+              try {
+                const current = fs.readFileSync(absPath, "utf-8");
+                const content = applyScopedEdits(current, fe.edits, fe.filePath);
+                // Replace or add the file entry (retry overrides first-pass for same path)
+                const rel = path.relative(projectRoot, absPath).replace(/\\/g, "/");
+                const existingIdx = retryGeneratedFiles.findIndex((f) => {
+                  const fRel = path.relative(projectRoot, f.path).replace(/\\/g, "/");
+                  return fRel === rel;
+                });
+                if (existingIdx >= 0) {
+                  retryGeneratedFiles[existingIdx] = { path: absPath, content };
+                } else {
+                  retryGeneratedFiles.push({ path: absPath, content });
+                }
+              } catch {
+                // If edits can't be applied, skip this file
+              }
+            }
+
+            // Re-run local verification with the retry results
+            const retryResult = await runUnifiedValidation({
+              blastRadius: blastResults[0],
+              breakingFieldNames: breakingFieldNamesPerModel.flat(),
+              generatedFiles: retryGeneratedFiles,
+              expectedDeltas: [],  // Skip graph check on retry — only re-check local
+              blastRadiusAffectedNodeIds: allAffectedNodeIds,
+              projectRoot,
+              proposedSchemaSource,
+            });
+
+            const retryElapsed = Date.now() - retryStart;
+
+            if (retryResult.localCheck.missed === 0) {
+              // Retry succeeded — merge: keep first-pass verified edits + retry edits for missed files
+              retrySpin.succeed(`Retry succeeded ${info(fmtElapsed(retryElapsed))}`);
+              print(`  ${sym.ok} All ${retryResult.localCheck.addressed + retryResult.localCheck.missed} blast-radius files now addressed`);
+
+              // Collect the file paths that were missed in the first pass (now fixed by retry)
+              const missedFilePaths = new Set(
+                unifiedResult.localCheck.report.missed.map((m) => m.filePath)
+              );
+
+              // Start with all first-pass actions that are NOT file edits for missed paths
+              const mergedActions = actions.filter((a) => {
+                if (a.type !== "file") return true; // keep schema, command, create_file
+                const fe = a as FileEdit;
+                const abs = path.isAbsolute(fe.filePath)
+                  ? fe.filePath
+                  : path.resolve(projectRoot, fe.filePath);
+                const rel = path.relative(projectRoot, abs).replace(/\\/g, "/");
+                return !missedFilePaths.has(rel); // keep only if NOT in missed list
+              });
+
+              // Add all retry actions (they cover the missed files)
+              mergedActions.push(...retryActions);
+
+              verifiedActions = mergedActions;
+              jsonResult.verification = "passed (after retry)";
+              print();
+            } else {
+              // Retry still failed — hard block
+              retrySpin.fail(`Retry failed ${info(fmtElapsed(retryElapsed))}`);
+              printErr(`\n  ${error("✗")} Retry still missed ${retryResult.localCheck.missed} file(s):`);
+              for (const m of retryResult.localCheck.report.missed) {
+                printErr(`    ${sym.bullet} ${m.filePath}`);
+                printErr(`      ${m.reason}`);
+              }
+              print();
+              throw new StepError(
+                stepIndex, description,
+                `Verification failed after retry: ${retryResult.localCheck.missed} file(s) still not addressed`,
+                opts.cumulativeResult.allWrittenPaths,
+                opts.cumulativeResult.allCreatedPaths
+              );
+            }
+          } else {
+            // Retry returned no actions
+            retrySpin.fail("Retry returned no actions");
+            print();
+            throw new StepError(
+              stepIndex, description,
+              `Verification failed: retry returned no actions for ${unifiedResult.localCheck.missed} missed file(s)`,
+              opts.cumulativeResult.allWrittenPaths,
+              opts.cumulativeResult.allCreatedPaths
+            );
+          }
+        } catch (err) {
+          if (err instanceof StepError) throw err;
+          retrySpin.fail(`Retry error: ${err instanceof Error ? err.message : err}`);
+          print();
+          throw new StepError(
+            stepIndex, description,
+            `Verification retry failed: ${err instanceof Error ? err.message : err}`,
+            opts.cumulativeResult.allWrittenPaths,
+            opts.cumulativeResult.allCreatedPaths
+          );
+        }
+      } else {
+        // No retry prompt available — hard block
+        print();
+        throw new StepError(
+          stepIndex, description,
+          `Structural verification failed: ${unifiedResult.resolutionReason}`,
+          opts.cumulativeResult.allWrittenPaths,
+          opts.cumulativeResult.allCreatedPaths
+        );
+      }
+    } else if (!unifiedResult.overallPassed) {
+      // Failed but no missed files (e.g. stale nodes) — hard block
+      print();
       throw new StepError(
         stepIndex, description,
-        `Verification failed: ${allMissed.length} blast-radius file(s) not addressed`,
+        `Structural verification failed: ${unifiedResult.resolutionReason}`,
         opts.cumulativeResult.allWrittenPaths,
         opts.cumulativeResult.allCreatedPaths
       );
     }
 
-    print(`  ${sym.ok} All ${allAddressed.length} blast-radius file(s) addressed`);
-    jsonResult.verification = "passed";
     print();
+    jsonResult.verification = "passed";
   }
 
   // ── 7. Write ──────────────────────────────────────────────────────

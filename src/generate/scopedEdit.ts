@@ -1,8 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { z } from "zod";
-import { GoogleGenAI, Type } from "@google/genai";
-import { requireGeminiApiKey } from "../config";
+import { generateCompletion } from "./llmClient";
 import {
   structuralSchemaMerge,
   formatPrismaSchema,
@@ -30,7 +29,49 @@ const SchemaEditSchema = z.object({
   fieldType: z.string().optional(),
   newFieldType: z.string().optional(),
   modelBody: z.string().optional(),
-});
+}).refine(
+  (data) => {
+    if (data.op === "add_field") {
+      return typeof data.fieldName === "string" && data.fieldName.length > 0
+        && typeof data.fieldType === "string" && data.fieldType.length > 0;
+    }
+    return true;
+  },
+  {
+    message: "add_field requires both fieldName and fieldType",
+  }
+).refine(
+  (data) => {
+    if (data.op === "remove_field" || data.op === "rename_field" || data.op === "change_type") {
+      return typeof data.fieldName === "string" && data.fieldName.length > 0;
+    }
+    return true;
+  },
+  {
+    message: "remove_field/rename_field/change_type requires fieldName",
+  }
+).refine(
+  (data) => {
+    if (data.op === "rename_field") {
+      return typeof data.newFieldName === "string" && data.newFieldName.length > 0;
+    }
+    return true;
+  },
+  {
+    message: "rename_field requires newFieldName",
+  }
+).refine(
+  (data) => {
+    if (data.op === "change_type") {
+      return typeof data.fieldType === "string" && data.fieldType.length > 0
+        && typeof data.newFieldType === "string" && data.newFieldType.length > 0;
+    }
+    return true;
+  },
+  {
+    message: "change_type requires fieldType and newFieldType",
+  }
+);
 
 const FileEditSchema = z.object({
   type: z.literal("file"),
@@ -93,12 +134,13 @@ function normalizeEditPlan(raw: unknown): unknown {
         .filter((e: any) => e.oldText !== "" || e.newText !== ""); // drop empty edits
     }
 
-    // Normalize SchemaEdit fields
+    // Normalize SchemaEdit fields — do NOT default fieldName/fieldType;
+    // missing values must fail validation and trigger a retry.
     if (normalized.type === "schema") {
-      normalized.fieldName = normalized.fieldName ?? undefined;
-      normalized.newFieldName = normalized.newFieldName ?? undefined;
-      normalized.fieldType = normalized.fieldType ?? undefined;
-      normalized.newFieldType = normalized.newFieldType ?? undefined;
+      if (normalized.fieldName === null) normalized.fieldName = undefined;
+      if (normalized.newFieldName === null) normalized.newFieldName = undefined;
+      if (normalized.fieldType === null) normalized.fieldType = undefined;
+      if (normalized.newFieldType === null) normalized.newFieldType = undefined;
       normalized.modelBody = normalized.modelBody ?? undefined;
     }
 
@@ -251,44 +293,16 @@ export async function classifyQuery(
   query: string,
   context: string
 ): Promise<{ classification: Classification; raw: unknown }> {
-  const apiKey = requireGeminiApiKey();
-  const ai = new GoogleGenAI({ apiKey });
-
   const contents = `${CLASSIFICATION_PROMPT}\n\nUser request: ${query}\n\nProject context:\n${context}\n\nReturn ONLY a JSON object. No prose, no explanation.`;
 
-  const genPromise = ai.models.generateContent({
-    model: "gemini-3.5-flash-lite",
-    contents,
-    config: {
-      thinkingConfig: { thinkingBudget: 1024 },
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          decomposable: { type: Type.BOOLEAN },
-          steps: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                description: { type: Type.STRING },
-                kind: { type: Type.STRING },
-              },
-              propertyOrdering: ["description", "kind"],
-            },
-          },
-        },
-        propertyOrdering: ["decomposable", "steps"],
-      },
-    },
-  });
+  const genPromise = generateCompletion(contents, { responseFormat: "json" });
 
   const timeoutPromise = new Promise<never>((_, reject) =>
     setTimeout(() => reject(new Error("Classification timed out after 15s")), 15_000)
   );
 
-  const response = await Promise.race([genPromise, timeoutPromise]);
-  const raw = JSON.parse(response.text!);
+  const text = await Promise.race([genPromise, timeoutPromise]);
+  const raw = JSON.parse(text);
   return { classification: raw as Classification, raw };
 }
 
@@ -375,9 +389,6 @@ export async function extractIntent(
   /** Current schema.prisma source — needed so the LLM can reference exact field names. */
   schemaSource?: string
 ): Promise<{ plan: EditPlan; raw: unknown }> {
-  const apiKey = requireGeminiApiKey();
-  const ai = new GoogleGenAI({ apiKey });
-
   const userContent = [
     `User query: ${query}`,
     `\nProject context:\n${context}`,
@@ -387,64 +398,18 @@ export async function extractIntent(
     `\nReturn ONLY a JSON array of operations. No prose, no explanation.`,
   ].join("\n");
 
-  const genPromise = ai.models.generateContent({
-    model: "gemini-3.5-flash-lite",
-    contents: `${INTENT_EXTRACTION_PROMPT}\n\n${userContent}`,
-    config: {
-      thinkingConfig: { thinkingBudget: 4096 },
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: Type.ARRAY,
-        items: {
-          type: Type.OBJECT,
-          properties: {
-            type: { type: Type.STRING },
-            model: { type: Type.STRING },
-            op: { type: Type.STRING },
-            fieldName: { type: Type.STRING },
-            newFieldName: { type: Type.STRING },
-            fieldType: { type: Type.STRING },
-            newFieldType: { type: Type.STRING },
-            modelBody: { type: Type.STRING },
-            filePath: { type: Type.STRING },
-            edits: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  filePath: { type: Type.STRING },
-                  oldText: { type: Type.STRING },
-                  newText: { type: Type.STRING },
-                },
-              },
-            },
-            command: { type: Type.STRING },
-          },
-          propertyOrdering: [
-            "type",
-            "model",
-            "op",
-            "fieldName",
-            "newFieldName",
-            "fieldType",
-            "newFieldType",
-            "modelBody",
-            "filePath",
-            "edits",
-            "command",
-          ],
-        },
-      },
-    },
-  });
+  const genPromise = generateCompletion(
+    `${INTENT_EXTRACTION_PROMPT}\n\n${userContent}`,
+    { responseFormat: "json" }
+  );
 
   const timeoutPromise = new Promise<never>((_, reject) =>
     setTimeout(() => reject(new Error("Intent extraction timed out after 30s")), 30_000)
   );
 
-  const response = await Promise.race([genPromise, timeoutPromise]);
+  const text = await Promise.race([genPromise, timeoutPromise]);
 
-  const raw = JSON.parse(response.text!);
+  const raw = JSON.parse(text);
   return { plan: raw as EditPlan, raw };
 }
 
@@ -816,9 +781,6 @@ export async function scopedCodeGen(
   plan: EditPlan,
   timeoutMs = 60_000
 ): Promise<EditPlan> {
-  const apiKey = requireGeminiApiKey();
-  const ai = new GoogleGenAI({ apiKey });
-
   const prompt = `${SCOPEDCodeGenPrompt}
 
 User query: ${query}
@@ -831,64 +793,15 @@ ${JSON.stringify(plan, null, 2)}
 
 Remember: for file edits, provide EXACT oldText (verbatim from current file) and newText (minimal replacement). For schema and command entries, pass them through as-is.`;
 
-  const genPromise = ai.models.generateContent({
-    model: "gemini-3.5-flash-lite",
-    contents: prompt,
-    config: {
-      thinkingConfig: { thinkingBudget: 20000 },
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: Type.ARRAY,
-        items: {
-          type: Type.OBJECT,
-          properties: {
-            type: { type: Type.STRING },
-            model: { type: Type.STRING },
-            op: { type: Type.STRING },
-            fieldName: { type: Type.STRING },
-            newFieldName: { type: Type.STRING },
-            fieldType: { type: Type.STRING },
-            newFieldType: { type: Type.STRING },
-            modelBody: { type: Type.STRING },
-            filePath: { type: Type.STRING },
-            edits: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  filePath: { type: Type.STRING },
-                  oldText: { type: Type.STRING },
-                  newText: { type: Type.STRING },
-                },
-              },
-            },
-            command: { type: Type.STRING },
-          },
-          propertyOrdering: [
-            "type",
-            "model",
-            "op",
-            "fieldName",
-            "newFieldName",
-            "fieldType",
-            "newFieldType",
-            "modelBody",
-            "filePath",
-            "edits",
-            "command",
-          ],
-        },
-      },
-    },
-  });
+  const genPromise = generateCompletion(prompt, { responseFormat: "json" });
 
   const timeoutPromise = new Promise<never>((_, reject) =>
     setTimeout(() => reject(new Error(`LLM generation timed out after ${Math.round(timeoutMs / 1000)}s`)), timeoutMs)
   );
 
-  const response = await Promise.race([genPromise, timeoutPromise]);
+  const text = await Promise.race([genPromise, timeoutPromise]);
 
-  return JSON.parse(response.text!) as EditPlan;
+  return JSON.parse(text) as EditPlan;
 }
 
 /**

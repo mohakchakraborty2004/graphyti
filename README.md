@@ -28,10 +28,43 @@ moments: **grounding at generation time**, so the model sees the real schema and
 the real call sites instead of guessing; **blast radius before writing**, so
 every downstream dependent of a breaking change is enumerated from the graph and
 shown to you for confirmation *before* a single file is touched; and
-**mechanical verification after generation, before commit**, which re-parses the
-generated code and fails the run if any file in the blast radius still
-references a removed or renamed field. The verifier is deterministic AST and
-text matching, not another model call — it cannot be talked out of a failure.
+**mechanical verification after generation, before commit**, which uses a
+two-layer structural validation approach.
+
+### Two-layer structural validation
+
+After code generation, Graphyti runs two independent verification passes:
+
+1. **Local deterministic check** (`src/verify/verifyChange.ts`) — re-parses
+   every file in the blast radius using AST extraction and text matching to
+   confirm that no file still references a removed or renamed field. This is
+   fully deterministic: no network calls, no HydraDB timing dependencies, no LLM
+   calls. If this check fails, the write is blocked immediately.
+
+2. **HydraDB graph round-trip check** (`src/graph/hydraVerify.ts`) — stages the
+   proposed graph state into HydraDB, queries the relations for each consumer
+   node, and verifies that stale references to the old field are gone. This
+   catches a class of bug that local re-parsing structurally *cannot* see:
+   HydraDB's own stored relations still pointing at a deleted or renamed node,
+   which would leave the graph out of sync with disk even after the local files
+   are correct.
+
+**Resolution rule**: local check is the primary gate. If it fails, the write is
+blocked regardless of the graph check. If local passes but the graph check finds
+stale nodes, the write is also blocked — that is a real hygiene bug. If local
+passes and the graph check only disagrees on soft/inferred relations that were
+never part of the explicit expected delta, a warning is logged but the write is
+not blocked — HydraDB's automatic entity/relation extraction from ingested
+content can surface extra inferred relations that aren't errors.
+
+The CLI output shows both checks distinctly:
+
+```
+  Local structural check: PASSED (3/3 files verified)
+  Graph structural check: PASSED (3/3 relations confirmed, 0 stale nodes)
+```
+
+so it is visibly two independent layers, not one combined pass/fail.
 
 ---
 
@@ -98,14 +131,15 @@ rather than a wrong answer).
 
 | What | Where |
 | --- | --- |
-| **`client.context.relations`** — HydraDB's neighbours for the changed node | [`src/graph/blastRadius.ts:166`](src/graph/blastRadius.ts#L166) |
-| `checkHydraConsistency()` — the cross-check itself | [`src/graph/blastRadius.ts:160`](src/graph/blastRadius.ts#L160) |
-| Neighbour ids read out of the returned relation triplets | [`src/graph/blastRadius.ts:177`](src/graph/blastRadius.ts#L177) |
-| local-only / HydraDB-only diff → agree ✅ or warn ⚠️ | [`src/graph/blastRadius.ts:190`](src/graph/blastRadius.ts#L190) |
-| `computeBlastRadius()` — 3-hop BFS + the cross-check | [`src/graph/blastRadius.ts:248`](src/graph/blastRadius.ts#L248) |
+| **`client.context.relations`** — HydraDB's neighbours for the changed node | [`src/graph/blastRadius.ts:142`](src/graph/blastRadius.ts#L142) |
+| `checkHydraConsistency()` — the cross-check itself | [`src/graph/blastRadius.ts:130`](src/graph/blastRadius.ts#L130) |
+| Neighbour ids read out of the returned relation triplets | [`src/graph/blastRadius.ts:155`](src/graph/blastRadius.ts#L155) |
+| local-only / HydraDB-only diff → agree ✅ or warn ⚠️ | [`src/graph/blastRadius.ts:168`](src/graph/blastRadius.ts#L168) |
+| `computeBlastRadius()` — 3-hop BFS + the cross-check | [`src/graph/blastRadius.ts:211`](src/graph/blastRadius.ts#L211) |
 
 Driven by the schema diff in [`src/generate/preWriteCheck.ts:295`](src/generate/preWriteCheck.ts#L295), and
-consumed by the verifier at [`src/verify/verifyChange.ts:218`](src/verify/verifyChange.ts#L218).
+consumed by the unified structural validator at [`src/verify/unifiedValidation.ts`](src/verify/unifiedValidation.ts)
+which combines the local deterministic check with the HydraDB graph round-trip check.
 
 ### Client and configuration
 
