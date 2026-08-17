@@ -306,7 +306,7 @@ export function wrapText(text: string, maxWidth: number, options: WrapOptions = 
     const firstAvail = maxWidth - firstPrefix;
     const contAvail = maxWidth - contPrefix;
 
-    const tokens = splitTokens(body);
+    const tokens = splitTokens(body, contAvail);
 
     let line = "";
     let lineWidth = 0;
@@ -373,14 +373,16 @@ export function wrapText(text: string, maxWidth: number, options: WrapOptions = 
 }
 
 /**
- * Split into tokens, keeping single spaces as their own tokens so the wrapper
- * can decide whether a space survives a line break.
+ * Split into tokens, keeping single spaces as their own tokens so the wrapper can
+ * decide whether a space survives a line break.
  *
- * Breaks are also allowed *after* path separators, `.`, `-`, `_`, `,` and `?`
- * and `&` inside long unbroken runs, so URLs and file paths wrap at meaningful
- * boundaries instead of arbitrary cell counts.
+ * Tokens wider than `fitWidth` are additionally split after `/ \ . - _ , ? & = :`
+ * so that long paths and URLs break at meaningful boundaries. That split is a
+ * *fallback for tokens that cannot fit*, not a default: applying it universally
+ * would break ordinary prose at every full stop, turning "Next.js" into "Next."
+ * and an orphaned "js".
  */
-function splitTokens(text: string): string[] {
+function splitTokens(text: string, fitWidth: number): string[] {
   const words = text.split(/( )/).filter((t) => t.length > 0);
   const out: string[] = [];
 
@@ -389,15 +391,22 @@ function splitTokens(text: string): string[] {
       out.push(word);
       continue;
     }
+
+    // Fits on a line as-is: no reason to look for break points inside it.
+    if (visualWidth(word) <= fitWidth) {
+      out.push(word);
+      continue;
+    }
+
     // Keep the separator attached to the end of the preceding fragment, so a
     // wrapped path reads "src/auth/" + "session.ts" rather than "src/auth" +
     // "/session.ts".
-    const fragments = word.split(/(?<=[/\\.\-_,?&=:])/);
+    const fragments = word.split(/(?<=[/\\.\-_,?&=:])/).filter((f) => f.length > 0);
     if (fragments.length === 1) {
       out.push(word);
       continue;
     }
-    out.push(...fragments.filter((f) => f.length > 0));
+    out.push(...fragments);
   }
 
   return out;

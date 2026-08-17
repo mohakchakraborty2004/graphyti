@@ -17,7 +17,6 @@ import { wrapText } from "../../core/text";
 import type { TerminalDimensions } from "../../layout/useTerminalLayout";
 
 interface WelcomeProps {
-  version: string;
   layout: TerminalDimensions;
   dryRun: boolean;
 }
@@ -34,7 +33,7 @@ const EXAMPLES = [
   "Why is the session token rejected?",
 ];
 
-export function WelcomeScreen({ version, layout, dryRun }: WelcomeProps) {
+export function WelcomeScreen({ layout, dryRun }: WelcomeProps) {
   const { contentWidth, maxTextWidth, height, isNarrow } = layout;
 
   // Height budget for this screen: shed sections rather than overflow.
@@ -46,22 +45,22 @@ export function WelcomeScreen({ version, layout, dryRun }: WelcomeProps) {
 
   return (
     <Box flexDirection="column" flexShrink={0}>
-      <Box flexDirection="row" flexShrink={0}>
-        <Text color={UI_COLORS.accent} bold>
-          graphyti
-        </Text>
-        <Text color={UI_COLORS.muted} dimColor>
-          {`  v${version}`}
-        </Text>
-        {dryRun && <Text color={UI_COLORS.warning}>{"  dry run"}</Text>}
-      </Box>
-
-      <Box marginTop={1} flexDirection="column" flexShrink={0}>
+      {/*
+        No wordmark here — the header already carries it, and repeating it is the
+        kind of redundancy §33 asks us to strip. This screen opens with what the
+        tool does, which is the thing a first-time user actually needs.
+      */}
+      <Box flexDirection="column" flexShrink={0}>
         {wrapText(tagline, maxTextWidth).map((row, i) => (
           <Text key={i} color={UI_COLORS.muted} wrap="truncate-end">
             {row}
           </Text>
         ))}
+        {dryRun && (
+          <Text color={UI_COLORS.warning} wrap="truncate-end">
+            {`${UI_SYMBOLS.warning} dry run — nothing will be written`}
+          </Text>
+        )}
       </Box>
 
       {showCapabilities && (

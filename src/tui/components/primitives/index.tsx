@@ -10,6 +10,7 @@
 import React from "react";
 import { Box, Text } from "ink";
 import { clipLine, type Line, type Span } from "../../core/line";
+import type { KeyHint } from "../../core/hints";
 import {
   SPINNER_FRAMES,
   SPINNER_INTERVAL_MS,
@@ -141,11 +142,6 @@ export function Divider({ width }: { width: number }) {
 }
 
 // ── Key hints ────────────────────────────────────────────────────────────────
-
-export interface KeyHint {
-  keys: string;
-  label: string;
-}
 
 /**
  * Contextual keyboard hints (§17).

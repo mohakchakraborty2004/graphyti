@@ -276,6 +276,35 @@ function testWrapBehaviour() {
     !wrapText("a\tb", 40, { normalizeWhitespace: false })[0]!.includes("\t"),
     "no tab survives into output"
   );
+
+  // Separator-breaking is a fallback for tokens that cannot fit, not a default.
+  // Applied universally it mangles ordinary prose: "Next.js" becomes "Next." on
+  // one line and an orphaned "js" on the next.
+  const prose2 = wrapText("Graph-grounded code generation for Next.js and Prisma.", 40);
+  ok(
+    prose2.every((l) => !/\.$/.test(l.trim()) || l.trim().endsWith("Prisma.")),
+    "prose does not break after a full stop mid-word",
+    JSON.stringify(prose2)
+  );
+  ok(
+    prose2.join(" ").includes("Next.js"),
+    "a short dotted token stays intact",
+    JSON.stringify(prose2)
+  );
+  ok(
+    wrapText("well-formed and self-contained words", 40).join(" ").includes("well-formed"),
+    "a short hyphenated token stays intact"
+  );
+
+  // But a token that genuinely cannot fit must still break at a separator.
+  const url = wrapText("https://registry.example.com/api/v2/packages/name-1.2.3.tgz", 24);
+  ok(url.every((l) => visualWidth(l) <= 24), "over-long URL respects width");
+  ok(url.length > 1, "over-long URL is broken up");
+  ok(
+    url.some((l) => /[/.]$/.test(l)),
+    "over-long URL breaks at a separator",
+    JSON.stringify(url)
+  );
 }
 
 function testPathWrapping() {

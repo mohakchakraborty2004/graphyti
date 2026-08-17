@@ -3,127 +3,46 @@
  *
  * Written from scratch rather than using `ink-text-input`, which is single-line,
  * has no history, and — the reason the old input's right border marched across
- * the screen as you typed — renders without any notion of the width it has to
- * live within.
+ * the screen as you typed — renders without any notion of the width it must live
+ * within.
  *
- * The model is a single string plus a cursor index. Everything visual is derived
- * from that: display rows come from wrapping the value to `width`, and the
- * caret's row/column come from the same wrap, so the caret can never disagree
- * with the text it sits in.
+ * **All edits are functional updates.** Ink parses a single stdin chunk into
+ * several key events and dispatches them synchronously in one tick, so a handler
+ * that computes its next value from props reads the same stale value for every
+ * keystroke in the burst and all but the last character is lost. Typing quickly
+ * or pasting is exactly that case. Every branch below therefore transforms
+ * `prev`, never the props.
+ *
+ * Wrapping and caret arithmetic live in `core/editor`.
  */
 
 import React from "react";
 import { Box, Text, useInput } from "ink";
 import { UI_COLORS, UI_SYMBOLS } from "../../theme/tokens";
-import { cells, visualWidth } from "../../core/text";
+import { cells } from "../../core/text";
+import {
+  caretPosition,
+  graphemeAfter,
+  graphemeBefore,
+  layoutEditor,
+  offsetForRowColumn,
+  wordStart,
+} from "../../core/editor";
 
-/** Rows of the editor the input area will ever show before scrolling. */
-const MAX_VISIBLE_ROWS = 6;
+/** Rows of the editor shown before it scrolls internally. */
+export const MAX_EDITOR_ROWS = 6;
 
-export interface EditorRow {
-  text: string;
-  /** Index into the value at which this row starts. */
-  start: number;
-}
-
-/**
- * Break `value` into display rows of at most `width` cells.
- *
- * Breaks at spaces when possible and mid-token when not, so a long unbroken
- * paste cannot overflow. Rows are returned with their source offsets so caret
- * position is a lookup rather than a second, possibly-divergent calculation.
- */
-export function layoutEditor(value: string, width: number): EditorRow[] {
-  const safeWidth = Math.max(1, width);
-  const rows: EditorRow[] = [];
-
-  for (const paragraph of splitKeepingOffsets(value, "\n")) {
-    if (paragraph.text.length === 0) {
-      rows.push({ text: "", start: paragraph.start });
-      continue;
-    }
-
-    let rowStart = paragraph.start;
-    let current = "";
-    let currentWidth = 0;
-    let lastBreak = -1;
-
-    const graphemes = cells(paragraph.text);
-    let offset = 0;
-
-    for (const cell of graphemes) {
-      if (currentWidth + cell.width > safeWidth) {
-        // Prefer breaking at the last space in this row; fall back to a hard
-        // break so an unbroken token still fits.
-        if (lastBreak > 0 && lastBreak < current.length) {
-          const head = current.slice(0, lastBreak);
-          rows.push({ text: head, start: rowStart });
-          const carried = current.slice(lastBreak);
-          rowStart += head.length;
-          current = carried;
-          currentWidth = visualWidth(carried);
-        } else {
-          rows.push({ text: current, start: rowStart });
-          rowStart += current.length;
-          current = "";
-          currentWidth = 0;
-        }
-        lastBreak = -1;
-      }
-
-      current += cell.text;
-      currentWidth += cell.width;
-      offset += cell.text.length;
-      if (cell.text === " ") lastBreak = current.length;
-    }
-
-    rows.push({ text: current, start: rowStart });
-  }
-
-  return rows;
-}
-
-function splitKeepingOffsets(value: string, separator: string): Array<{ text: string; start: number }> {
-  const out: Array<{ text: string; start: number }> = [];
-  let start = 0;
-  let index = value.indexOf(separator);
-
-  while (index !== -1) {
-    out.push({ text: value.slice(start, index), start });
-    start = index + separator.length;
-    index = value.indexOf(separator, start);
-  }
-  out.push({ text: value.slice(start), start });
-  return out;
-}
-
-/** Locate the caret within the laid-out rows. */
-export function caretPosition(
-  rows: EditorRow[],
-  cursor: number
-): { row: number; column: number } {
-  for (let i = rows.length - 1; i >= 0; i--) {
-    const row = rows[i]!;
-    if (cursor >= row.start) {
-      const within = cursor - row.start;
-      // A caret exactly at a soft-wrap boundary belongs at the start of the next
-      // row, not past the end of this one.
-      if (within > row.text.length && i < rows.length - 1) continue;
-      return {
-        row: i,
-        column: visualWidth(row.text.slice(0, Math.min(within, row.text.length))),
-      };
-    }
-  }
-  return { row: 0, column: 0 };
+export interface Draft {
+  value: string;
+  cursor: number;
 }
 
 interface PromptEditorProps {
-  value: string;
-  cursor: number;
-  onChange: (value: string, cursor: number) => void;
+  draft: Draft;
+  /** Apply a transformation to the current draft. Never pass a bare value. */
+  onEdit: (update: (prev: Draft) => Draft) => void;
   onSubmit: (value: string) => void;
-  /** Navigate input history; returns the replacement value or null. */
+  /** Navigate input history; returns the replacement value, or null. */
   onHistory: (direction: -1 | 1) => string | null;
   width: number;
   active: boolean;
@@ -131,41 +50,49 @@ interface PromptEditorProps {
 }
 
 export function PromptEditor({
-  value,
-  cursor,
-  onChange,
+  draft,
+  onEdit,
   onSubmit,
   onHistory,
   width,
   active,
   placeholder = "",
 }: PromptEditorProps) {
+  const { value, cursor } = draft;
+
   const rows = React.useMemo(() => layoutEditor(value, width), [value, width]);
   const caret = React.useMemo(() => caretPosition(rows, cursor), [rows, cursor]);
 
   useInput(
     (input, key) => {
-      // Paste and other multi-character bursts arrive as a single event. Handle
-      // them before key interpretation, or a pasted newline reads as Enter and
-      // submits half a message.
+      const insert = (text: string) =>
+        onEdit((prev) => ({
+          value: prev.value.slice(0, prev.cursor) + text + prev.value.slice(prev.cursor),
+          cursor: prev.cursor + text.length,
+        }));
+
+      // Paste and other multi-character bursts arrive as one event. Handle them
+      // before key interpretation, or a pasted newline reads as Enter and submits
+      // half a message.
       if (input.length > 1 && !key.ctrl && !key.meta) {
-        const normalized = input.replace(/\r\n?/g, "\n");
-        insert(normalized);
+        insert(input.replace(/\r\n?/g, "\n"));
         return;
       }
 
       if (key.return) {
-        // Shift+Enter (where the terminal reports it) and Alt/Meta+Enter insert a
+        // Shift+Enter (where the terminal reports it) and Alt+Enter insert a
         // newline; plain Enter submits.
         if (key.shift || key.meta) {
           insert("\n");
           return;
         }
-        // Trailing backslash is a universally-supported continuation, for
-        // terminals that cannot report Shift+Enter at all.
+        // A trailing backslash is the universal fallback, for terminals that
+        // cannot report Shift+Enter at all.
         if (value.endsWith("\\")) {
-          const next = value.slice(0, -1) + "\n";
-          onChange(next, next.length);
+          onEdit((prev) => {
+            const next = prev.value.replace(/\\$/, "\n");
+            return { value: next, cursor: next.length };
+          });
           return;
         }
         if (value.trim().length > 0) onSubmit(value);
@@ -173,103 +100,135 @@ export function PromptEditor({
       }
 
       if (key.backspace || key.delete) {
-        // Some terminals report Backspace as `delete`; treat Delete-forward only
-        // when the key is unambiguous.
-        if (key.delete && !key.backspace && cursor < value.length) {
-          onChange(value.slice(0, cursor) + value.slice(cursor + 1), cursor);
-          return;
-        }
-        if (cursor > 0) {
-          const removed = graphemeBefore(value, cursor);
-          onChange(value.slice(0, cursor - removed) + value.slice(cursor), cursor - removed);
-        }
+        // Some terminals report Backspace as `delete`; only treat it as a forward
+        // delete when the key is unambiguous.
+        const forward = key.delete && !key.backspace;
+        onEdit((prev) => {
+          if (forward) {
+            if (prev.cursor >= prev.value.length) return prev;
+            const size = graphemeAfter(prev.value, prev.cursor);
+            return {
+              value: prev.value.slice(0, prev.cursor) + prev.value.slice(prev.cursor + size),
+              cursor: prev.cursor,
+            };
+          }
+          if (prev.cursor <= 0) return prev;
+          const size = graphemeBefore(prev.value, prev.cursor);
+          return {
+            value: prev.value.slice(0, prev.cursor - size) + prev.value.slice(prev.cursor),
+            cursor: prev.cursor - size,
+          };
+        });
         return;
       }
 
       if (key.leftArrow) {
-        if (cursor > 0) onChange(value, cursor - graphemeBefore(value, cursor));
+        onEdit((prev) =>
+          prev.cursor > 0
+            ? { ...prev, cursor: prev.cursor - graphemeBefore(prev.value, prev.cursor) }
+            : prev
+        );
         return;
       }
       if (key.rightArrow) {
-        if (cursor < value.length) onChange(value, cursor + graphemeAfter(value, cursor));
+        onEdit((prev) =>
+          prev.cursor < prev.value.length
+            ? { ...prev, cursor: prev.cursor + graphemeAfter(prev.value, prev.cursor) }
+            : prev
+        );
         return;
       }
 
       if (key.upArrow) {
         // Within a multi-row value the arrow moves the caret; on the first row it
-        // reaches for history, which is the behaviour a shell user expects.
+        // reaches for history — what a shell user expects.
         if (caret.row > 0) {
-          onChange(value, offsetForRowColumn(rows, caret.row - 1, caret.column));
+          onEdit((prev) => {
+            const prevRows = layoutEditor(prev.value, width);
+            const at = caretPosition(prevRows, prev.cursor);
+            if (at.row === 0) return prev;
+            return { ...prev, cursor: offsetForRowColumn(prevRows, at.row - 1, at.column) };
+          });
           return;
         }
         const previous = onHistory(-1);
-        if (previous !== null) onChange(previous, previous.length);
+        if (previous !== null) onEdit(() => ({ value: previous, cursor: previous.length }));
         return;
       }
       if (key.downArrow) {
         if (caret.row < rows.length - 1) {
-          onChange(value, offsetForRowColumn(rows, caret.row + 1, caret.column));
+          onEdit((prev) => {
+            const prevRows = layoutEditor(prev.value, width);
+            const at = caretPosition(prevRows, prev.cursor);
+            if (at.row >= prevRows.length - 1) return prev;
+            return { ...prev, cursor: offsetForRowColumn(prevRows, at.row + 1, at.column) };
+          });
           return;
         }
         const next = onHistory(1);
-        if (next !== null) onChange(next, next.length);
+        if (next !== null) onEdit(() => ({ value: next, cursor: next.length }));
         return;
       }
 
       if (key.ctrl) {
         switch (input) {
           case "a":
-            onChange(value, rows[caret.row]!.start);
+            onEdit((prev) => {
+              const prevRows = layoutEditor(prev.value, width);
+              const at = caretPosition(prevRows, prev.cursor);
+              return { ...prev, cursor: prevRows[at.row]?.start ?? 0 };
+            });
             return;
-          case "e": {
-            const row = rows[caret.row]!;
-            onChange(value, row.start + row.text.length);
+          case "e":
+            onEdit((prev) => {
+              const prevRows = layoutEditor(prev.value, width);
+              const at = caretPosition(prevRows, prev.cursor);
+              const row = prevRows[at.row];
+              return row ? { ...prev, cursor: row.start + row.text.length } : prev;
+            });
             return;
-          }
           case "k":
-            onChange(value.slice(0, cursor), cursor);
+            onEdit((prev) => ({ value: prev.value.slice(0, prev.cursor), cursor: prev.cursor }));
             return;
           case "u":
-            onChange(value.slice(cursor), 0);
+            onEdit((prev) => ({ value: prev.value.slice(prev.cursor), cursor: 0 }));
             return;
-          case "w": {
-            const start = wordStart(value, cursor);
-            onChange(value.slice(0, start) + value.slice(cursor), start);
+          case "w":
+            onEdit((prev) => {
+              const start = wordStart(prev.value, prev.cursor);
+              return {
+                value: prev.value.slice(0, start) + prev.value.slice(prev.cursor),
+                cursor: start,
+              };
+            });
             return;
-          }
           default:
             return;
         }
       }
 
-      if (key.meta) return;
-      if (key.tab || key.escape || key.pageUp || key.pageDown) return;
+      if (key.meta || key.tab || key.escape || key.pageUp || key.pageDown) return;
 
       if (key.home) {
-        onChange(value, 0);
+        onEdit((prev) => ({ ...prev, cursor: 0 }));
         return;
       }
       if (key.end) {
-        onChange(value, value.length);
+        onEdit((prev) => ({ ...prev, cursor: prev.value.length }));
         return;
       }
 
       if (input.length === 1 && input >= " ") insert(input);
-
-      function insert(text: string) {
-        const next = value.slice(0, cursor) + text + value.slice(cursor);
-        onChange(next, cursor + text.length);
-      }
     },
     { isActive: active }
   );
 
   const showPlaceholder = value.length === 0 && placeholder.length > 0;
-  const visibleRows = rows.slice(
-    Math.max(0, caret.row - (MAX_VISIBLE_ROWS - 1)),
-    Math.max(MAX_VISIBLE_ROWS, caret.row + 1)
-  );
-  const firstVisible = Math.max(0, caret.row - (MAX_VISIBLE_ROWS - 1));
+
+  // Scroll the editor internally so a long prompt cannot grow the frame past its
+  // reserved rows, keeping the caret in view.
+  const firstVisible = Math.max(0, caret.row - (MAX_EDITOR_ROWS - 1));
+  const visibleRows = rows.slice(firstVisible, firstVisible + MAX_EDITOR_ROWS);
 
   return (
     <Box flexDirection="column" flexShrink={0}>
@@ -286,7 +245,7 @@ export function PromptEditor({
             <Text wrap="truncate-end">
               {showPlaceholder && rowIndex === 0 ? (
                 <>
-                  {active && <Text inverse>{" "}</Text>}
+                  {active && <Text inverse> </Text>}
                   <Text color={UI_COLORS.muted} dimColor>
                     {placeholder}
                   </Text>
@@ -305,20 +264,19 @@ export function PromptEditor({
 }
 
 /**
- * A row with the caret drawn in it.
+ * A row with the caret drawn into it.
  *
- * The caret is an inverse-video cell over the character it sits on, which keeps
- * the row's width identical whether the caret is visible or not — a caret that
- * added a cell would shift the text after it on every keystroke.
+ * The caret is inverse video over the character it occupies, so the row's width
+ * is identical whether the caret is on it or not — a caret that added a cell
+ * would shift the text after it on every keystroke.
  */
 function CaretRow({ text, column }: { text: string; column: number }) {
-  const graphemes = cells(text);
   let before = "";
   let at = "";
   let after = "";
   let x = 0;
 
-  for (const cell of graphemes) {
+  for (const cell of cells(text)) {
     if (x < column) before += cell.text;
     else if (at.length === 0) at = cell.text;
     else after += cell.text;
@@ -332,40 +290,4 @@ function CaretRow({ text, column }: { text: string; column: number }) {
       <Text>{after}</Text>
     </>
   );
-}
-
-// ── Cursor helpers ───────────────────────────────────────────────────────────
-
-/** Bytes to step back to clear one grapheme, so a cluster deletes as a unit. */
-function graphemeBefore(value: string, cursor: number): number {
-  const head = value.slice(0, cursor);
-  const graphemes = cells(head);
-  const last = graphemes[graphemes.length - 1];
-  return last ? last.text.length : 1;
-}
-
-function graphemeAfter(value: string, cursor: number): number {
-  const tail = value.slice(cursor);
-  const graphemes = cells(tail);
-  const first = graphemes[0];
-  return first ? first.text.length : 1;
-}
-
-function wordStart(value: string, cursor: number): number {
-  let i = cursor;
-  while (i > 0 && /\s/.test(value[i - 1]!)) i--;
-  while (i > 0 && !/\s/.test(value[i - 1]!)) i--;
-  return i;
-}
-
-function offsetForRowColumn(rows: EditorRow[], rowIndex: number, column: number): number {
-  const row = rows[Math.max(0, Math.min(rowIndex, rows.length - 1))]!;
-  let x = 0;
-  let offset = 0;
-  for (const cell of cells(row.text)) {
-    if (x >= column) break;
-    x += cell.width;
-    offset += cell.text.length;
-  }
-  return row.start + offset;
 }

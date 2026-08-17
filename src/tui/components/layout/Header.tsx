@@ -45,6 +45,9 @@ export function Header({ info, layout, compact, dryRun }: HeaderProps) {
   if (dryRun) {
     segments.push({ text: "dry run", color: UI_COLORS.warning, priority: 1 });
   }
+  if (isWide) {
+    segments.push({ text: `v${info.version}`, color: UI_COLORS.muted, dim: true, priority: 5 });
+  }
   if (!isNarrow) {
     segments.push({ text: info.model, color: UI_COLORS.muted, dim: true, priority: 3 });
   }

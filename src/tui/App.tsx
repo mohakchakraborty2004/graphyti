@@ -20,14 +20,18 @@ import { useSession } from "./state/useSession";
 import { isBusy, type Block, type PermissionRequest } from "./state/types";
 import { renderBlock, renderBlocks, type RenderContext } from "./render/blocks";
 import { blank, type Line } from "./core/line";
+import { computeWindow } from "./core/scroll";
+import { editorRowCount } from "./core/editor";
+import { layoutPermission } from "./core/permission";
+import { filterCommands } from "./core/commands";
 import { Divider, Lines, useSpinnerFrame } from "./components/primitives";
 import { Header } from "./components/layout/Header";
-import { Conversation, computeWindow } from "./components/layout/Conversation";
+import { Conversation } from "./components/layout/Conversation";
 import { StatusBar, HelpBar } from "./components/layout/StatusBar";
 import { WelcomeScreen } from "./components/layout/WelcomeScreen";
-import { PromptEditor } from "./components/layout/PromptEditor";
+import { PromptEditor, MAX_EDITOR_ROWS, type Draft } from "./components/layout/PromptEditor";
 import { PermissionPrompt } from "./components/interactive/PermissionPrompt";
-import { CommandPalette, filterCommands } from "./components/interactive/CommandPalette";
+import { CommandPalette } from "./components/interactive/CommandPalette";
 import { useSelection } from "./components/interactive/Selector";
 import { runPipeline, CancelledError } from "./engine/runPipeline";
 
@@ -52,8 +56,11 @@ export function App({
   const { session, dispatch, addTool, patchTool } = useSession();
 
   const [dryRun, setDryRun] = React.useState(initialDryRun);
-  const [input, setInput] = React.useState("");
-  const [cursor, setCursor] = React.useState(0);
+  // One piece of state, updated functionally. Ink dispatches every key parsed
+  // from a single stdin chunk in the same tick, so two independent setters (or a
+  // props-derived next value) would drop all but the last keystroke of a burst.
+  const [draft, setDraft] = React.useState<Draft>({ value: "", cursor: 0 });
+  const input = draft.value;
   const [scrollOffset, setScrollOffset] = React.useState(0);
   const [historyIndex, setHistoryIndex] = React.useState<number | null>(null);
   const [elapsedMs, setElapsedMs] = React.useState(0);
@@ -123,19 +130,21 @@ export function App({
   );
 
   // ── Height budget ──────────────────────────────────────────────────────────
-  const compact = layout.height < 20 || layout.isNarrow;
+  // Compact chrome is decided once, by the layout, so every consumer of the
+  // height budget agrees with the components that draw into it.
+  const { compact } = layout;
   const chrome = chromeBudget(compact);
 
   // Overlays are chrome too: reserving their rows is what stops a permission
   // prompt appearing from shoving the conversation upward.
   const overlayRows =
     overlay === "permission"
-      ? permissionRows(session.permission!, layout.isNarrow)
+      ? layoutPermission(session.permission!, layout.contentWidth, layout.isNarrow).height + 1
       : overlay === "palette"
-        ? Math.min(6, Math.max(1, paletteMatches.length)) + 2
+        ? Math.min(6, Math.max(1, paletteMatches.length)) + 3
         : 0;
 
-  const inputRows = Math.max(1, countEditorRows(input, layout.inputWidth));
+  const inputRows = editorRowCount(input, layout.inputWidth, MAX_EDITOR_ROWS);
   const conversationHeight = Math.max(
     1,
     layout.height -
@@ -165,8 +174,7 @@ export function App({
       dispatch({ type: "pushHistory", value: query });
       dispatch({ type: "appendHistory", block: { kind: "user", id: `user-${Date.now()}`, text: query } });
 
-      setInput("");
-      setCursor(0);
+      setDraft({ value: "", cursor: 0 });
       setHistoryIndex(null);
       setScrollOffset(0);
       runStartRef.current = Date.now();
@@ -324,8 +332,7 @@ export function App({
       if (key.upArrow) return palette.move(-1);
       if (key.downArrow) return palette.move(1);
       if (key.escape) {
-        setInput("");
-        setCursor(0);
+        setDraft({ value: "", cursor: 0 });
         return;
       }
       if (key.return) {
@@ -339,8 +346,7 @@ export function App({
 
   const runCommand = React.useCallback(
     (name: string) => {
-      setInput("");
-      setCursor(0);
+      setDraft({ value: "", cursor: 0 });
 
       switch (name) {
         case "/clear":
@@ -358,22 +364,25 @@ export function App({
             },
           });
           return;
-        case "/dry-run":
-          setDryRun((current) => {
-            dispatch({
-              type: "appendHistory",
-              block: {
-                kind: "system",
-                id: id("sys"),
-                text: current
-                  ? "Dry run off — changes will be written."
-                  : "Dry run on — changes will be previewed only.",
-                tone: current ? "info" : "warning",
-              },
-            });
-            return !current;
+        case "/dry-run": {
+          // Compute the next value first, then dispatch. Dispatching from inside
+          // a state updater makes the updater impure — React may invoke it more
+          // than once, duplicating the message.
+          const next = !dryRun;
+          setDryRun(next);
+          dispatch({
+            type: "appendHistory",
+            block: {
+              kind: "system",
+              id: id("sys"),
+              text: next
+                ? "Dry run on — changes will be previewed, not written."
+                : "Dry run off — changes will be written to disk.",
+              tone: next ? "warning" : "info",
+            },
           });
           return;
+        }
         case "/exit":
           exit();
           return;
@@ -394,7 +403,7 @@ export function App({
           return;
       }
     },
-    [dispatch, exit, session.debug]
+    [dispatch, exit, session.debug, dryRun]
   );
 
   // ── History recall ─────────────────────────────────────────────────────────
@@ -428,7 +437,7 @@ export function App({
 
       {showWelcome ? (
         <Box flexDirection="column" flexShrink={0} marginTop={compact ? 0 : 1}>
-          <WelcomeScreen version={version} layout={layout} dryRun={dryRun} />
+          <WelcomeScreen layout={layout} dryRun={dryRun} />
         </Box>
       ) : (
         <Conversation
@@ -476,12 +485,8 @@ export function App({
         {!compact && <Divider width={layout.contentWidth} />}
 
         <PromptEditor
-          value={input}
-          cursor={cursor}
-          onChange={(value, nextCursor) => {
-            setInput(value);
-            setCursor(nextCursor);
-          }}
+          draft={draft}
+          onEdit={setDraft}
           onSubmit={(value) => {
             if (value.startsWith("/")) {
               const chosen = paletteMatches[palette.index];
@@ -522,30 +527,6 @@ function id(prefix: string): string {
 
 function isExpandable(block: Block): boolean {
   return "expanded" in block || block.kind === "log";
-}
-
-/**
- * Rows a permission prompt occupies, so the height budget can reserve them.
- *
- * Computed rather than measured: measuring would mean rendering first and then
- * discovering the conversation must shrink, which is a visible one-frame jump.
- */
-function permissionRows(request: PermissionRequest, narrow: boolean): number {
-  let rows = 2 /* border */ + 1 /* title */ + 1 /* question */ + 2 /* options */;
-  if (request.subject) rows += 2;
-  if (request.consequence && !narrow) rows += 2;
-  rows += 2; // internal margins
-  return rows;
-}
-
-/** Editor height, so the prompt growing does not overlap the conversation. */
-function countEditorRows(value: string, width: number): number {
-  if (value.length === 0) return 1;
-  let rows = 0;
-  for (const paragraph of value.split("\n")) {
-    rows += Math.max(1, Math.ceil(Math.max(1, paragraph.length) / Math.max(1, width)));
-  }
-  return Math.min(rows, 6);
 }
 
 function describeError(error: unknown): Block {

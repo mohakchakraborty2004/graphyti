@@ -14,6 +14,8 @@
  */
 
 import path from "path";
+import fs from "fs";
+import { creationDiff, unifiedDiff } from "../core/diff";
 import {
   captureConsole,
   decolorize,
@@ -309,16 +311,39 @@ async function executeStep(
   events.state("tool_running");
   events.activity(options.dryRun ? "Previewing changes" : "Writing files");
 
+  // Snapshot every file the plan targets before anything is written, so the diff
+  // shown to the user is the real before/after rather than a re-derivation. The
+  // pipeline logs its own diffs to stdout, but those are pre-coloured strings
+  // that cannot enter the line model.
+  const targets = collectTargets(actions, projectRoot);
+  const before = snapshotFiles(targets);
+
   const { handleAgentOutput } = await import("../../agentPipeline");
   const writeResult = await handleAgentOutput(actions, {
     dryRun: options.dryRun,
-    // Command execution asks through our own permission prompt below, so the
-    // pipeline's readline-based confirm must never engage: it would read from
-    // the same stdin Ink holds in raw mode and hang the app.
+    // Command execution asks through our own permission prompt, so the pipeline's
+    // readline-based confirm must never engage: it would read from the same stdin
+    // Ink holds in raw mode and hang the app.
     yes: true,
     projectRoot,
   });
   throwIfAborted(signal);
+
+  if (options.dryRun) {
+    // Nothing was written, so project the result in memory to preview it.
+    for (const preview of await previewDiffs(actions, before, projectRoot)) {
+      events.diff(preview.relativePath, preview.patch);
+    }
+  } else {
+    for (const absolute of writeResult.writtenPaths) {
+      const patch = diffAgainstDisk(absolute, before.get(absolute) ?? null);
+      if (patch) events.diff(path.relative(projectRoot, absolute), patch);
+    }
+    for (const absolute of writeResult.createdPaths) {
+      const patch = diffAgainstDisk(absolute, null);
+      if (patch) events.diff(path.relative(projectRoot, absolute), patch);
+    }
+  }
 
   for (const absolute of writeResult.writtenPaths) {
     const relative = path.relative(projectRoot, absolute);
@@ -378,4 +403,119 @@ async function executeStep(
       elapsedMs: Date.now() - indexStart,
     });
   }
+}
+
+// ── Diff support ─────────────────────────────────────────────────────────────
+
+type Action = { type?: string; filePath?: string; model?: string };
+
+/** Absolute paths the plan may touch, so they can be snapshotted up front. */
+function collectTargets(actions: readonly Action[], projectRoot: string): string[] {
+  const paths = new Set<string>();
+
+  for (const action of actions) {
+    if (action.type === "file" || action.type === "create_file") {
+      if (!action.filePath) continue;
+      paths.add(
+        path.isAbsolute(action.filePath)
+          ? action.filePath
+          : path.resolve(projectRoot, action.filePath)
+      );
+    } else if (action.type === "schema") {
+      const schema = findSchema(projectRoot);
+      if (schema) paths.add(schema);
+    }
+  }
+
+  return [...paths];
+}
+
+function findSchema(projectRoot: string): string | null {
+  for (const candidate of [
+    path.join(projectRoot, "prisma", "schema.prisma"),
+    path.join(projectRoot, "schema.prisma"),
+  ]) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+/** Contents keyed by absolute path; `null` means the file did not exist. */
+function snapshotFiles(paths: string[]): Map<string, string | null> {
+  const snapshot = new Map<string, string | null>();
+  for (const target of paths) {
+    try {
+      snapshot.set(target, fs.existsSync(target) ? fs.readFileSync(target, "utf-8") : null);
+    } catch {
+      snapshot.set(target, null);
+    }
+  }
+  return snapshot;
+}
+
+function diffAgainstDisk(absolute: string, before: string | null): string | null {
+  let after: string;
+  try {
+    after = fs.readFileSync(absolute, "utf-8");
+  } catch {
+    return null;
+  }
+
+  const patch = before === null ? creationDiff(after) : unifiedDiff(before, after);
+  return patch.length > 0 ? patch : null;
+}
+
+/**
+ * Project a dry run's changes in memory so they can be previewed.
+ *
+ * `handleAgentOutput` writes nothing in dry-run mode, so there is no "after" on
+ * disk to diff against; the same pure edit functions the writer uses are applied
+ * here instead. Failures are skipped rather than raised — a preview that cannot
+ * be computed is a missing preview, not a failed run.
+ */
+async function previewDiffs(
+  actions: readonly Action[],
+  before: Map<string, string | null>,
+  projectRoot: string
+): Promise<Array<{ relativePath: string; patch: string }>> {
+  const { applyScopedEdits, applySchemaEdit } = await import("../../generate/scopedEdit");
+  const out: Array<{ relativePath: string; patch: string }> = [];
+
+  for (const action of actions) {
+    try {
+      if (action.type === "file") {
+        const edit = action as unknown as { filePath: string; edits: never };
+        const absolute = path.isAbsolute(edit.filePath)
+          ? edit.filePath
+          : path.resolve(projectRoot, edit.filePath);
+        const original = before.get(absolute) ?? null;
+        if (original === null) continue;
+
+        const projected = applyScopedEdits(original, edit.edits, edit.filePath);
+        const patch = unifiedDiff(original, projected);
+        if (patch) out.push({ relativePath: path.relative(projectRoot, absolute), patch });
+      } else if (action.type === "create_file") {
+        const create = action as unknown as { filePath: string; content: string };
+        out.push({
+          relativePath: create.filePath,
+          patch: creationDiff(create.content),
+        });
+      } else if (action.type === "schema") {
+        const schema = findSchema(projectRoot);
+        if (!schema) continue;
+        const original = before.get(schema) ?? null;
+        if (original === null) continue;
+
+        const projected = applySchemaEdit(original, action as never, schema, projectRoot);
+        const patch = unifiedDiff(original, projected);
+        if (patch) out.push({ relativePath: path.relative(projectRoot, schema), patch });
+      }
+    } catch {
+      // A preview that cannot be computed is skipped; the write path reports the
+      // same failure properly, with a real error block.
+      continue;
+    }
+  }
+
+  return out;
 }

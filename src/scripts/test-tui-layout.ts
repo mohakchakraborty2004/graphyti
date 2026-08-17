@@ -21,21 +21,19 @@ import {
 } from "../tui/render/blocks";
 import { clipLine, lineText, lineWidth, type Line } from "../tui/core/line";
 import { visualWidth } from "../tui/core/text";
-import { computeWindow } from "../tui/components/layout/Conversation";
-import {
-  chromeRows,
-  computeLayout,
-  breakpointFor,
-} from "../tui/layout/useTerminalLayout";
+import { computeWindow } from "../tui/core/scroll";
+import { chromeRows, computeLayout, breakpointFor } from "../tui/core/layout";
 import {
   SPINNER_FRAMES,
   UI_LAYOUT,
   WIDE_UNSAFE,
 } from "../tui/theme/tokens";
-import { hintsFor } from "../tui/components/layout/StatusBar";
-import { filterCommands } from "../tui/components/interactive/CommandPalette";
-import { layoutEditor, caretPosition } from "../tui/components/layout/PromptEditor";
-import type { Block, SessionState } from "../tui/state/types";
+import { hintsFor } from "../tui/core/hints";
+import { filterCommands } from "../tui/core/commands";
+import { layoutEditor, caretPosition } from "../tui/core/editor";
+import { layoutPermission } from "../tui/core/permission";
+import { creationDiff, unifiedDiff } from "../tui/core/diff";
+import type { Block, PermissionRequest, SessionState } from "../tui/state/types";
 
 let failures = 0;
 let checks = 0;
@@ -388,7 +386,31 @@ function testScrollModel() {
 
   for (const height of [1, 5, 10, 33, 99, 100, 101, 250]) {
     for (const offset of [0, 1, 5, 50, 99, 100, 1000, -5]) {
-      const { visible, scroll } = computeWindow(lines, height, offset);
+      const { visible, scroll, renderedHeight, markers } = computeWindow(lines, height, offset);
+
+      // The property that actually matters: everything the viewport draws —
+      // rows plus scroll markers — fits the height it was given. Asserting only
+      // `visible.length` would miss markers overflowing the frame by a row.
+      ok(
+        renderedHeight <= Math.max(1, height),
+        `rendered height fits (h=${height}, o=${offset})`,
+        `${renderedHeight} > ${height}`
+      );
+
+      const shown = (markers.above ? 1 : 0) + (markers.below ? 1 : 0);
+      ok(
+        renderedHeight === visible.length + shown,
+        `rendered height accounts for markers (h=${height}, o=${offset})`,
+        `${renderedHeight} != ${visible.length} + ${shown}`
+      );
+      ok(
+        !markers.above || scroll.hiddenAbove > 0,
+        `above marker only when rows are hidden above (h=${height}, o=${offset})`
+      );
+      ok(
+        !markers.below || scroll.hiddenBelow > 0,
+        `below marker only when rows are hidden below (h=${height}, o=${offset})`
+      );
 
       ok(
         visible.length <= Math.max(1, height),
@@ -607,6 +629,139 @@ function testPalette() {
   ok(filterCommands("/conversation").some((c) => c.name === "/clear"), "descriptions are searchable");
 }
 
+function testPermissionHeightIsExact() {
+  section("permission prompt height is exact, not estimated");
+
+  const requests: PermissionRequest[] = [
+    {
+      id: "p1",
+      title: "Breaking schema change",
+      subject:
+        "npx prisma migrate dev --name rename_user_email --schema ./prisma/schema.prisma",
+      consequence:
+        "11 downstream files reference User.email and may stop compiling until they are updated.",
+      question: "Write these changes anyway?",
+      danger: true,
+    },
+    { id: "p2", title: "Run command", subject: "npm test", question: "Allow?" },
+    { id: "p3", title: "Multi-step change", question: "Proceed with this plan?" },
+    {
+      id: "p4",
+      title: "Very long title that will certainly need to wrap on a narrow terminal",
+      subject: LONG_COMMAND,
+      consequence: LONG_PROMPT,
+      question: LONG_PROMPT,
+      danger: true,
+    },
+  ];
+
+  for (const width of WIDTHS) {
+    for (const narrow of [false, true]) {
+      for (const request of requests) {
+        const layout = layoutPermission(request, width, narrow);
+
+        // Every wrapped row must fit inside the border, or the box tears.
+        const inner = Math.max(8, width - 4);
+        for (const row of [...layout.consequence, ...layout.question]) {
+          ok(
+            visualWidth(row) <= inner,
+            `permission body fits inside border (w=${width})`,
+            `${visualWidth(row)} > ${inner}: ${JSON.stringify(row)}`
+          );
+        }
+        for (const row of layout.subject) {
+          ok(
+            visualWidth(row) + 2 <= inner,
+            `permission command fits inside border with gutter (w=${width})`,
+            `${visualWidth(row) + 2} > ${inner}: ${JSON.stringify(row)}`
+          );
+        }
+
+        // The reported height must equal the sum of what will be drawn, since the
+        // conversation budget subtracts exactly this number.
+        const drawn =
+          2 /* border */ +
+          1 /* title */ +
+          (layout.subject.length > 0 ? layout.subject.length + 1 : 0) +
+          (layout.consequence.length > 0 ? layout.consequence.length + 1 : 0) +
+          layout.question.length +
+          1 +
+          layout.options.length +
+          1;
+        ok(
+          layout.height === drawn,
+          `permission height matches its sections (w=${width}, narrow=${narrow})`,
+          `reported ${layout.height} != drawn ${drawn}`
+        );
+
+        ok(
+          layout.consequence.length === 0 || !narrow,
+          "narrow terminals drop the consequence paragraph"
+        );
+        ok(layout.question.length > 0, "the question is never dropped");
+        ok(layout.options.length === 2, "both choices are always offered");
+      }
+    }
+  }
+}
+
+function testDiffGeneration() {
+  section("diff generation");
+
+  const before = "const a = 1;\nconst b = 2;\nconst c = 3;\n";
+  const after = "const a = 1;\nconst b = 20;\nconst c = 3;\n";
+
+  const patch = unifiedDiff(before, after);
+  ok(patch.length > 0, "a real change produces a patch");
+  ok(patch.includes("-const b = 2;"), "removal is marked");
+  ok(patch.includes("+const b = 20;"), "addition is marked");
+  ok(/@@ -\d+,\d+ \+\d+,\d+ @@/.test(patch), "hunk header carries line numbers");
+
+  ok(unifiedDiff(before, before) === "", "identical content produces no patch");
+  ok(unifiedDiff("", "") === "", "empty content produces no patch");
+
+  const created = creationDiff("line one\nline two\n");
+  ok(created.includes("+line one"), "creation marks every line as added");
+  ok(created.includes("+line two"), "creation covers all lines");
+  ok(!created.includes("-"), "creation has no removals");
+
+  // A huge diff must be bounded before it reaches the renderer, not just when it
+  // is displayed — an unbounded patch string is a memory and wrapping cost.
+  const huge = unifiedDiff("", Array.from({ length: 5000 }, (_, i) => `line ${i}`).join("\n"), {
+    maxLines: 50,
+  });
+  ok(
+    huge.split("\n").length <= 52,
+    "diff generation respects maxLines",
+    `${huge.split("\n").length} rows`
+  );
+  ok(huge.includes("truncated"), "truncation is disclosed, not silent");
+
+  const hugeCreation = creationDiff(
+    Array.from({ length: 5000 }, (_, i) => `line ${i}`).join("\n"),
+    { maxLines: 30 }
+  );
+  ok(hugeCreation.split("\n").length <= 32, "creation diff respects maxLines");
+  ok(hugeCreation.includes("more lines"), "creation truncation is disclosed");
+
+  // Generated patches must survive the renderer at every width.
+  for (const width of WIDTHS) {
+    const ctx = contextFor(width);
+    for (const [label, p] of [["edit", patch], ["create", created]] as const) {
+      const lines = renderBlock(
+        { kind: "diff", id: "d", filePath: "src/very/long/path/to/a/file.ts", patch: p, expanded: true },
+        ctx
+      );
+      const worst = lines.reduce((max, l) => Math.max(max, lineWidth(l)), 0);
+      ok(
+        worst <= ctx.width,
+        `generated ${label} diff renders within ${width} cols`,
+        `widest ${worst} > ${ctx.width}`
+      );
+    }
+  }
+}
+
 async function main() {
   console.log("TUI layout — responsive verification");
 
@@ -622,6 +777,8 @@ async function main() {
   testBreakpoints();
   testResize();
   testPalette();
+  testPermissionHeightIsExact();
+  testDiffGeneration();
 
   console.log(
     `\n${failures === 0 ? "PASS" : "FAIL"}  ${checks - failures}/${checks} checks passed`

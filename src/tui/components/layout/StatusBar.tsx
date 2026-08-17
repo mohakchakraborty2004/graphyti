@@ -17,7 +17,8 @@ import { Box, Text } from "ink";
 import { UI_COLORS, UI_SYMBOLS } from "../../theme/tokens";
 import { truncateEnd } from "../../core/text";
 import { formatElapsed } from "../../render/blocks";
-import { KeyHints, type KeyHint } from "../primitives";
+import { KeyHints } from "../primitives";
+import { hintsFor, type HintContext } from "../../core/hints";
 import { isBusy, SESSION_LABELS, type SessionState } from "../../state/types";
 
 // ── Status bar ───────────────────────────────────────────────────────────────
@@ -99,62 +100,6 @@ export function StatusBar({
 }
 
 // ── Contextual key hints ─────────────────────────────────────────────────────
-
-export interface HintContext {
-  state: SessionState;
-  /** A modal surface is open and owns the keyboard. */
-  overlay: "none" | "palette" | "permission";
-  /** There is collapsible content on screen. */
-  hasExpandable: boolean;
-  /** The viewport is scrolled away from the bottom. */
-  scrolledUp: boolean;
-  /** There is history to recall. */
-  hasHistory: boolean;
-}
-
-/**
- * The hints live for the current context, most important first.
- *
- * Ordering matters: `KeyHints` drops from the end when the row is too narrow, so
- * the leftmost hint is the one guaranteed to survive on a 40-column terminal.
- */
-export function hintsFor(ctx: HintContext): KeyHint[] {
-  if (ctx.overlay === "permission") {
-    return [
-      { keys: "enter", label: "confirm" },
-      { keys: `${UI_SYMBOLS.scrollUp}${UI_SYMBOLS.scrollDown}`, label: "navigate" },
-      { keys: "esc", label: "deny" },
-    ];
-  }
-
-  if (ctx.overlay === "palette") {
-    return [
-      { keys: "enter", label: "select" },
-      { keys: `${UI_SYMBOLS.scrollUp}${UI_SYMBOLS.scrollDown}`, label: "navigate" },
-      { keys: "esc", label: "close" },
-    ];
-  }
-
-  const hints: KeyHint[] = [];
-
-  if (isBusy(ctx.state)) {
-    hints.push({ keys: "ctrl+c", label: "stop" });
-    if (ctx.hasExpandable) hints.push({ keys: "ctrl+o", label: "expand" });
-    if (ctx.scrolledUp) hints.push({ keys: "end", label: "follow" });
-    else hints.push({ keys: "pgup", label: "scroll" });
-    return hints;
-  }
-
-  hints.push({ keys: "enter", label: "send" });
-  hints.push({ keys: "shift+enter", label: "newline" });
-  if (ctx.hasHistory) {
-    hints.push({ keys: `${UI_SYMBOLS.scrollUp}${UI_SYMBOLS.scrollDown}`, label: "history" });
-  }
-  if (ctx.hasExpandable) hints.push({ keys: "ctrl+o", label: "expand" });
-  hints.push({ keys: "/", label: "commands" });
-
-  return hints;
-}
 
 export function HelpBar({
   ctx,

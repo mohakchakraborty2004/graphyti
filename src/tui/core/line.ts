@@ -132,13 +132,14 @@ interface Token {
 }
 
 /**
- * Tokenise spans into words that each remember their own style, so a wrapped
- * line can carry several styles and a style can span a line break.
+ * Tokenise spans into words that each remember their own style, so a wrapped line
+ * can carry several styles and a style can span a line break.
  *
- * Break opportunities after `/ \ . - _ , ? & = :` match `wrapText`, so a long
- * path or URL breaks at a meaningful boundary here too.
+ * As in `wrapText`, separator-splitting applies only to tokens too wide to fit —
+ * it is a fallback for long paths and URLs, not a default, or prose would break
+ * at every full stop.
  */
-function tokenizeSpans(spans: Line): Token[] {
+function tokenizeSpans(spans: Line, fitWidth: number): Token[] {
   const tokens: Token[] = [];
 
   for (const s of spans) {
@@ -151,13 +152,17 @@ function tokenizeSpans(spans: Line): Token[] {
         tokens.push({ text: " ", width: 1, style, isSpace: true });
         continue;
       }
+
+      const chunkWidth = visualWidth(chunk);
       const fragments =
-        chunk.length > 1 ? chunk.split(/(?<=[/\\.\-_,?&=:])/) : [chunk];
+        chunk.length > 1 && chunkWidth > fitWidth
+          ? chunk.split(/(?<=[/\\.\-_,?&=:])/).filter((f) => f.length > 0)
+          : [chunk];
+
       for (const fragment of fragments) {
-        if (fragment.length === 0) continue;
         tokens.push({
           text: fragment,
-          width: visualWidth(fragment),
+          width: fragments.length === 1 ? chunkWidth : visualWidth(fragment),
           style,
           isSpace: false,
         });
@@ -194,10 +199,14 @@ export function wrapSpans(
   const { indent = 0, hangingIndent = 0, continuationPrefix } = options;
   if (maxWidth <= 0) return [];
 
-  const tokens = tokenizeSpans(spans);
-  if (tokens.length === 0) return [];
-
   const prefixWidth = continuationPrefix ? lineWidth(continuationPrefix) : 0;
+  // Threshold for "this token is too long to fit anyway" — measured against the
+  // narrowest line the wrapper will produce, so a token that fits everywhere is
+  // never broken up.
+  const fitWidth = Math.max(1, maxWidth - indent - hangingIndent - prefixWidth);
+
+  const tokens = tokenizeSpans(spans, fitWidth);
+  if (tokens.length === 0) return [];
 
   // Reserve room for the widest atomic grapheme, since clusters cannot split.
   let widest = 1;

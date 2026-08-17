@@ -6,16 +6,22 @@
     "graphyti": "./run.mjs"
   },
   "scripts": {
-    "test": "npm run test:commands && npm run test:pipeline && npm run test:config && npm run test:docs",
+    "test": "npm run test:commands && npm run test:pipeline && npm run test:config && npm run test:docs && npm run test:tui",
     "dev": "ts-node src/index.ts",
-    "build": "tsc",
-    "relink" : "npm unlink -g graphyti && npm run build && npm link ",
+    "build": "node build-tui.mjs",
+    "relink": "npm unlink -g graphyti && npm run build && npm link",
     "extract:test": "tsx src/extract/test-extract.ts",
     "test:commands": "tsx src/scripts/test-command-allowlist.ts",
     "test:pipeline": "tsx src/scripts/test-pipeline.ts",
     "test:config": "tsx src/scripts/test-config.ts",
     "test:docs": "tsx src/scripts/test-docs.ts",
-    "init-graph": "tsx src/index.ts init-graph"
+    "init-graph": "tsx src/index.ts init-graph",
+    "build:tsc": "tsc",
+    "test:tui-text": "tsx src/scripts/test-tui-text.ts",
+    "test:tui-layout": "tsx src/scripts/test-tui-layout.ts",
+    "tui:snapshot": "node run-esm.mjs src/scripts/tui-snapshot.tsx",
+    "test:tui-live": "node run-esm.mjs src/scripts/test-tui-live.tsx",
+    "test:tui": "npm run test:tui-text && npm run test:tui-layout && npm run test:tui-live"
   },
   "keywords": [],
   "author": "",

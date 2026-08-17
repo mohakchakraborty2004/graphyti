@@ -60,6 +60,69 @@ const MUTED = { color: UI_COLORS.muted } as const;
 const ACCENT = { color: UI_COLORS.accent } as const;
 const DIM = { color: UI_COLORS.muted, dim: true } as const;
 
+// ── Row builders ─────────────────────────────────────────────────────────────
+//
+// Rows assembled by hand-concatenating spans are how a renderer ends up one or
+// two cells over budget: the indent gets counted but the gutter or the trailing
+// affordance does not. These helpers own that arithmetic so no block renderer
+// has to repeat it — and so a fix lands once rather than three times.
+
+/**
+ * A collapsed-content hint: `▸ 12 lines of output   ctrl+o`.
+ *
+ * The key affordance is dropped, then the label truncated, as the row narrows —
+ * so the hint degrades instead of overflowing, and the label (which carries the
+ * information) outlives the shortcut (which is discoverable elsewhere).
+ */
+function hintLine(
+  label: string,
+  indent: number,
+  width: number,
+  options: { glyph?: string; keyHint?: string } = {}
+): Line {
+  const { glyph = UI_SYMBOLS.collapsed, keyHint } = options;
+
+  const prefix = " ".repeat(Math.min(indent, Math.max(0, width - 1)));
+  const glyphPart = glyph.length > 0 ? `${glyph} ` : "";
+  const fixed = visualWidth(prefix) + visualWidth(glyphPart);
+
+  const keyPart = keyHint ? `  ${keyHint}` : "";
+  const withKey = fixed + visualWidth(label) + visualWidth(keyPart);
+
+  if (keyHint && withKey <= width) {
+    return line(
+      span(prefix),
+      glyphPart ? span(glyphPart, DIM) : null,
+      span(label, DIM),
+      span(keyPart, DIM)
+    );
+  }
+
+  return line(
+    span(prefix),
+    glyphPart ? span(glyphPart, DIM) : null,
+    span(truncateEnd(label, Math.max(1, width - fixed)), DIM)
+  );
+}
+
+/**
+ * A shell command with a `$ ` gutter, wrapped so continuations align under the
+ * command text rather than under the gutter.
+ */
+function commandLines(command: string, width: number, indent: number): Line[] {
+  const gutter = 2;
+  const available = Math.max(1, width - indent - gutter);
+  const rows = wrapText(command, available, { normalizeWhitespace: false });
+
+  return rows.map((row, i) =>
+    line(
+      span(" ".repeat(indent)),
+      span(i === 0 ? "$ " : "  ", MUTED),
+      span(row, { bold: true })
+    )
+  );
+}
+
 // ── Speaker markers ──────────────────────────────────────────────────────────
 
 /**
@@ -115,9 +178,9 @@ function renderError(block: ErrorBlock, ctx: RenderContext): Line[] {
 
   if (block.context) {
     out.push(blank());
-    for (const row of wrapText(block.context, ctx.width - UI_INDENT.sm, { indent: 0 })) {
-      out.push(line(span("  "), span("$ ", MUTED), span(row, { bold: true })));
-    }
+    // The `$ ` gutter costs two cells on top of the indent; wrap to what is left
+    // or the row overflows by exactly the gutter width.
+    out.push(...commandLines(block.context, ctx.width, UI_INDENT.sm));
   }
 
   if (block.detail) {
@@ -249,11 +312,11 @@ function renderToolOutput(output: string, expanded: boolean, ctx: RenderContext)
 
   if (!expanded) {
     out.push(
-      line(
-        span(" ".repeat(UI_INDENT.md)),
-        span(`${UI_SYMBOLS.collapsed} `, DIM),
-        span(`${rows.length} line${rows.length === 1 ? "" : "s"} of output`, DIM),
-        span("  ctrl+o", { color: UI_COLORS.muted, dim: true })
+      hintLine(
+        `${rows.length} line${rows.length === 1 ? "" : "s"} of output`,
+        UI_INDENT.md,
+        ctx.width,
+        { keyHint: "ctrl+o" }
       )
     );
     return out;
@@ -262,13 +325,7 @@ function renderToolOutput(output: string, expanded: boolean, ctx: RenderContext)
   const shown = rows.slice(0, cap);
   const hidden = rows.length - shown.length;
 
-  out.push(
-    line(
-      span(" ".repeat(UI_INDENT.md)),
-      span(`${UI_SYMBOLS.expanded} `, DIM),
-      span("Output", DIM)
-    )
-  );
+  out.push(hintLine("Output", UI_INDENT.md, ctx.width, { glyph: UI_SYMBOLS.expanded }));
 
   for (const row of shown) {
     for (const wrapped of wrapText(row, ctx.width, {
@@ -282,7 +339,7 @@ function renderToolOutput(output: string, expanded: boolean, ctx: RenderContext)
 
   if (hidden > 0) {
     out.push(
-      line(span(" ".repeat(UI_INDENT.lg)), span(`${UI_SYMBOLS.ellipsis} ${hidden} more`, DIM))
+      hintLine(`${UI_SYMBOLS.ellipsis} ${hidden} more`, UI_INDENT.lg, ctx.width, { glyph: "" })
     );
   }
 
@@ -370,10 +427,11 @@ function renderDiff(block: DiffBlock, ctx: RenderContext): Line[] {
 
   if (hidden > 0) {
     out.push(
-      line(
-        span(" ".repeat(UI_INDENT.sm)),
-        span(`${UI_SYMBOLS.ellipsis} ${hidden} more line${hidden === 1 ? "" : "s"}`, DIM),
-        span("  ctrl+o", DIM)
+      hintLine(
+        `${UI_SYMBOLS.ellipsis} ${hidden} more line${hidden === 1 ? "" : "s"}`,
+        UI_INDENT.sm,
+        ctx.width,
+        { glyph: "", keyHint: "ctrl+o" }
       )
     );
   }
@@ -528,12 +586,7 @@ function renderBlast(block: BlastBlock, ctx: RenderContext): Line[] {
 
   if (!block.expanded) {
     out.push(
-      line(
-        span(" ".repeat(UI_INDENT.sm)),
-        span(`${UI_SYMBOLS.collapsed} `, DIM),
-        span("show affected files", DIM),
-        span("  ctrl+o", DIM)
-      )
+      hintLine("show affected files", UI_INDENT.sm, ctx.width, { keyHint: "ctrl+o" })
     );
     return out;
   }
@@ -570,9 +623,11 @@ function renderBlast(block: BlastBlock, ctx: RenderContext): Line[] {
 
     if (items.length > cap) {
       out.push(
-        line(
-          span(" ".repeat(UI_INDENT.md + (ctx.narrow ? 0 : 3))),
-          span(`${UI_SYMBOLS.ellipsis} ${items.length - cap} more`, DIM)
+        hintLine(
+          `${UI_SYMBOLS.ellipsis} ${items.length - cap} more`,
+          UI_INDENT.md + (ctx.narrow ? 0 : 3),
+          ctx.width,
+          { glyph: "" }
         )
       );
     }
@@ -659,10 +714,11 @@ function renderSummary(block: SummaryBlock, ctx: RenderContext): Line[] {
 function renderLog(block: LogBlock, ctx: RenderContext): Line[] {
   if (!block.expanded && !ctx.debug) {
     return [
-      line(
-        span(" ".repeat(UI_INDENT.sm)),
-        span(`${UI_SYMBOLS.collapsed} `, DIM),
-        span(`${block.lines.length} log line${block.lines.length === 1 ? "" : "s"}`, DIM)
+      hintLine(
+        `${block.lines.length} log line${block.lines.length === 1 ? "" : "s"}`,
+        UI_INDENT.sm,
+        ctx.width,
+        { keyHint: "ctrl+o" }
       ),
     ];
   }
@@ -670,11 +726,7 @@ function renderLog(block: LogBlock, ctx: RenderContext): Line[] {
   const cap = UI_LAYOUT.expandedOutputRows;
   const shown = block.lines.slice(-cap);
   const out: Line[] = [
-    line(
-      span(" ".repeat(UI_INDENT.sm)),
-      span(`${UI_SYMBOLS.expanded} `, DIM),
-      span("Logs", DIM)
-    ),
+    hintLine("Logs", UI_INDENT.sm, ctx.width, { glyph: UI_SYMBOLS.expanded }),
   ];
 
   for (const row of shown) {

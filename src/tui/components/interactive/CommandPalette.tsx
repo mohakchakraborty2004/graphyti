@@ -10,52 +10,9 @@ import React from "react";
 import { Box, Text } from "ink";
 import { UI_COLORS } from "../../theme/tokens";
 import { Selector, type SelectorOption } from "./Selector";
+import { filterCommands } from "../../core/commands";
 
-export interface Command {
-  name: string;
-  description: string;
-  /** Extra terms that should match this command. */
-  aliases?: string[];
-}
-
-export const COMMANDS: Command[] = [
-  { name: "/help", description: "Show what graphyti can do" },
-  { name: "/clear", description: "Clear the conversation" },
-  { name: "/dry-run", description: "Toggle preview-only mode", aliases: ["dryrun"] },
-  { name: "/debug", description: "Toggle internal detail" },
-  { name: "/doctor", description: "Check environment and credentials" },
-  { name: "/exit", description: "Quit graphyti", aliases: ["quit"] },
-];
-
-/**
- * Filter and rank commands against a query.
- *
- * Prefix matches outrank substring matches so that typing `/d` puts `/debug`
- * and `/dry-run` above `/doctor`-style incidental matches, which is what makes
- * the first Enter press predictable.
- */
-export function filterCommands(query: string): Command[] {
-  const needle = query.replace(/^\//, "").toLowerCase().trim();
-  if (needle.length === 0) return COMMANDS;
-
-  const scored = COMMANDS.map((command) => {
-    const name = command.name.replace(/^\//, "").toLowerCase();
-    const terms = [name, ...(command.aliases ?? [])];
-
-    let score = -1;
-    for (const term of terms) {
-      if (term === needle) score = Math.max(score, 3);
-      else if (term.startsWith(needle)) score = Math.max(score, 2);
-      else if (term.includes(needle)) score = Math.max(score, 1);
-    }
-    if (score < 0 && command.description.toLowerCase().includes(needle)) score = 0;
-
-    return { command, score };
-  }).filter((entry) => entry.score >= 0);
-
-  scored.sort((a, b) => b.score - a.score || a.command.name.localeCompare(b.command.name));
-  return scored.map((entry) => entry.command);
-}
+export { COMMANDS, filterCommands, type Command } from "../../core/commands";
 
 interface CommandPaletteProps {
   query: string;

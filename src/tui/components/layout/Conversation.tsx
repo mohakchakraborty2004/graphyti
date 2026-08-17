@@ -24,57 +24,8 @@ import React from "react";
 import { Box, Static, Text } from "ink";
 import { UI_COLORS, UI_SYMBOLS } from "../../theme/tokens";
 import type { Line } from "../../core/line";
+import { computeWindow, type ScrollState } from "../../core/scroll";
 import { Lines } from "../primitives";
-
-export interface ScrollState {
-  /** Rows scrolled up from the bottom. 0 means pinned to the newest content. */
-  offset: number;
-  /** Rows hidden above the window at the current offset. */
-  hiddenAbove: number;
-  /** Rows hidden below the window — non-zero only while scrolled up. */
-  hiddenBelow: number;
-  /** True when pinned to the bottom, i.e. auto-following new output. */
-  following: boolean;
-}
-
-/**
- * Compute the visible window over `lines`.
- *
- * Pure, so the scroll model can be tested exhaustively without a terminal.
- */
-export function computeWindow(
-  lines: Line[],
-  height: number,
-  offset: number
-): { visible: Line[]; scroll: ScrollState } {
-  const total = lines.length;
-  const rows = Math.max(1, height);
-
-  if (total <= rows) {
-    return {
-      visible: lines,
-      scroll: { offset: 0, hiddenAbove: 0, hiddenBelow: 0, following: true },
-    };
-  }
-
-  // Clamp so scrolling can never run past either end, no matter how the content
-  // changed since the offset was set.
-  const maxOffset = total - rows;
-  const clamped = Math.max(0, Math.min(offset, maxOffset));
-
-  const end = total - clamped;
-  const start = end - rows;
-
-  return {
-    visible: lines.slice(start, end),
-    scroll: {
-      offset: clamped,
-      hiddenAbove: start,
-      hiddenBelow: total - end,
-      following: clamped === 0,
-    },
-  };
-}
 
 interface ConversationProps {
   /** Finalised rows, grouped so `<Static>` can flush them incrementally. */
@@ -93,7 +44,7 @@ export function Conversation({
   height,
   scrollOffset,
 }: ConversationProps) {
-  const { visible, scroll } = computeWindow(live, height, scrollOffset);
+  const { visible, scroll, markers } = computeWindow(live, height, scrollOffset);
 
   return (
     <>
@@ -110,7 +61,7 @@ export function Conversation({
       </Static>
 
       <Box flexDirection="column" flexShrink={0}>
-        {scroll.hiddenAbove > 0 && (
+        {markers.above && (
           <ScrollMarker
             direction="up"
             count={scroll.hiddenAbove}
@@ -121,7 +72,7 @@ export function Conversation({
 
         <Lines lines={visible} width={width} />
 
-        {scroll.hiddenBelow > 0 && (
+        {markers.below && (
           <ScrollMarker
             direction="down"
             count={scroll.hiddenBelow}
