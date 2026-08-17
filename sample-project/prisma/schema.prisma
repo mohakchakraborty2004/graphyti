@@ -16,7 +16,7 @@ model User {
   username  String
   phone  String
   bio      String?
- 
+  likes     LikeDislike[]
 }
 
 model Post {
@@ -31,6 +31,7 @@ model Post {
   authorId  Int?
   author    User?     @relation(fields: [authorId], references: [id])
   comments  Comment[]
+  likes     LikeDislike[]
 }
 
 model Comment {
