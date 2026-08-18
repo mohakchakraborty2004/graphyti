@@ -1,5 +1,8 @@
 ﻿import { AsciiNoiseField } from './components/AsciiNoiseField';
 import { StartButton } from './components/StartButton';
+import { HowItWorksSection } from './components/HowItWorksSection';
+import { DemoVideoSection } from './components/DemoVideoSection';
+import { FeaturesSection } from './components/FeaturesSection';
 
 const sidebarPanels = [
   {
@@ -50,9 +53,10 @@ export default function Home() {
       <section className="hero-stage" aria-label="Graphyti">
         <div className="hero-copy">
           <h1>
-            Code that
+            Code that{' '}
+            <span className="cursive-orange">verifies</span>
             <br />
-            verifies itself.
+            itself.
           </h1>
           <p className="subhead">
             Graphyti builds a real graph of your codebase and checks every AI-generated change against it before anything gets written.
@@ -83,6 +87,12 @@ export default function Home() {
           ))}
         </aside>
       </section>
+
+      <HowItWorksSection />
+
+      <DemoVideoSection />
+
+      <FeaturesSection />
 
       <section id="start" className="quickstart" aria-label="Quickstart">
         <span>Install</span>

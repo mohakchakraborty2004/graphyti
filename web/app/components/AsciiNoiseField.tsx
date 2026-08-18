@@ -18,9 +18,9 @@ type Glyph = {
   row: number;
 };
 
-const CHARS = ['.', ':', ';', '+', '=', '*', '#', '%', '@'];
-const REST = [28, 28, 28] as const;
-const REST_BRIGHT = [44, 44, 44] as const;
+const CHARS = ['#', '@', '#', '@', '#', '@', '#', '@', '#'];
+const REST = [22, 22, 22] as const;
+const REST_BRIGHT = [38, 38, 38] as const;
 const ACCENT = [255, 106, 26] as const;
 
 function mix(a: number, b: number, t: number) {
@@ -56,12 +56,12 @@ export function AsciiNoiseField() {
     let dpr = 1;
     let burst = 0;
     let reduced = motion.matches;
-    let interactive = window.matchMedia('(pointer: fine)').matches && window.innerWidth >= 900;
+    let interactive = window.matchMedia('(pointer: fine)').matches;
 
-    const fontSize = window.innerWidth < 720 ? 11 : 13;
-    const cellW = window.innerWidth < 720 ? 12 : 13;
-    const cellH = window.innerWidth < 720 ? 14 : 15;
-    const radius = interactive ? 155 : 0;
+    const fontSize = window.innerWidth < 720 ? 12 : 14;
+    const cellW = window.innerWidth < 720 ? 13 : 14;
+    const cellH = window.innerWidth < 720 ? 15 : 16;
+    const radius = interactive ? 220 : 0;
     const binSize = 48;
 
     const binKey = (x: number, y: number) => `${Math.floor(x / binSize)},${Math.floor(y / binSize)}`;
@@ -91,41 +91,45 @@ export function AsciiNoiseField() {
       bins = new Map();
       const cols = Math.ceil(width / cellW);
       const rows = Math.ceil(height / cellH);
+
+      // Graph nodes for subtle density variation
       const nodes = [
-        { x: cols * 0.16, y: rows * 0.48, r: 5.2 },
-        { x: cols * 0.34, y: rows * 0.28, r: 6.8 },
-        { x: cols * 0.52, y: rows * 0.54, r: 9.1 },
-        { x: cols * 0.28, y: rows * 0.76, r: 6.4 },
-        { x: cols * 0.72, y: rows * 0.34, r: 5.8 },
-        { x: cols * 0.66, y: rows * 0.78, r: 5.0 },
+        { x: cols * 0.12, y: rows * 0.35, r: 8 },
+        { x: cols * 0.30, y: rows * 0.20, r: 10 },
+        { x: cols * 0.50, y: rows * 0.45, r: 12 },
+        { x: cols * 0.22, y: rows * 0.70, r: 9 },
+        { x: cols * 0.70, y: rows * 0.28, r: 8 },
+        { x: cols * 0.65, y: rows * 0.72, r: 7 },
+        { x: cols * 0.85, y: rows * 0.50, r: 9 },
+        { x: cols * 0.40, y: rows * 0.85, r: 8 },
       ];
-      const edges = [[0, 1], [1, 2], [2, 3], [2, 4], [3, 5], [4, 5]] as const;
+      const edges = [[0, 1], [1, 2], [2, 3], [2, 4], [3, 5], [4, 5], [4, 6], [3, 7]] as const;
 
       for (let row = 0; row < rows; row += 1) {
         for (let col = 0; col < cols; col += 1) {
-          let shape = 0.03;
+          let shape = 0.06;
           for (const node of nodes) {
             const d = Math.hypot(col - node.x, row - node.y);
-            if (d < node.r) shape += (1 - d / node.r) * 0.82;
+            if (d < node.r) shape += (1 - d / node.r) * 0.9;
           }
           for (const [a, b] of edges) {
             const d = distToSeg(col, row, nodes[a].x, nodes[a].y, nodes[b].x, nodes[b].y);
-            if (d < 1.5) shape += (1 - d / 1.5) * 0.5;
+            if (d < 2) shape += (1 - d / 2) * 0.6;
           }
-          if (shape < 0.12 && Math.random() > 0.22) continue;
+          if (shape < 0.10 && Math.random() > 0.35) continue;
 
           const grain = Math.random();
-          const charIndex = Math.min(CHARS.length - 1, Math.floor((shape * 0.7 + grain * 0.4) * CHARS.length));
-          const restT = Math.min(1, 0.12 + Math.min(shape, 1) * 0.35 + (grain > 0.82 ? 0.45 : grain * 0.12));
+          const charIndex = Math.min(CHARS.length - 1, Math.floor((shape * 0.6 + grain * 0.5) * CHARS.length));
+          const restT = Math.min(1, 0.15 + Math.min(shape, 1) * 0.4 + (grain > 0.8 ? 0.5 : grain * 0.15));
           const glyph: Glyph = {
             char: CHARS[charIndex],
-            x: col * cellW + (grain - 0.5) * 1.6,
+            x: col * cellW + (grain - 0.5) * 1.8,
             y: row * cellH,
             r: mix(REST[0], REST_BRIGHT[0], restT),
             g: mix(REST[1], REST_BRIGHT[1], restT),
             b: mix(REST[2], REST_BRIGHT[2], restT),
-            a: Math.min(0.92, 0.16 + shape * 0.42),
-            noise: 0.12 + grain * 1.15,
+            a: Math.min(0.85, 0.18 + shape * 0.45),
+            noise: 0.15 + grain * 1.2,
             phase: grain * 240,
             glow: 0,
             flick: 0,
@@ -170,32 +174,32 @@ export function AsciiNoiseField() {
         let accent = 0;
         if (dist < radius) {
           const falloff = 1 - dist / radius;
-          const grain = Math.max(0, g.noise * (0.35 + Math.sin(t * 0.018 + g.phase) * 0.55));
-          accent = Math.min(1, Math.pow(falloff, 1.45) * grain * (0.55 + burst));
+          const grain = Math.max(0, g.noise * (0.4 + Math.sin(t * 0.02 + g.phase) * 0.6));
+          accent = Math.min(1, Math.pow(falloff, 1.3) * grain * (0.6 + burst));
         }
-        g.glow = accent > g.glow ? accent : g.glow * 0.86;
+        g.glow = accent > g.glow ? accent : g.glow * 0.82;
         if (g.glow > 0.02) {
           const k = g.glow;
-          ctx.fillStyle = `rgba(${mix(g.r, ACCENT[0], k)},${mix(g.g, ACCENT[1], k)},${mix(g.b, ACCENT[2], k)},${Math.min(0.98, g.a + k * 0.7)})`;
+          ctx.fillStyle = `rgba(${mix(g.r, ACCENT[0], k)},${mix(g.g, ACCENT[1], k)},${mix(g.b, ACCENT[2], k)},${Math.min(0.98, g.a + k * 0.75)})`;
           ctx.fillText(g.char, g.x, g.y);
         }
       }
 
-      if (Math.random() < 0.45 && glyphs.length) {
-        const n = 2 + ((Math.random() * 4) | 0);
+      if (Math.random() < 0.5 && glyphs.length) {
+        const n = 3 + ((Math.random() * 5) | 0);
         for (let i = 0; i < n; i += 1) {
-          glyphs[(Math.random() * glyphs.length) | 0].flick = 0.18 + Math.random() * 0.38;
+          glyphs[(Math.random() * glyphs.length) | 0].flick = 0.2 + Math.random() * 0.4;
         }
       }
       for (const g of glyphs) {
         if (g.flick <= 0.02) continue;
-        g.flick *= 0.84;
+        g.flick *= 0.82;
         const f = g.flick;
-        ctx.fillStyle = `rgba(${mix(g.r, REST_BRIGHT[0], f)},${mix(g.g, REST_BRIGHT[1], f)},${mix(g.b, REST_BRIGHT[2], f)},${Math.min(0.95, g.a + f * 0.3)})`;
+        ctx.fillStyle = `rgba(${mix(g.r, REST_BRIGHT[0], f)},${mix(g.g, REST_BRIGHT[1], f)},${mix(g.b, REST_BRIGHT[2], f)},${Math.min(0.95, g.a + f * 0.35)})`;
         ctx.fillText(g.char, g.x, g.y);
       }
 
-      if (burst > 0.01) burst *= 0.9;
+      if (burst > 0.01) burst *= 0.88;
     };
 
     const loop = () => {
@@ -206,7 +210,7 @@ export function AsciiNoiseField() {
     const resize = () => {
       const rect = canvas.parentElement?.getBoundingClientRect();
       if (!rect) return;
-      interactive = window.matchMedia('(pointer: fine)').matches && window.innerWidth >= 900;
+      interactive = window.matchMedia('(pointer: fine)').matches;
       reduced = motion.matches;
       width = rect.width;
       height = rect.height;
