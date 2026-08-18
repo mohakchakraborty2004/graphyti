@@ -1,39 +1,63 @@
 'use client';
 
-import React from 'react';
-import { Network, ShieldCheck } from 'lucide-react';
+import Link from 'next/link';
 
-export const Footer: React.FC = () => {
+export function Footer() {
   return (
-    <footer style={{ borderTop: '1px solid #2a2a2a', background: '#050505', padding: '40px 32px 30px' }}>
-      <div style={{ maxWidth: '1380px', margin: '0 auto' }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '24px', marginBottom: '32px' }}>
-          {/* Logo Mark + Wordmark */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-            <div style={{ width: '24px', height: '24px', border: '1px solid #ff6a1a', borderRadius: '3px', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(255,106,26,0.1)' }}>
-              <Network size={14} color="#ff6a1a" />
-            </div>
-            <span style={{ fontFamily: 'var(--font-sans)', fontWeight: 800, fontSize: '1.1rem', color: '#f5f5f5' }}>GRAPHYTI</span>
-          </div>
-
-          {/* Plain Text Nav Links */}
-          <div style={{ display: 'flex', gap: '24px', fontSize: '0.85rem', color: '#8a8a8a' }}>
-            <a href="#architecture" style={{ color: '#8a8a8a', textDecoration: 'none' }}>Open Source</a>
-            <a href="#graph" style={{ color: '#8a8a8a', textDecoration: 'none' }}>TypeScript</a>
-            <a href="#hydradb" style={{ color: '#8a8a8a', textDecoration: 'none' }}>HydraDB</a>
-            <a href="https://github.com" target="_blank" rel="noreferrer" style={{ color: '#8a8a8a', textDecoration: 'none' }}>@graphyti_cli</a>
-          </div>
+    <footer className="site-footer">
+      <div className="footer-inner">
+        <div className="footer-brand">
+          <Link className="brand" href="/" aria-label="Graphyti home">
+            <span className="logo-mark" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </span>
+            <span>Graphyti</span>
+          </Link>
+          <span className="footer-handle">@graphyti</span>
         </div>
 
-        {/* Legal & Guarantee Line */}
-        <div style={{ borderTop: '1px solid #1a1a1a', paddingTop: '20px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '12px', fontSize: '0.78rem', color: '#555555' }}>
-          <div>MIT License — Graphyti CLI Hackathon Submission</div>
-          <div style={{ display: 'flex', gap: '16px' }}>
-            <span style={{ cursor: 'pointer' }}>Privacy Policy</span>
-            <span style={{ cursor: 'pointer' }}>Terms of Use</span>
-          </div>
+        <nav className="footer-nav" aria-label="Footer">
+          <Link href="/docs">Documentation</Link>
+          <Link href="/about">About</Link>
+          <a href="https://github.com/mohakchakraborty2004/graphyti" target="_blank" rel="noopener noreferrer">Open Source</a>
+          <a href="https://www.typescriptlang.org/" target="_blank" rel="noopener noreferrer">TypeScript</a>
+          <a href="https://hydradb.com" target="_blank" rel="noopener noreferrer">HydraDB</a>
+        </nav>
+
+        <div className="footer-socials">
+          <a
+            className="footer-social"
+            href="https://twitter.com/I_Mohak19"
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="Mohak on Twitter"
+          >
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+              <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z" />
+            </svg>
+            <span>@I_Mohak19</span>
+          </a>
+          <a
+            className="footer-social"
+            href="https://twitter.com/onirbanhere"
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="Anirban on Twitter"
+          >
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+              <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z" />
+            </svg>
+            <span>@onirbanhere</span>
+          </a>
+        </div>
+
+        <div className="footer-legal">
+          <a href="#top">Privacy Policy</a>
+          <a href="#top">Terms of Use</a>
         </div>
       </div>
     </footer>
   );
-};
+}

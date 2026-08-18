@@ -122,18 +122,24 @@ export function EditAnimation() {
     const handleResize = () => {
       const parent = canvas.parentElement;
       if (!parent) return;
-      canvas.width = parent.clientWidth;
-      canvas.height = parent.clientHeight;
+      const rect = parent.getBoundingClientRect();
+      const w = Math.floor(rect.width);
+      const h = Math.floor(rect.height);
+      if (w > 0 && h > 0) {
+        canvas.width = w;
+        canvas.height = h;
+      }
     };
 
     handleResize();
-    window.addEventListener('resize', handleResize);
+    const ro = new ResizeObserver(handleResize);
+    ro.observe(canvas.parentElement!);
 
     startTimeRef.current = performance.now();
     animRef.current = requestAnimationFrame(draw);
 
     return () => {
-      window.removeEventListener('resize', handleResize);
+      ro.disconnect();
       cancelAnimationFrame(animRef.current);
     };
   }, [draw]);

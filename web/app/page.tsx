@@ -1,5 +1,7 @@
-﻿import { AsciiNoiseField } from './components/AsciiNoiseField';
-import { StartButton } from './components/StartButton';
+﻿'use client';
+
+import Link from 'next/link';
+import { AsciiNoiseField } from './components/AsciiNoiseField';
 import { HowItWorksSection } from './components/HowItWorksSection';
 import { DemoVideoSection } from './components/DemoVideoSection';
 import { FeaturesSection } from './components/FeaturesSection';
@@ -22,33 +24,10 @@ const sidebarPanels = [
   },
 ];
 
-function LogoMark() {
-  return (
-    <span className="logo-mark" aria-hidden="true">
-      <span />
-      <span />
-      <span />
-    </span>
-  );
-}
-
-function Brand() {
-  return (
-    <a className="brand" href="#top" aria-label="Graphyti home">
-      <LogoMark />
-      <span>Graphyti</span>
-    </a>
-  );
-}
-
 export default function Home() {
   return (
     <main id="top" className="landing-shell">
       <div className="dot-grid" aria-hidden="true" />
-
-      <header className="topbar">
-        <Brand />
-      </header>
 
       <section className="hero-stage" aria-label="Graphyti">
         <div className="hero-copy">
@@ -62,10 +41,17 @@ export default function Home() {
             Graphyti builds a real graph of your codebase and checks every AI-generated change against it before anything gets written.
           </p>
           <div className="cta-row">
-            <a className="btn-pill-outlined" href="https://github.com/graphyti/graphyti">
+            <Link className="btn-pill-outlined" href="/docs">
               Build
+            </Link>
+            <a
+              className="btn-pill-outlined"
+              href="https://mohakchakrabortyv9.hashnode.dev/graphyti"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Learn more
             </a>
-            <StartButton />
           </div>
         </div>
 
@@ -98,22 +84,6 @@ export default function Home() {
         <span>Install</span>
         <code>npx graphyti</code>
       </section>
-
-      <footer className="site-footer">
-        <Brand />
-        <nav aria-label="Footer">
-          <a href="https://github.com/graphyti/graphyti">Open Source</a>
-          <a href="https://www.typescriptlang.org/">TypeScript</a>
-          <a href="https://hydradb.com">HydraDB</a>
-        </nav>
-        <a className="social-link" href="https://github.com/graphyti">
-          @graphyti
-        </a>
-        <div className="legal-links">
-          <a href="#top">Privacy Policy</a>
-          <a href="#top">Terms of Use</a>
-        </div>
-      </footer>
     </main>
   );
 }

@@ -1,6 +1,8 @@
 ﻿import type { Metadata } from 'next';
 import { Fira_Code, Newsreader, Space_Grotesk } from 'next/font/google';
 import './globals.css';
+import { Navbar } from './components/Navbar';
+import { Footer } from './components/Footer';
 
 const spaceGrotesk = Space_Grotesk({
   weight: ['500', '600', '700'],
@@ -28,6 +30,9 @@ export const metadata: Metadata = {
   title: 'Graphyti — Code that verifies itself',
   description:
     'A CLI coding agent that builds a deterministic code graph and checks every AI-generated change against it before anything is written to disk.',
+  icons: {
+    icon: '/favicon.svg',
+  },
 };
 
 export default function RootLayout({
@@ -37,7 +42,11 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en" className={`${spaceGrotesk.variable} ${newsreader.variable} ${firaCode.variable}`}>
-      <body>{children}</body>
+      <body>
+        <Navbar />
+        {children}
+        <Footer />
+      </body>
     </html>
   );
 }

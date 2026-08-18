@@ -1,159 +1,148 @@
 'use client';
 
-import { useRef, useEffect, useCallback } from 'react';
+import { useRef, useEffect } from 'react';
 
 const BLOCK_SIZE = 6;
-const CYCLE_DURATION = 2000;
+const CYCLE_MS = 2200;
 const NUM_RINGS = 4;
 
 export function BlastAnimation() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const animRef = useRef<number>(0);
-  const startTimeRef = useRef(0);
-  const isRunningRef = useRef(false);
 
-  const draw = useCallback(() => {
+  useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const W = canvas.width;
-    const H = canvas.height;
+    let raf = 0;
+    let running = true;
 
-    ctx.fillStyle = '#0a0a0a';
-    ctx.fillRect(0, 0, W, H);
+    const sizeCanvas = () => {
+      const parent = canvas.parentElement;
+      if (!parent) return;
+      const rect = parent.getBoundingClientRect();
+      const w = Math.floor(rect.width);
+      const h = Math.floor(rect.height);
+      if (w > 0 && h > 0 && (canvas.width !== w || canvas.height !== h)) {
+        canvas.width = w;
+        canvas.height = h;
+      }
+    };
 
-    const elapsed = performance.now() - startTimeRef.current;
-    const t = Math.min(1, elapsed / CYCLE_DURATION);
+    sizeCanvas();
 
-    const cx = W / 2;
-    const cy = H / 2;
-    const maxRadius = Math.sqrt(cx * cx + cy * cy);
+    const ro = new ResizeObserver(sizeCanvas);
+    if (canvas.parentElement) ro.observe(canvas.parentElement);
 
-    const cols = Math.ceil(W / BLOCK_SIZE);
-    const rows = Math.ceil(H / BLOCK_SIZE);
+    const start = performance.now();
 
-    for (let row = 0; row < rows; row++) {
-      for (let col = 0; col < cols; col++) {
-        const bx = col * BLOCK_SIZE;
-        const by = row * BLOCK_SIZE;
-        const dx = bx + BLOCK_SIZE / 2 - cx;
-        const dy = by + BLOCK_SIZE / 2 - cy;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        const normalizedDist = dist / maxRadius;
+    const draw = (now: number) => {
+      if (!running) return;
 
-        for (let ring = 0; ring < NUM_RINGS; ring++) {
-          const ringOffset = ring * 0.2;
-          const ringRadius = t * (1.2 + ring * 0.15) + ringOffset;
-          const ringWidth = 0.18 - ring * 0.02;
+      sizeCanvas();
 
-          const ringDist = Math.abs(normalizedDist - ringRadius);
-          const inRing = ringDist < ringWidth;
+      const W = canvas.width;
+      const H = canvas.height;
+      if (W === 0 || H === 0) {
+        raf = requestAnimationFrame(draw);
+        return;
+      }
 
-          if (inRing) {
-            const ringStrength = 1 - ringDist / ringWidth;
-            const fadeEdge = normalizedDist;
-            const intensity = ringStrength * (1 - fadeEdge * 0.5) * (1 - ring * 0.15);
+      ctx.fillStyle = '#0a0a0a';
+      ctx.fillRect(0, 0, W, H);
 
-            const flickerSeed = Math.sin(col * 7.3 + row * 11.7 + elapsed * 0.003 + ring * 2.5);
-            const flicker = 0.7 + flickerSeed * 0.3;
-            const finalIntensity = intensity * flicker * (1 - t * 0.4);
+      const elapsed = (now - start) % (CYCLE_MS * 2);
+      const cycleT = elapsed < CYCLE_MS ? elapsed / CYCLE_MS : 1;
+      const holdT = elapsed < CYCLE_MS ? 0 : (elapsed - CYCLE_MS) / CYCLE_MS;
 
-            const r = Math.floor(255 * finalIntensity);
-            const g = Math.floor(80 * finalIntensity * (1 - fadeEdge * 0.4));
-            const b = Math.floor(20 * finalIntensity * (1 - fadeEdge * 0.3));
-            const a = finalIntensity;
+      const cx = W / 2;
+      const cy = H / 2;
+      const maxR = Math.sqrt(cx * cx + cy * cy);
 
-            if (a > 0.05) {
-              ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${a})`;
-              ctx.fillRect(bx, by, BLOCK_SIZE - 1, BLOCK_SIZE - 1);
+      const cols = Math.ceil(W / BLOCK_SIZE);
+      const rows = Math.ceil(H / BLOCK_SIZE);
+
+      const t = cycleT;
+      const fade = holdT > 0 ? Math.max(0, 1 - holdT * 2) : 1;
+
+      for (let row = 0; row < rows; row++) {
+        for (let col = 0; col < cols; col++) {
+          const bx = col * BLOCK_SIZE;
+          const by = row * BLOCK_SIZE;
+          const dx = bx + BLOCK_SIZE / 2 - cx;
+          const dy = by + BLOCK_SIZE / 2 - cy;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          const nd = dist / maxR;
+
+          for (let ring = 0; ring < NUM_RINGS; ring++) {
+            const rr = t * (1.1 + ring * 0.18) + ring * 0.18;
+            const rw = 0.2 - ring * 0.025;
+            const rd = Math.abs(nd - rr);
+
+            if (rd < rw) {
+              const strength = (1 - rd / rw) * (1 - ring * 0.18) * fade;
+              const flick = 0.7 + Math.sin(col * 7.3 + row * 11.7 + now * 0.003 + ring * 2.5) * 0.3;
+              const i = strength * flick * (1 - nd * 0.5);
+
+              if (i > 0.04) {
+                const r = Math.floor(255 * i);
+                const g = Math.floor(80 * i * (1 - nd * 0.4));
+                const b = Math.floor(20 * i);
+                ctx.fillStyle = `rgba(${r},${g},${b},${i})`;
+                ctx.fillRect(bx, by, BLOCK_SIZE - 1, BLOCK_SIZE - 1);
+              }
             }
           }
-        }
 
-        if (t > 0.3 && t < 0.85) {
-          const scatterChance = Math.sin(col * 3.7 + row * 5.3 + elapsed * 0.005) * 0.5 + 0.5;
-          const scatterThreshold = 0.92 + (t - 0.3) * 0.1;
-          if (scatterChance > scatterThreshold && normalizedDist > 0.1 && normalizedDist < 0.9) {
-            const scatterIntensity = (1 - Math.abs(normalizedDist - t) * 2) * (1 - t);
-            if (scatterIntensity > 0) {
-              const flicker = Math.sin(elapsed * 0.01 + col + row * 3) * 0.3 + 0.7;
-              const si = scatterIntensity * flicker * 0.6;
-              ctx.fillStyle = `rgba(${Math.floor(255 * si)}, ${Math.floor(90 * si)}, ${Math.floor(20 * si)}, ${si})`;
-              ctx.fillRect(bx, by, BLOCK_SIZE - 1, BLOCK_SIZE - 1);
+          if (t > 0.25 && t < 0.85 && fade > 0.3) {
+            const sc = Math.sin(col * 3.7 + row * 5.3 + now * 0.005) * 0.5 + 0.5;
+            const thresh = 0.93 + (t - 0.25) * 0.08;
+            if (sc > thresh && nd > 0.08 && nd < 0.92) {
+              const si = (1 - Math.abs(nd - t) * 2.2) * fade * 0.5;
+              if (si > 0) {
+                const fl = Math.sin(now * 0.01 + col + row * 3) * 0.3 + 0.7;
+                const fi = si * fl;
+                ctx.fillStyle = `rgba(${Math.floor(255 * fi)},${Math.floor(90 * fi)},20,${fi})`;
+                ctx.fillRect(bx, by, BLOCK_SIZE - 1, BLOCK_SIZE - 1);
+              }
             }
           }
         }
       }
-    }
 
-    const pulseR = t * maxRadius * 0.8;
-    const pulseWidth = 8 + t * 12;
-    const pulseAlpha = (1 - t) * 0.25;
-    if (pulseAlpha > 0.01) {
-      ctx.beginPath();
-      ctx.arc(cx, cy, pulseR, 0, Math.PI * 2);
-      ctx.strokeStyle = `rgba(255, 106, 26, ${pulseAlpha})`;
-      ctx.lineWidth = pulseWidth;
-      ctx.stroke();
-    }
+      const pulseR = t * maxR * 0.85;
+      const pw = 6 + t * 14;
+      const pa = (1 - t * 0.6) * fade * 0.3;
+      if (pa > 0.01 && pulseR > 0) {
+        ctx.beginPath();
+        ctx.arc(cx, cy, pulseR, 0, Math.PI * 2);
+        ctx.strokeStyle = `rgba(255,106,26,${pa})`;
+        ctx.lineWidth = pw;
+        ctx.stroke();
+      }
 
-    const glowAlpha = (1 - t) * 0.15 * (1 + Math.sin(elapsed * 0.008) * 0.3);
-    if (glowAlpha > 0.01) {
-      const gradient = ctx.createRadialGradient(cx, cy, 0, cx, cy, maxRadius * 0.4 * (1 - t * 0.5));
-      gradient.addColorStop(0, `rgba(255, 106, 26, ${glowAlpha})`);
-      gradient.addColorStop(1, 'rgba(255, 106, 26, 0)');
-      ctx.fillStyle = gradient;
-      ctx.fillRect(0, 0, W, H);
-    }
+      const ga = fade * 0.12 * (1 + Math.sin(now * 0.008) * 0.3);
+      if (ga > 0.01) {
+        const gr = maxR * 0.35 * (1 - t * 0.4);
+        const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, gr);
+        grad.addColorStop(0, `rgba(255,106,26,${ga})`);
+        grad.addColorStop(1, 'rgba(255,106,26,0)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, W, H);
+      }
 
-    if (t < 1) {
-      animRef.current = requestAnimationFrame(draw);
-    } else {
-      isRunningRef.current = false;
-    }
-  }, []);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const handleResize = () => {
-      const parent = canvas.parentElement;
-      if (!parent) return;
-      canvas.width = parent.clientWidth;
-      canvas.height = parent.clientHeight;
+      raf = requestAnimationFrame(draw);
     };
 
-    handleResize();
-    window.addEventListener('resize', handleResize);
+    raf = requestAnimationFrame(draw);
 
     return () => {
-      window.removeEventListener('resize', handleResize);
-      cancelAnimationFrame(animRef.current);
+      running = false;
+      cancelAnimationFrame(raf);
+      ro.disconnect();
     };
   }, []);
-
-  const startAnimation = useCallback(() => {
-    if (isRunningRef.current) return;
-    isRunningRef.current = true;
-    startTimeRef.current = performance.now();
-    animRef.current = requestAnimationFrame(draw);
-  }, [draw]);
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      startAnimation();
-    }, 3000);
-
-    startAnimation();
-
-    return () => {
-      clearInterval(interval);
-      cancelAnimationFrame(animRef.current);
-    };
-  }, [startAnimation]);
 
   return (
     <div className="blast-anim-wrap">

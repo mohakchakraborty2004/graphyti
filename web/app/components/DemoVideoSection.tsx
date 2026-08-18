@@ -45,7 +45,6 @@ export function DemoVideoSection({ videoId = VIDEO_ID }: DemoVideoSectionProps) 
               <div className="video-placeholder">
                 <div className="video-play-icon">▶</div>
                 <span className="video-text">Demo video coming soon</span>
-                <span className="video-hint">Set VIDEO_ID in DemoVideoSection.tsx to embed your YouTube video.</span>
               </div>
             )}
           </div>
