@@ -4,11 +4,13 @@
  * The code-generation model (see utils/agent.ts) is asked to emit `command`
  * actions alongside file writes. Those strings are model output, so they are
  * never executed as free-form shell. Every command must match one of exactly
- * three shapes:
+ * five shapes:
  *
  *   npm install <pkg> [<pkg>...]        (optionally -D / --save-dev / -E / --save-exact)
+ *   npm run dev
  *   npx prisma generate
  *   npx prisma migrate dev --name <name>
+ *   graphyti <query>
  *
  * Matching is structural, not substring-based: the raw string is first rejected
  * if it contains any character outside a conservative charset (so no quoting,
@@ -17,7 +19,7 @@
  * canonical `argv` this module returns — never the original string.
  */
 
-export type AllowedRule = "npm install" | "npx prisma generate" | "npx prisma migrate dev";
+export type AllowedRule = "npm install" | "npm run dev" | "npx prisma generate" | "npx prisma migrate dev" | "graphyti";
 
 export interface AllowedCommand {
   ok: true;
@@ -40,8 +42,10 @@ export type CommandCheck = AllowedCommand | RejectedCommand;
 /** Shown to the user whenever a command is rejected. */
 export const ALLOWLIST_HELP: readonly string[] = [
   "npm install <pkg> [<pkg>...]   (optional -D / --save-dev / -E / --save-exact)",
+  "npm run dev",
   "npx prisma generate",
   "npx prisma migrate dev --name <name>",
+  "graphyti <query>",
 ];
 
 /**
@@ -53,9 +57,11 @@ export const ALLOWLIST_HELP: readonly string[] = [
  * ranges: `^` is cmd.exe's escape character, so on Windows a shell-invoked
  * `zod@^3.23.8` would silently arrive at npm as `zod@3.23.8`. Rejecting ranges
  * outright keeps behaviour identical on every platform.
+ *
+ * For graphyti commands, we allow additional characters for natural language queries.
  */
-const SAFE_CHARS = /^[A-Za-z0-9@._/=+\- \t]*$/;
-const UNSAFE_CHAR = /[^A-Za-z0-9@._/=+\- \t]/g;
+const SAFE_CHARS = /^[A-Za-z0-9@._/=+\- \t.,!?]*$/;
+const UNSAFE_CHAR = /[^A-Za-z0-9@._/=+\- \t.,!?]/g;
 
 /**
  * npm package spec: optional `@scope/`, lowercase name, optional exact version
@@ -114,7 +120,7 @@ export function parseAllowedCommand(raw: unknown): CommandCheck {
     return reject(
       `Command contains character(s) that are never allowed: ${bad}. ` +
         `Shell operators, quoting and substitution are not permitted — a command must be a plain ` +
-        `space-separated invocation.`
+        `space-separated invocation. For graphyti commands, natural language characters like .,!? are allowed.`
     );
   }
 
@@ -125,22 +131,41 @@ export function parseAllowedCommand(raw: unknown): CommandCheck {
       return checkNpm(argv);
     case "npx":
       return checkNpx(argv);
+    case "graphyti":
+      return checkGraphyti(argv);
     default:
       return reject(
-        `Only "npm" and "npx" commands are allowed — this one starts with "${argv[0]}".`
+        `Only "npm", "npx", and "graphyti" commands are allowed — this one starts with "${argv[0]}".`
       );
   }
 }
 
 // ---------------------------------------------------------------------------
-// npm install <pkg> [<pkg>...]
+// npm install <pkg> [<pkg>...]  |  npm run dev
 // ---------------------------------------------------------------------------
 
 function checkNpm(argv: string[]): CommandCheck {
+  // npm run dev
+  if (argv[1] === "run") {
+    if (argv[2] !== "dev") {
+      return reject(
+        `"${argv.slice(0, 3).join(" ")}" is not allowed — the only npm run script on the allowlist ` +
+          `is "npm run dev".`
+      );
+    }
+    if (argv.length !== 3) {
+      return reject(
+        `"npm run dev" takes no extra arguments — got ${argv.slice(3).join(" ")}.`
+      );
+    }
+    return allow(["npm", "run", "dev"], "npm run dev");
+  }
+
+  // npm install <pkg> [<pkg>...]
   if (argv[1] !== "install") {
     return reject(
-      `"${argv.slice(0, 2).join(" ")}" is not allowed — the only npm subcommand on the allowlist ` +
-        `is "npm install <pkg>" (spelled out in full, not "npm i").`
+      `"${argv.slice(0, 2).join(" ")}" is not allowed — the only npm subcommands on the allowlist ` +
+        `are "npm install <pkg>" and "npm run dev" (spelled out in full, not "npm i").`
     );
   }
 
@@ -245,4 +270,35 @@ function checkNpx(argv: string[]): CommandCheck {
     `"${argv.slice(0, 3).join(" ")}" is not on the allowlist — only "npx prisma generate" and ` +
       `"npx prisma migrate dev --name <name>" are permitted.`
   );
+}
+
+// ---------------------------------------------------------------------------
+// graphyti <query>
+// ---------------------------------------------------------------------------
+
+function checkGraphyti(argv: string[]): CommandCheck {
+  if (argv.length < 2) {
+    return reject(
+      `"graphyti" requires a query argument — provide a natural language description of what you want to build.`
+    );
+  }
+
+  // Reconstruct the query (may contain spaces)
+  const query = argv.slice(1).join(" ");
+
+  // Basic validation - query should be reasonable length
+  if (query.length > 500) {
+    return reject(
+      `Graphyti query is too long (${query.length} characters) — maximum 500 characters allowed.`
+    );
+  }
+
+  // Query should contain at least some alphanumeric characters
+  if (!/[A-Za-z0-9]/.test(query)) {
+    return reject(
+      `Graphyti query must contain at least some alphanumeric characters.`
+    );
+  }
+
+  return allow(["graphyti", ...argv.slice(1)], "graphyti");
 }

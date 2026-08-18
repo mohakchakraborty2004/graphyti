@@ -43,6 +43,10 @@ const ACCEPT: Array<{ input: string; display: string; rule: AllowedRule }> = [
   // flags are hoisted ahead of packages in the canonical form
   { input: "npm install zod -D",                  display: "npm install -D zod",                  rule: "npm install" },
 
+  // npm run dev
+  { input: "npm run dev",                         display: "npm run dev",                         rule: "npm run dev" },
+  { input: "  npm   run   dev  ",                 display: "npm run dev",                         rule: "npm run dev" },
+
   // npx prisma generate
   { input: "npx prisma generate",                 display: "npx prisma generate",                 rule: "npx prisma generate" },
 
@@ -63,6 +67,11 @@ const ACCEPT: Array<{ input: string; display: string; rule: AllowedRule }> = [
     display: "npx prisma migrate dev --name rename-title-to-heading",
     rule: "npx prisma migrate dev",
   },
+
+  // graphyti
+  { input: "graphyti add a login feature",        display: "graphyti add a login feature",        rule: "graphyti" },
+  { input: "graphyti create user model",          display: "graphyti create user model",          rule: "graphyti" },
+  { input: "  graphyti   fix   the   bug  ",       display: "graphyti fix the bug",                rule: "graphyti" },
 ];
 
 // ---------------------------------------------------------------------------
@@ -99,7 +108,9 @@ const REJECT: Array<{ label: string; input: unknown }> = [
 
   // --- npm: wrong subcommand ----------------------------------------------
   { label: "npm i shorthand",          input: "npm i zod" },
-  { label: "npm run",                  input: "npm run build" },
+  { label: "npm run build",            input: "npm run build" },
+  { label: "npm run test",             input: "npm run test" },
+  { label: "npm run dev --flag",       input: "npm run dev --flag" },
   { label: "npm uninstall",            input: "npm uninstall zod" },
   { label: "npm publish",              input: "npm publish" },
   { label: "npm exec",                 input: "npm exec rm" },
@@ -140,6 +151,11 @@ const REJECT: Array<{ label: string; input: unknown }> = [
   { label: "not a string (undefined)", input: undefined },
   { label: "not a string (object)",    input: { command: "npm install zod" } },
   { label: "over length limit",        input: `npm install ${"a".repeat(600)}` },
+
+  // --- graphyti: invalid inputs -------------------------------------------
+  { label: "graphyti no query",        input: "graphyti" },
+  { label: "graphyti too long",        input: `graphyti ${"a".repeat(600)}` },
+  { label: "graphyti special chars",   input: "graphyti command && rm -rf" },
 ];
 
 // ---------------------------------------------------------------------------
@@ -161,12 +177,12 @@ for (const c of ACCEPT) {
     fail(JSON.stringify(c.input), `matched rule "${result.rule}", expected "${c.rule}"`);
     continue;
   }
-  // Invariant: argv and display must agree, and argv[0] is always npm or npx.
+  // Invariant: argv and display must agree, and argv[0] is always npm, npx, or graphyti.
   if (result.argv.join(" ") !== result.display) {
     fail(JSON.stringify(c.input), `argv ${JSON.stringify(result.argv)} disagrees with display`);
     continue;
   }
-  if (result.argv[0] !== "npm" && result.argv[0] !== "npx") {
+  if (result.argv[0] !== "npm" && result.argv[0] !== "npx" && result.argv[0] !== "graphyti") {
     fail(JSON.stringify(c.input), `argv[0] is "${result.argv[0]}"`);
     continue;
   }
@@ -189,6 +205,7 @@ for (const c of REJECT) {
 
 // ---------------------------------------------------------------------------
 // Invariant: no accepted command can carry a shell metacharacter
+// (except for graphyti which allows .,!? for natural language queries)
 // ---------------------------------------------------------------------------
 
 console.log(`\n=== INVARIANTS ===`);
@@ -196,6 +213,8 @@ const METACHAR = /[;&|<>`$(){}\[\]!*?"'\\\n\r%^~]/;
 let metacharClean = true;
 for (const c of ACCEPT) {
   const result = parseAllowedCommand(c.input);
+  // Skip graphyti commands for metacharacter check since they allow .,!?
+  if (result.ok && result.rule === "graphyti") continue;
   if (result.ok && METACHAR.test(result.display)) {
     fail(`metacharacter survived: ${result.display}`, "accepted argv contains a shell metacharacter");
     metacharClean = false;

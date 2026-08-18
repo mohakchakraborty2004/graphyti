@@ -3,19 +3,29 @@
   "version": "1.0.0",
   "main": "index.js",
   "bin": {
-    "graphyti": "./dist/index.js"
+    "graphyti": "./run.mjs"
   },
   "scripts": {
-    "test": "npm run test:commands && npm run test:pipeline && npm run test:config && npm run test:docs",
+    "test": "npm run test:commands && npm run test:pipeline && npm run test:config && npm run test:docs && npm run test:tui",
     "dev": "ts-node src/index.ts",
-    "build": "tsc",
-    "relink": "npm unlink -g graphyti && npm run build && npm link ",
+    "build": "node build-tui.mjs",
+    "relink": "npm unlink -g graphyti && npm run build && npm link",
     "extract:test": "tsx src/extract/test-extract.ts",
     "test:commands": "tsx src/scripts/test-command-allowlist.ts",
     "test:pipeline": "tsx src/scripts/test-pipeline.ts",
     "test:config": "tsx src/scripts/test-config.ts",
     "test:docs": "tsx src/scripts/test-docs.ts",
-    "init-graph": "tsx src/index.ts init-graph"
+    "init-graph": "tsx src/index.ts init-graph",
+    "build:tsc": "tsc",
+    "test:tui-text": "tsx src/scripts/test-tui-text.ts",
+    "test:tui-layout": "tsx src/scripts/test-tui-layout.ts",
+    "tui:snapshot": "node run-esm.mjs src/scripts/tui-snapshot.tsx",
+    "test:tui-live": "node run-esm.mjs src/scripts/test-tui-live.tsx",
+    "test:tui": "npm run test:tui-text && npm run test:tui-layout && npm run test:tui-live",
+    "dev:web": "vite --config web/vite.config.ts",
+    "build:web": "vite build --config web/vite.config.ts",
+    "dev:next": "next dev web -p 3000",
+    "build:next": "next build web"
   },
   "keywords": [],
   "author": "",
@@ -31,18 +41,34 @@
     "@types/dotenv": "^6.1.1",
     "@types/fs-extra": "^11.0.4",
     "@types/node": "^24.13.3",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
     "chalk": "^4.1.2",
     "commander": "^14.0.3",
     "dotenv": "^17.4.2",
     "fs-extra": "^11.3.0",
+    "ink": "^7.1.1",
+    "ink-spinner": "^5.0.0",
+    "ink-text-input": "^6.0.0",
+    "lucide-react": "^0.475.0",
+    "next": "^15.1.7",
     "ora": "^8.2.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
     "ts-morph": "^28.0.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.7.3",
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@swc-node/register": "^1.12.1",
+    "@swc/core": "^1.16.0",
     "@types/diff": "^7.0.2",
-    "tsx": "^4.23.12"
+    "@vitejs/plugin-react": "^4.3.4",
+    "tsx": "^4.23.12",
+    "vite": "^6.1.0"
+  },
+  "optionalDependencies": {
+    "@next/swc-win32-x64-msvc": "^15.5.23"
   }
 }
