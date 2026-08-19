@@ -2,7 +2,7 @@
 
 import { AnimatedBackground } from './AnimatedBackground';
 
-const VIDEO_ID = '';
+const VIDEO_ID = '7pZtKeFzWSM';
 
 type DemoVideoSectionProps = {
   videoId?: string;
