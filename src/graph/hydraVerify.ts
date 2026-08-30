@@ -27,6 +27,16 @@ export interface GraphVerifyResult {
   graphAddressed: string[];
   graphMissed: Array<{ nodeId: string; reason: string }>;
   staleNodesFound: Array<{ nodeId: string; staleRef: string; relations: string[] }>;
+  /**
+   * True when the staged graph had not finished indexing before we queried it.
+   *
+   * A stale-node finding is only trustworthy once HydraDB has re-indexed what
+   * we just staged. While ids sit in its queue, "the old field is still in the
+   * relations" and "the new relations have not landed yet" are indistinguishable
+   * — so the caller must downgrade findings to warnings rather than block a
+   * correct write on a remote queue.
+   */
+  indexPending: boolean;
 }
 
 interface StagedState {
@@ -34,6 +44,10 @@ interface StagedState {
   previousEntries: Map<string, GraphMapEntry>; // node id → entry before overwrite
   deletedIds: string[];
   stagedIds: string[];
+  /** Ids still queued in HydraDB when staging gave up waiting. */
+  pendingIds: string[];
+  /** When staging began, epoch ms — the reference point for relation freshness. */
+  stagedAt: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -58,9 +72,25 @@ function ownedIds(map: GraphMap, filePath: string): string[] {
 
 const RELATIONS_TIMEOUT_MS = 10_000;
 
-async function queryRelations(
-  nodeId: string
-): Promise<Set<string>> {
+/**
+ * The relation endpoints HydraDB reports for a node, as comparable strings.
+ *
+ * HydraDB identifies each endpoint by a content-hash `entityId` plus a
+ * lowercased display `name` and, for ingested documents, an `identifier`. This
+ * function used to collect only the `entityId`s, so the returned set could
+ * never contain a graphyti node id such as `field:User.phone` — every downstream
+ * `has(...)` was false by construction and the entire graph check passed
+ * unconditionally. Collect the names and identifiers, lowercased, and the
+ * comparison becomes real.
+ */
+interface RelationRefs {
+  /** Every endpoint name/identifier, lowercased. */
+  names: Set<string>;
+  /** Newest relation timestamp per endpoint name, epoch ms; 0 when unknown. */
+  seenAt: Map<string, number>;
+}
+
+async function queryRelationRefs(nodeId: string): Promise<RelationRefs> {
   const { database, collection } = requireHydraConfig();
 
   const timeoutPromise = new Promise<never>((_, reject) =>
@@ -77,15 +107,51 @@ async function queryRelations(
     timeoutPromise,
   ]);
 
-  const ids = new Set<string>();
+  const names = new Set<string>();
+  const seenAt = new Map<string, number>();
+
   if (envelope.data?.relations) {
     for (const triplet of envelope.data.relations) {
-      if (triplet.source?.entityId) ids.add(triplet.source.entityId);
-      if (triplet.target?.entityId) ids.add(triplet.target.entityId);
+      const stamps = (triplet.relations ?? [])
+        .map((r) => (r.timestamp ? Date.parse(r.timestamp) : NaN))
+        .filter((n) => Number.isFinite(n));
+      const newest = stamps.length > 0 ? Math.max(...stamps) : 0;
+
+      for (const side of [triplet.source, triplet.target]) {
+        if (!side) continue;
+        for (const label of [side.name, side.identifier]) {
+          if (!label) continue;
+          const key = label.trim().toLowerCase();
+          names.add(key);
+          seenAt.set(key, Math.max(seenAt.get(key) ?? 0, newest));
+        }
+      }
     }
-    ids.delete(nodeId);
+    names.delete(nodeId.trim().toLowerCase());
   }
-  return ids;
+  return { names, seenAt };
+}
+
+/**
+ * Forms in which HydraDB may echo back a reference to `Model.field`.
+ *
+ * `strict` are graphyti-shaped ids that only appear because we ingested them —
+ * a hit is hard evidence of a stale relation, safe to block on. `loose` adds
+ * the bare concept name HydraDB's own extraction invents; a hit there is
+ * suggestive but ambiguous (`id`, `status`, `title` are common words), so it is
+ * reported as a warning and never blocks.
+ */
+function fieldRefForms(model: string, field: string): { strict: string[]; loose: string[] } {
+  return {
+    strict: [`field:${model}.${field}`.toLowerCase(), `${model}.${field}`.toLowerCase()],
+    loose: [field.toLowerCase()],
+  };
+}
+
+function fieldRefFormsFor(delta: ExpectedDelta): { strict: string[]; loose: string[] } {
+  if (delta.changeType === "add") return { strict: [], loose: [] };
+  const field = delta.targetNodeId.replace(/^field:/, "").split(".").slice(1).join(".");
+  return fieldRefForms(delta.targetModel, field);
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +168,9 @@ export async function stageProposedGraph(
   const { database, collection } = requireHydraConfig();
   const absRoot = path.resolve(projectRoot);
   const map = loadGraphMap(absRoot);
+  // Recorded before the upsert so any relation written after this point is
+  // demonstrably a re-derivation of what we staged.
+  const stagedAt = Date.now();
 
   // Load Prisma models — use proposed schema if provided, else from disk
   let allModels: PrismaModel[] = [];
@@ -302,12 +371,15 @@ export async function stageProposedGraph(
   }
   saveGraphMap(absRoot, map);
 
-  // Wait for indexing
-  if (stagedIds.length > 0) {
-    await waitForIndexed(stagedIds);
-  }
+  // Wait for indexing. A remote stall must not abort verification outright —
+  // it downgrades the confidence of the stale-node check instead, which the
+  // caller reads off `indexPending`.
+  const pendingIds =
+    stagedIds.length > 0
+      ? await waitForIndexed(stagedIds, { throwOnTimeout: false })
+      : [];
 
-  return { previousOwned, previousEntries, deletedIds: toDelete, stagedIds };
+  return { previousOwned, previousEntries, deletedIds: toDelete, stagedIds, pendingIds, stagedAt };
 }
 
 // ---------------------------------------------------------------------------
@@ -330,11 +402,14 @@ async function queryAndVerify(
     return { graphAddressed: [], graphMissed: [] };
   }
 
-  // For rename/remove: query relations for each affected node
+  const { strict, loose } = fieldRefFormsFor(delta);
+  const oldLabel = delta.changeType === "rename" ? delta.oldName : delta.targetNodeId;
+
+  // For rename/remove: query relations for each affected node.
   for (const nodeId of affectedNodeIds) {
-    let hydraNeighborIds: Set<string>;
+    let refs: RelationRefs;
     try {
-      hydraNeighborIds = await queryRelations(nodeId);
+      refs = await queryRelationRefs(nodeId);
     } catch (err) {
       graphMissed.push({
         nodeId,
@@ -343,46 +418,21 @@ async function queryAndVerify(
       continue;
     }
 
-    if (delta.changeType === "rename") {
-      const { targetNodeId, oldName, newName, targetModel } = delta;
-      // Check that old field reference is gone
-      const oldStillPresent = delta.expectedRemovedRefs.some(
-        (refId) => hydraNeighborIds.has(refId) && refId === targetNodeId
-      );
-      if (oldStillPresent) {
-        graphMissed.push({
-          nodeId,
-          reason: `HydraDB still has relation to old field ${targetNodeId} (${oldName})`,
-        });
-        continue;
-      }
-
-      // Check that new field reference exists
-      const newFieldId = `field:${targetModel}.${newName}`;
-      const newPresent = hydraNeighborIds.has(newFieldId);
-      if (newPresent) {
-        graphAddressed.push(nodeId);
-      } else {
-        // New field not in relations — may be expected if the node doesn't
-        // directly reference the field (e.g. a Component that fetches a route
-        // which queries the model).  Flag as addressed if old ref is gone.
-        graphAddressed.push(nodeId);
-      }
-    } else if (delta.changeType === "remove") {
-      const { targetNodeId } = delta;
-      // Check that old field reference is gone
-      const oldStillPresent = delta.expectedRemovedRefs.some(
-        (refId) => hydraNeighborIds.has(refId) && refId === targetNodeId
-      );
-      if (oldStillPresent) {
-        graphMissed.push({
-          nodeId,
-          reason: `HydraDB still has relation to removed field ${targetNodeId}`,
-        });
-      } else {
-        graphAddressed.push(nodeId);
-      }
+    // The old reference must be gone from this consumer's stored relations.
+    // Strict hits are reported by checkStaleNodes, which blocks; here we also
+    // surface the ambiguous bare-name form as a non-blocking warning.
+    const hit = [...strict, ...loose].find((form) => refs.names.has(form));
+    if (hit) {
+      graphMissed.push({
+        nodeId,
+        reason: `HydraDB relations still mention "${hit}" for the ${
+          delta.changeType === "rename" ? "renamed" : "removed"
+        } field ${oldLabel}`,
+      });
+      continue;
     }
+
+    graphAddressed.push(nodeId);
   }
 
   return { graphAddressed, graphMissed };
@@ -397,38 +447,88 @@ async function queryAndVerify(
 //    pre-remove) field node.  Querying the old field node's own relations would
 //    only catch the inverse (someone else still pointing at it), which is a
 //    different, less likely failure mode.
+//
+//    Findings are split: `stale` is blocking, `inconclusive` is a warning for
+//    nodes where HydraDB simply has not re-derived relations yet.
 // ---------------------------------------------------------------------------
+
+interface StaleCheckResult {
+  stale: Array<{ nodeId: string; staleRef: string; relations: string[] }>;
+  inconclusive: Array<{ nodeId: string; reason: string }>;
+}
 
 async function checkStaleNodes(
   delta: ExpectedDelta,
-  consumerNodeIds: string[]
-): Promise<Array<{ nodeId: string; staleRef: string; relations: string[] }>> {
-  if (delta.changeType === "add") return [];
+  consumerNodeIds: string[],
+  /** When the proposed graph was staged, epoch ms. */
+  stagedAt: number
+): Promise<StaleCheckResult> {
+  if (delta.changeType === "add") return { stale: [], inconclusive: [] };
 
-  const oldFieldId = delta.targetNodeId;
-  const staleNodes: Array<{ nodeId: string; staleRef: string; relations: string[] }> = [];
+  const { strict } = fieldRefFormsFor(delta);
+  if (strict.length === 0) return { stale: [], inconclusive: [] };
+
+  const stale: Array<{ nodeId: string; staleRef: string; relations: string[] }> = [];
+  const inconclusive: Array<{ nodeId: string; reason: string }> = [];
 
   for (const consumerId of consumerNodeIds) {
-    let hydraNeighborIds: Set<string>;
+    let refs: RelationRefs;
     try {
-      hydraNeighborIds = await queryRelations(consumerId);
+      refs = await queryRelationRefs(consumerId);
     } catch {
       // If the relations query fails for this node, skip it — don't mask
       // real staleness with query errors.
       continue;
     }
 
-    if (hydraNeighborIds.has(oldFieldId)) {
-      staleNodes.push({
+    // Only the graphyti-shaped forms count. A bare concept name is the product
+    // of HydraDB's own extraction and far too common a word to block a write on.
+    const staleRef = strict.find((form) => refs.names.has(form));
+    if (!staleRef) continue;
+
+    // The old reference is present — but that alone does not make it stale.
+    // HydraDB re-derives relations asynchronously and `indexingStatus:
+    // completed` does not mean that has happened yet, so blocking on presence
+    // alone fails correct writes on remote extraction lag.
+    //
+    // The discriminator is the timestamp on the relation carrying the old
+    // field. Relations are written in per-extraction batches sharing one
+    // timestamp, so:
+    //   - old ref stamped BEFORE we staged  → left over from the previous
+    //     extraction, not yet superseded — in flight, not stale.
+    //   - old ref stamped AFTER we staged   → HydraDB re-extracted from the new
+    //     content and still emitted the dead reference — genuinely stale.
+    //
+    // The replacement field's presence is deliberately NOT used as proof: the
+    // new relation routinely lands before the old one is purged, so mid-flight
+    // both are visible and treating that as stale blocks every correct rename.
+    const staleSeenAt = refs.seenAt.get(staleRef) ?? 0;
+    const reExtractedSinceStaging = staleSeenAt > 0 && staleSeenAt >= stagedAt - CLOCK_SKEW_MS;
+
+    if (reExtractedSinceStaging) {
+      stale.push({ nodeId: consumerId, staleRef, relations: [...refs.names] });
+    } else {
+      const when = staleSeenAt > 0 ? new Date(staleSeenAt).toISOString() : "unknown";
+      inconclusive.push({
         nodeId: consumerId,
-        staleRef: oldFieldId,
-        relations: [...hydraNeighborIds],
+        reason: `HydraDB still lists ${staleRef} (relation written ${when}, before this change was staged) — its relations have not been re-derived yet, so this is lag rather than staleness`,
       });
     }
   }
 
-  return staleNodes;
+  return { stale, inconclusive };
 }
+
+/**
+ * Tolerance when comparing HydraDB relation timestamps against our own clock.
+ *
+ * The timestamps have second granularity and come from a different machine, so
+ * some slack is needed — but it must stay far below the gap between extraction
+ * batches. At two minutes it swallowed the very distinction it exists to draw:
+ * a batch written shortly before staging read as "written after staging", and
+ * every rename was reported as leaving a stale node behind.
+ */
+const CLOCK_SKEW_MS = 5_000;
 
 // ---------------------------------------------------------------------------
 // 4. Restore original HydraDB state (on verification failure or crash)
@@ -501,7 +601,7 @@ async function restoreOriginalState(
       .map((r) => r.id)
       .filter((id): id is string => Boolean(id));
     if (resultIds.length > 0) {
-      await waitForIndexed(resultIds);
+      await waitForIndexed(resultIds, { throwOnTimeout: false });
     }
   }
 
@@ -573,6 +673,7 @@ export async function verifyGraphConsistency(
         reason: `Graph staging failed: ${err instanceof Error ? err.message : err}`,
       }],
       staleNodesFound: [],
+      indexPending: false,
     };
   }
 
@@ -586,7 +687,9 @@ export async function verifyGraphConsistency(
 
     // Check for stale nodes (consumer-side: does HydraDB still show the old field
     // id in any consumer's relations?)
-    const staleNodesFound = await checkStaleNodes(delta, blastRadiusAffectedNodeIds);
+    const staleCheck = await checkStaleNodes(delta, blastRadiusAffectedNodeIds, staged.stagedAt);
+    const staleNodesFound = staleCheck.stale;
+    graphResult.graphMissed.push(...staleCheck.inconclusive);
 
     // If verification failed, restore original HydraDB state
     const passed =
@@ -609,6 +712,7 @@ export async function verifyGraphConsistency(
       graphAddressed: graphResult.graphAddressed,
       graphMissed: graphResult.graphMissed,
       staleNodesFound,
+      indexPending: staged.pendingIds.length > 0,
     };
   } catch (err) {
     // Any unexpected exception during verification — attempt restore
@@ -622,6 +726,7 @@ export async function verifyGraphConsistency(
           reason: `Verification crashed AND restore failed: ${restoreErr instanceof Error ? restoreErr.message : restoreErr}. Graph may be out of sync — run "graphyti init-graph" to resync.`,
         }],
         staleNodesFound: [],
+        indexPending: false,
       };
     }
     return {
@@ -631,6 +736,7 @@ export async function verifyGraphConsistency(
         reason: `HydraDB verification crashed: ${err instanceof Error ? err.message : err}`,
       }],
       staleNodesFound: [],
+      indexPending: false,
     };
   } finally {
     activeStagedState = null;

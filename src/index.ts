@@ -8,18 +8,21 @@ import { loadContext } from "./utils/StrAnalyzer";
 import { handleAgentOutput, StaleEditError, AmbiguousEditError } from "./agentPipeline";
 import { runInitGraph } from "./cli/init-graph";
 import { retrieveContext } from "./generate/retrieveContext";
-import { extractIntentWithRetry, applyScopedEdits, applySchemaEdit, scopedCodeGen, validateEditPlan, classifyQueryWithRetry, type EditPlan, type FileEdit, type CreateFile, type Classification, type Step, type SchemaEdit } from "./generate/scopedEdit";
+import { extractIntentWithRetry, applyScopedEdits, applySchemaEdit, classifyQueryWithRetry, type EditPlan } from "./generate/scopedEdit";
 import { type GeneratedFile } from "./verify/verifyChange";
 import { runUnifiedValidation, type UnifiedValidationResult } from "./verify/unifiedValidation";
 import { reingestFile } from "./graph/incremental";
-import { computeExpectedDelta, type ExpectedDelta } from "./graph/expectedDelta";
-
+import { resolveProjectPath } from "./utils/paths";
+import { regenerateAffectedFile, clampForPrompt } from "./generate/regenerateFile";
 import {
-  computeBlastRadius,
-  formatBlastRadius,
-  blastRadiusPromptSection,
-  type BlastRadiusResult,
-} from "./graph/blastRadius";
+  analyzeBreakingChanges,
+  affectedFilePaths,
+  describeBreakingChanges,
+  promptInjectionFor,
+  schemaEditsOf,
+} from "./graph/changeAnalysis";
+
+import { formatBlastRadius } from "./graph/blastRadius";
 import {
   accent, success, error, warn, info, sym, bold,
   fmtElapsed, rule, section, summaryBox, row,
@@ -231,15 +234,16 @@ if (isTui) {
     const classSpin = spinner("Classifying query...");
     classSpin.start();
     const classStart = Date.now();
-    let classification: Classification;
-    try {
-      classification = await classifyQueryWithRetry(query ?? "", context);
-    } catch (err) {
-      classSpin.fail("Classification failed");
-      throw err;
-    }
+    // Never throws — classification is an optimisation, and a timeout on it
+    // used to kill the whole run before a single file was touched.
+    const { classification, degraded } = await classifyQueryWithRetry(query ?? "", context);
     const classElapsed = Date.now() - classStart;
-    classSpin.succeed(`Classified ${info(fmtElapsed(classElapsed))}`);
+    if (degraded) {
+      classSpin.warn(`Classification unavailable — treating as a single step ${info(fmtElapsed(classElapsed))}`);
+      print(`    ${info(degraded)}`);
+    } else {
+      classSpin.succeed(`Classified ${info(fmtElapsed(classElapsed))}`);
+    }
 
     if (!classification.decomposable) {
       // Single-step: proceed exactly as before — no overhead
@@ -482,18 +486,30 @@ interface StepOptions {
 }
 
 async function runStep(opts: StepOptions): Promise<StepResult> {
-  const { stepIndex, description, query, context, projectRoot, dryRun, yes, jsonOut } = opts;
+  const { stepIndex, description, query, context, projectRoot, dryRun, yes } = opts;
   const stepLabel = `Step ${stepIndex + 1}: ${description}`;
 
-  const jsonResult: Record<string, any> = {
-    query,
-    filesWritten: [],
-    blastRadiusSize: 0,
-    verification: "skipped",
-    graphIndexUpdated: false,
-  };
+  const fail = (reason: string) =>
+    new StepError(
+      stepIndex,
+      description,
+      reason,
+      opts.cumulativeResult.allWrittenPaths,
+      opts.cumulativeResult.allCreatedPaths
+    );
+
+  const noChange = (): StepResult => ({
+    stepIndex,
+    description,
+    success: true,
+    writtenPaths: [],
+    createdPaths: [],
+  });
 
   print(section(`[${stepLabel}]`));
+
+  const schemaPath = findSchemaPath(projectRoot);
+  const schemaSource = schemaPath ? fs.readFileSync(schemaPath, "utf-8") : undefined;
 
   // ── 3. Intent Extraction ──────────────────────────────────────────
   print(section("Intent"));
@@ -502,240 +518,63 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
   const intentStart = Date.now();
   let editPlan: EditPlan;
   try {
-    const schemaPath = findSchemaPath(projectRoot);
-    const schemaSource = schemaPath ? fs.readFileSync(schemaPath, "utf-8") : undefined;
     editPlan = await extractIntentWithRetry(query, context, schemaSource);
   } catch (err) {
     intentSpin.fail("Intent extraction failed");
-    throw new StepError(stepIndex, description, `Intent extraction failed: ${err instanceof Error ? err.message : err}`);
+    throw fail(`Intent extraction failed: ${err instanceof Error ? err.message : err}`);
   }
   const intentElapsed = Date.now() - intentStart;
   if (editPlan.length === 0) {
     intentSpin.info("No operations extracted.");
-    return {
-      stepIndex,
-      description,
-      success: true,
-      writtenPaths: [],
-      createdPaths: [],
-    };
+    return noChange();
   }
   intentSpin.succeed(`Intent extracted ${info(fmtElapsed(intentElapsed))}`);
   print(`    ${info(`${editPlan.length} operation(s) extracted`)}`);
-
-  // Show extracted operations
   print(`    ${info("Operations")}:`);
-  for (const op of editPlan) {
-    if (op.type === "schema") {
-      if (op.op === "create_model") {
-        print(`      ${sym.bullet} ${bold("schema")}  ${bold("create_model")} ${op.model}`);
-      } else if (op.op === "remove_model") {
-        print(`      ${sym.bullet} ${bold("schema")}  ${bold("remove_model")} ${op.model}`);
-      } else {
-        print(`      ${sym.bullet} ${bold("schema")}  ${op.op} on ${op.model}.${op.fieldName ?? ""}`);
-      }
-    } else if (op.type === "file") {
-      const editCount = op.edits.length;
-      print(`      ${sym.bullet} ${bold("file")}    ${op.filePath} ${info(`(${editCount} edit${editCount > 1 ? "s" : ""})`)}`);
-    } else if (op.type === "command") {
-      print(`      ${sym.bullet} ${bold("cmd")}     ${op.command}`);
-    } else if (op.type === "create_file") {
-      print(`      ${sym.bullet} ${bold("create")}  ${op.filePath} ${info(`— ${op.reason}`)}`);
-    }
-  }
+  printOperations(editPlan);
   print();
 
-  // ── 4. Code Generation ────────────────────────────────────────────
-  print(section("Generation"));
-  const genSpin = spinner("Generating changes...");
-  genSpin.start();
-  const genStart = Date.now();
-  let actions = await codeGen(editPlan, query, context);
-  const genElapsed = Date.now() - genStart;
-
-  if (!actions?.length) {
-    genSpin.info("No actions generated.");
-    return {
-      stepIndex,
-      description,
-      success: true,
-      writtenPaths: [],
-      createdPaths: [],
-    };
-  }
-  genSpin.succeed(`Code generated ${info(fmtElapsed(genElapsed))}`);
-  print(`    ${info(`${actions.length} action(s) returned from model`)}`);
-
-  // ── Post-process: fix new-file edits (LLM may return non-empty oldText) ──
-  for (const action of actions) {
-    if (action.type !== "file") continue;
-    const absPath = path.isAbsolute(action.filePath)
-      ? action.filePath
-      : path.resolve(projectRoot, action.filePath);
-    if (fs.existsSync(absPath)) continue; // file exists, leave edits as-is
-
-    // File doesn't exist — treat as new file creation
-    // Merge all newText into a single content, use empty oldText
-    const fullContent = action.edits.map((e) => e.newText).join("\n");
-    action.edits = [{ filePath: action.filePath, oldText: "", newText: fullContent }];
-  }
-
-  // ── Post-process: inject prisma migrate + generate after schema edits ──
-  const hasSchemaEdits = actions.some((a) => a.type === "schema");
-  if (hasSchemaEdits) {
-    // Generate a migration name from the schema changes
-    const schemaOps = actions.filter((a) => a.type === "schema");
-    const migrationName = schemaOps
-      .map((op) => {
-        if (op.type !== "schema") return "";
-        const field = op.fieldName ?? op.model;
-        switch (op.op) {
-          case "add_field": return `add_${field}`;
-          case "remove_field": return `remove_${field}`;
-          case "rename_field": return `rename_${field}`;
-          case "change_type": return `change_${field}`;
-          case "create_model": return `create_${op.model}`;
-          case "remove_model": return `drop_${op.model}`;
-          default: return op.op;
-        }
-      })
-      .join("_")
-      .slice(0, 64); // Prisma migration name limit
-
-    // Only inject if not already present
-    const hasMigrate = actions.some(
-      (a) => a.type === "command" && a.command.includes("prisma migrate")
-    );
-    const hasGenerate = actions.some(
-      (a) => a.type === "command" && a.command.includes("prisma generate")
-    );
-
-    if (!hasMigrate) {
-      actions.push({
-        type: "command",
-        command: `npx prisma migrate dev --name ${migrationName}`,
-      });
-    }
-    if (!hasGenerate) {
-      actions.push({
-        type: "command",
-        command: "npx prisma generate",
-      });
-    }
-  }
-
-  // Show what will be applied
-  print(`    ${info("Actions")}:`);
-  for (const action of actions) {
-    if (action.type === "schema") {
-      if (action.op === "create_model") {
-        print(`      ${sym.bullet} ${bold("schema")}  ${bold("create_model")} ${action.model}`);
-      } else if (action.op === "remove_model") {
-        print(`      ${sym.bullet} ${bold("schema")}  ${bold("remove_model")} ${action.model}`);
-      } else {
-        print(`      ${sym.bullet} ${bold("schema")}  ${action.op} on ${action.model}.${action.fieldName ?? ""}`);
-      }
-    } else if (action.type === "file") {
-      const editCount = action.edits.length;
-      print(`      ${sym.bullet} ${bold("file")}    ${action.filePath} ${info(`(${editCount} edit${editCount > 1 ? "s" : ""})`)}`);
-    } else if (action.type === "command") {
-      print(`      ${sym.bullet} ${bold("cmd")}     ${action.command}`);
-    } else if (action.type === "create_file") {
-      print(`      ${sym.bullet} ${bold("create")}  ${action.filePath} ${info(`— ${action.reason}`)}`);
-    }
-  }
-  print();
-
-  // ── 5. Blast Radius ───────────────────────────────────────────────
-  const schemaEdits = actions.filter((a) => a.type === "schema");
-  const isBreaking = (op: typeof schemaEdits[number]) =>
-    op.type === "schema" && (op.op === "remove_field" || op.op === "rename_field" || op.op === "change_type" || op.op === "remove_model");
-  const breakingEdits = schemaEdits.filter(isBreaking);
-
-  let blastResults: BlastRadiusResult[] = [];
+  // ── 4. Blast Radius ───────────────────────────────────────────────
+  //
+  // Computed from the INTENT, not from the generated actions, so the model can
+  // be told which files it must also fix before it writes a line of code. The
+  // previous order ran generation first and then built the prompt injection
+  // that generation was supposed to receive, so the main pass never saw the
+  // blast radius and every downstream file had to be patched by a second pass.
+  const changes = await analyzeBreakingChanges(editPlan, projectRoot);
+  const mustChange = affectedFilePaths(changes);
   let promptInjection = "";
-  let breakingFieldNamesPerModel: string[][] = [];
-  const llmProcessedFiles = new Set<string>();
-  let expectedDeltas: ExpectedDelta[] = [];
 
-  if (breakingEdits.length > 0) {
+  if (changes.length > 0) {
     print(section("Blast Radius"));
-    const checkSpin = spinner("Analyzing schema changes...");
-    checkSpin.start();
-    const checkStart = Date.now();
+    const blastSpin = spinner("Analyzing schema changes...");
+    blastSpin.start();
+    const blastStart = Date.now();
 
     print(`\n  ${warn("!")} ${bold("Breaking changes:")}`);
-    for (const op of breakingEdits) {
-      if (op.type !== "schema") continue;
-      if (op.op === "remove_field") {
-        print(`    ${error("−")} ${op.model}.${op.fieldName} ${error("removed")}`);
-      } else if (op.op === "rename_field") {
-        print(`    ${error("−")} ${op.model}.${op.fieldName} ${info(`→ ${op.newFieldName}`)}`);
-      } else if (op.op === "change_type") {
-        print(`    ${error("−")} ${op.model}.${op.fieldName} ${info(`${op.fieldType} → ${op.newFieldType}`)}`);
+    for (const { edit } of changes) {
+      if (edit.op === "remove_field") {
+        print(`    ${error("−")} ${edit.model}.${edit.fieldName} ${error("removed")}`);
+      } else if (edit.op === "rename_field") {
+        print(`    ${error("−")} ${edit.model}.${edit.fieldName} ${info(`→ ${edit.newFieldName}`)}`);
+      } else if (edit.op === "change_type") {
+        print(`    ${error("−")} ${edit.model}.${edit.fieldName} ${info(`${edit.fieldType} → ${edit.newFieldType}`)}`);
+      } else if (edit.op === "remove_model") {
+        print(`    ${error("−")} model ${edit.model} ${error("removed")}`);
       }
     }
 
-    const additiveEdits = schemaEdits.filter(
-      (op) => op.type === "schema" && op.op === "add_field"
-    );
-    for (const op of additiveEdits) {
-      if (op.type !== "schema") continue;
-      print(`    ${info("+")} ${op.model}.${op.fieldName} ${info("(additive)")}`);
-    }
-
-    const modelIds = [...new Set(breakingEdits.map((op) => `model:${op.type === "schema" ? op.model : ""}`))];
-    blastResults = await Promise.all(
-      modelIds.map((id) => computeBlastRadius(id, projectRoot))
-    );
-
-    for (const result of blastResults) {
+    for (const change of changes) {
       print();
-      print(formatBlastRadius(result));
+      print(formatBlastRadius(change.blastRadius));
     }
 
-    promptInjection = blastResults
-      .map(blastRadiusPromptSection)
-      .filter(Boolean)
-      .join("\n");
-
-    breakingFieldNamesPerModel = blastResults.map((br) => {
-      const modelName = br.changedNode.id.replace(/^model:/, "");
-      return breakingEdits
-        .filter((op) => op.type === "schema" && op.model === modelName)
-        .map((op) => (op.type === "schema" ? op.fieldName : ""))
-        .filter(Boolean) as string[];
-    });
-
-    const checkElapsed = Date.now() - checkStart;
-    const blastSize = blastResults.reduce(
-      (sum, r) => sum + r.affectedRoutes.length + r.affectedComponents.length + r.affectedFiles.length,
-      0
-    );
-    jsonResult.blastRadiusSize = blastSize;
-    checkSpin.succeed(`Blast radius computed ${info(fmtElapsed(checkElapsed))}`);
+    promptInjection = promptInjectionFor(changes);
+    blastSpin.succeed(`Blast radius computed ${info(fmtElapsed(Date.now() - blastStart))}`);
+    print();
+    print(`    ${bold(String(mustChange.length))} file(s) must change alongside the schema`);
     print();
 
-    // ── Expected structural delta (for HydraDB verification) ───────
-    expectedDeltas = breakingEdits
-      .filter((op): op is SchemaEdit => op.type === "schema")
-      .map((op) => {
-        const blast = blastResults.find(
-          (br) => br.changedNode.id === `model:${op.model}`
-        );
-        return computeExpectedDelta(
-          op,
-          blast ?? {
-            changedNode: { id: `model:${op.model}`, name: op.model, kind: "PrismaModel", filePath: "" },
-            affectedRoutes: [],
-            affectedComponents: [],
-            affectedFiles: [],
-          },
-          projectRoot
-        );
-      });
-
-    // ── Confirmation ───────────────────────────────────────────────
     if (!dryRun && !yes) {
       const readline = await import("readline");
       const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -745,164 +584,108 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
           resolve(answer.trim().toLowerCase().startsWith("y"));
         });
       });
-      if (!confirmed) {
-        throw new StepError(stepIndex, description, "Write aborted by user.");
-      }
-    }
-
-    // ── Re-generate for blast-radius-affected files ────────────────
-    const affectedFilePaths = [...new Set(
-      blastResults.flatMap((r) => [
-        ...r.affectedRoutes.map((n) => n.filePath),
-        ...r.affectedComponents.map((n) => n.filePath),
-        ...r.affectedFiles.map((n) => n.filePath),
-      ])
-    )];
-
-    const existingEditedPaths = new Set(
-      actions
-        .filter((a) => a.type === "file")
-        .map((a) => {
-          const fe = a as FileEdit;
-          const abs = path.isAbsolute(fe.filePath) ? fe.filePath : path.resolve(projectRoot, fe.filePath);
-          return path.relative(projectRoot, abs).replace(/\\/g, "/");
-        })
-    );
-    const uncoveredPaths = affectedFilePaths.filter((p) => !existingEditedPaths.has(p));
-
-    if (uncoveredPaths.length > 0 && !dryRun) {
-      print(section("Re-generation"));
-      const reSpin = spinner(`Generating edits for ${uncoveredPaths.length} affected file(s)...`);
-      reSpin.start();
-      const reStart = Date.now();
-
-      const schemaOpDesc = breakingEdits
-        .map((op) => {
-          if (op.type !== "schema") return "";
-          if (op.op === "rename_field") return `${op.model}.${op.fieldName} was renamed to ${op.newFieldName}`;
-          if (op.op === "remove_field") return `${op.model}.${op.fieldName} was removed`;
-          if (op.op === "change_type") return `${op.model}.${op.fieldName} type changed from ${op.fieldType} to ${op.newFieldType}`;
-          return "";
-        })
-        .filter(Boolean)
-        .join("; ");
-
-      for (const filePath of uncoveredPaths) {
-        const absPath = path.isAbsolute(filePath)
-          ? filePath
-          : path.resolve(projectRoot, filePath);
-        if (!fs.existsSync(absPath)) continue;
-        const content = fs.readFileSync(absPath, "utf-8");
-        const lines = content.split("\n");
-        const snippet = lines.slice(0, 80).join("\n") + (lines.length > 80 ? `\n... (${lines.length - 80} more lines)` : "");
-
-        const singleQuery =
-          `The schema had this change: ${schemaOpDesc}.\n` +
-          `Update the file "${filePath}" to stay consistent with this schema change.\n` +
-          `Produce MINIMAL oldText/newText edits. oldText must be a verbatim snippet (2-5 lines) from the file.\n` +
-          `Do NOT modify anything unrelated to the schema change. Return ONLY file edits.\n` +
-          `If the file does not need any changes, return an empty edits array [].`;
-
-        const singlePlan: EditPlan = [{
-          type: "file",
-          filePath,
-          edits: [{ filePath, oldText: "", newText: "" }],
-        }];
-
-        const singleContext =
-          context + "\n" + promptInjection +
-          `\n\nFile content (${filePath}, ${lines.length} lines):\n\`\`\`\n${snippet}\n\`\`\``;
-
-        try {
-          const fileActions = await scopedCodeGen(singleQuery, singleContext, singlePlan, 60_000);
-          const check = validateEditPlan(fileActions);
-          if (check.ok) {
-            llmProcessedFiles.add(filePath);
-            for (const action of check.plan) {
-              if (action.type === "file" && action.edits.some((e) => e.oldText !== "")) {
-                actions.push(action as FileEdit);
-              }
-            }
-          } else {
-            print(`    ${warn("!")} [${filePath}] validation failed: ${check.reason}`);
-          }
-        } catch (err: any) {
-          print(`    ${warn("!")} [${filePath}] LLM error: ${err?.message || err}`);
-        }
-      }
-
-      const reElapsed = Date.now() - reStart;
-      const addedCount = actions.filter((a) => a.type === "file" && !existingEditedPaths.has(
-        path.relative(projectRoot, path.isAbsolute((a as FileEdit).filePath) ? (a as FileEdit).filePath : path.resolve(projectRoot, (a as FileEdit).filePath)).replace(/\\/g, "/")
-      )).length;
-      if (addedCount > 0) {
-        reSpin.succeed(`Re-generation complete ${info(fmtElapsed(reElapsed))}`);
-        print(`    ${info(`${addedCount} file edit(s) generated for affected files`)}`);
-      } else {
-        reSpin.info(`No additional file edits generated ${info(fmtElapsed(reElapsed))}`);
-      }
-      print();
+      if (!confirmed) throw fail("Write aborted by user.");
     }
   } else {
-    const additiveEdits = schemaEdits.filter(
-      (op) => op.type === "schema" && op.op === "add_field"
-    );
-    if (additiveEdits.length > 0) {
+    const additive = schemaEditsOf(editPlan).filter((op) => op.op === "add_field");
+    if (additive.length > 0) {
       print(section("Blast Radius"));
-      for (const op of additiveEdits) {
-        if (op.type !== "schema") continue;
+      for (const op of additive) {
         print(`    ${info("+")} ${op.model}.${op.fieldName} ${info("(additive — no blast radius)")}`);
       }
       print();
     }
   }
 
-  // ── 6. Unified Structural Verification ─────────────────────────────
-  let verifiedActions = actions;
+  // ── 5. Code Generation ────────────────────────────────────────────
+  print(section("Generation"));
+  const genSpin = spinner("Generating changes...");
+  genSpin.start();
+  const genStart = Date.now();
+  const actions = await codeGen(editPlan, query, context + promptInjection);
+  const genElapsed = Date.now() - genStart;
 
-  if (blastResults.length > 0 && !dryRun) {
-    print(section("Structural Verification"));
+  if (!actions?.length) {
+    genSpin.info("No actions generated.");
+    return noChange();
+  }
+  genSpin.succeed(`Code generated ${info(fmtElapsed(genElapsed))}`);
+  print(`    ${info(`${actions.length} action(s) returned from model`)}`);
 
-    // Collect all affected node IDs for graph check
-    const allAffectedNodeIds = [
-      ...blastResults.flatMap((r) => [
-        ...r.affectedRoutes.map((n) => n.id),
-        ...r.affectedComponents.map((n) => n.id),
-        ...r.affectedFiles.map((n) => n.id),
-      ]),
-    ];
+  // ── Post-process: new-file edits (the model may return non-empty oldText) ──
+  for (const action of actions) {
+    if (action.type !== "file") continue;
+    const resolved = resolveProjectPath(action.filePath, projectRoot);
+    if (!resolved || fs.existsSync(resolved.abs)) continue;
+    const fullContent = action.edits.map((e) => e.newText).join("\n");
+    action.edits = [{ filePath: action.filePath, oldText: "", newText: fullContent }];
+  }
 
-    // Build generatedFiles for both checks
-    const generatedFilesForValidation: GeneratedFile[] = [];
-    for (const action of actions) {
-      if (action.type !== "file") continue;
-      const fe = action as FileEdit;
-      const absPath = path.isAbsolute(fe.filePath)
-        ? fe.filePath
-        : path.resolve(projectRoot, fe.filePath);
-      if (!fs.existsSync(absPath)) continue;
-      try {
-        const current = fs.readFileSync(absPath, "utf-8");
-        const content = applyScopedEdits(current, fe.edits, fe.filePath);
-        generatedFilesForValidation.push({ path: absPath, content });
-      } catch {
-        // If edits can't be applied, skip this file
-      }
-    }
+  injectPrismaCommands(actions);
 
-    // Build proposed schema source for graph check
-    const schemaEdit = actions.find((a): a is SchemaEdit => a.type === "schema");
-    let proposedSchemaSource: string | undefined;
-    if (schemaEdit) {
-      const schemaPath = findSchemaPath(projectRoot);
-      if (schemaPath) {
-        const currentSchema = fs.readFileSync(schemaPath, "utf-8");
-        try {
-          proposedSchemaSource = applySchemaEdit(currentSchema, schemaEdit, schemaPath, projectRoot);
-        } catch {
-          print(`  ${warn("!")} Could not compute proposed schema for graph verification`);
+  print(`    ${info("Actions")}:`);
+  printOperations(actions);
+  print();
+
+  // ── 6. Re-generation for uncovered blast-radius files ─────────────
+  if (mustChange.length > 0 && !dryRun) {
+    const covered = editedPaths(actions, projectRoot);
+    const uncovered = mustChange.filter((p) => !covered.has(p));
+
+    if (uncovered.length > 0) {
+      print(section("Re-generation"));
+      const reSpin = spinner(`Generating edits for ${uncovered.length} affected file(s)...`);
+      reSpin.start();
+      const reStart = Date.now();
+      const schemaChange = describeBreakingChanges(changes);
+      const oldFields = [...new Set(changes.flatMap((c) => c.breakingFieldNames))];
+      const outcomes: string[] = [];
+      let added = 0;
+
+      for (const filePath of uncovered) {
+        const abs = path.resolve(projectRoot, filePath);
+        if (!fs.existsSync(abs)) continue;
+
+        const result = await regenerateAffectedFile({
+          filePath,
+          currentContent: fs.readFileSync(abs, "utf-8"),
+          schemaChange,
+          oldFields,
+          context: context + "\n" + promptInjection,
+        });
+
+        if (result.edit) {
+          actions.push(result.edit);
+          added++;
+          outcomes.push(`    ${sym.ok} ${filePath} ${info(`(${result.strategy})`)}`);
+        } else {
+          outcomes.push(`    ${warn("!")} ${filePath} — ${result.reason}`);
         }
       }
+
+      const reElapsed = Date.now() - reStart;
+      if (added > 0) {
+        reSpin.succeed(`Re-generation complete ${info(fmtElapsed(reElapsed))}`);
+      } else {
+        reSpin.info(`No additional file edits generated ${info(fmtElapsed(reElapsed))}`);
+      }
+      for (const line of outcomes) print(line);
+      print();
+    }
+  }
+
+  // ── 7. Structural Verification ────────────────────────────────────
+  let verifiedActions: EditPlan = actions;
+
+  if (changes.length > 0 && !dryRun) {
+    print(section("Structural Verification"));
+
+    const { files: generatedFiles, unapplied } = materialize(actions, projectRoot);
+    const proposedSchemaSource = proposeSchema(actions, projectRoot);
+
+    if (unapplied.length > 0) {
+      printErr(`  ${warn("!")} ${unapplied.length} edit(s) could not be applied:`);
+      for (const u of unapplied) printErr(`    ${sym.bullet} ${u.filePath} — ${u.reason}`);
     }
 
     const verifySpin = spinner("Running unified structural validation...");
@@ -912,228 +695,125 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
     let unifiedResult: UnifiedValidationResult;
     try {
       unifiedResult = await runUnifiedValidation({
-        blastRadius: blastResults[0],
-        breakingFieldNames: breakingFieldNamesPerModel.flat(),
-        generatedFiles: generatedFilesForValidation,
-        expectedDeltas,
-        blastRadiusAffectedNodeIds: allAffectedNodeIds,
+        changes,
+        generatedFiles,
         projectRoot,
         proposedSchemaSource,
       });
     } catch (err) {
-      unifiedResult = {
-        localCheck: { addressed: 0, missed: 0, report: { addressed: [], missed: [], retryPrompt: "" } },
-        graphCheck: { addressed: 0, missed: 1, staleNodesFound: 0, report: { graphAddressed: [], graphMissed: [{ nodeId: "unknown", reason: err instanceof Error ? err.message : String(err) }], staleNodesFound: [] } },
-        graphCheckSkipped: false,
-        overallPassed: false,
-        summary: `Structural validation FAILED: ${err instanceof Error ? err.message : err}`,
-        resolutionReason: `ERROR: ${err instanceof Error ? err.message : err}`,
-      };
+      verifySpin.fail("Structural verification crashed");
+      throw fail(`Structural validation crashed: ${err instanceof Error ? err.message : err}`);
     }
 
     const verifyElapsed = Date.now() - verifyStart;
-
     if (unifiedResult.overallPassed) {
       verifySpin.succeed(`Structural verification passed ${info(fmtElapsed(verifyElapsed))}`);
     } else {
       verifySpin.fail(`Structural verification failed ${info(fmtElapsed(verifyElapsed))}`);
     }
+    reportValidation(unifiedResult);
 
-    // Display both checks distinctly
-    const totalAffected = unifiedResult.localCheck.addressed + unifiedResult.localCheck.missed;
-    const localStatus = unifiedResult.localCheck.missed === 0 ? success("PASSED") : error("FAILED");
-
-    // Graph check line: show SKIPPED when it was short-circuited, otherwise show real result
-    let graphLine: string;
-    if (unifiedResult.graphCheckSkipped) {
-      graphLine = `  Graph structural check: ${info("SKIPPED")} (local check failed first)`;
-    } else {
-      const graphStatus = unifiedResult.graphCheck.staleNodesFound > 0
-        ? error("FAILED (stale nodes)")
-        : unifiedResult.graphCheck.missed > 0
-          ? warn("PASSED (with warnings)")
-          : success("PASSED");
-      graphLine = `  Graph structural check: ${graphStatus} (${unifiedResult.graphCheck.addressed} relations confirmed, ${unifiedResult.graphCheck.staleNodesFound} stale nodes)`;
-    }
-
-    print(`  Local structural check: ${localStatus} (${unifiedResult.localCheck.addressed}/${totalAffected} files verified)`);
-    print(graphLine);
-
-    if (unifiedResult.localCheck.missed > 0) {
-      printErr(`\n  ${error("✗")} Local check — missed files:`);
-      for (const m of unifiedResult.localCheck.report.missed) {
-        printErr(`    ${sym.bullet} ${m.filePath}`);
-        printErr(`      ${m.reason}`);
-      }
-    }
-
-    if (!unifiedResult.graphCheckSkipped && unifiedResult.graphCheck.staleNodesFound > 0) {
-      printErr(`\n  ${error("✗")} Graph check — stale nodes (invisible to local re-parsing):`);
-      for (const stale of unifiedResult.graphCheck.report.staleNodesFound) {
-        printErr(`    ${sym.bullet} ${stale.nodeId} — still references stale node ${stale.staleRef}`);
-      }
-    }
-
-    if (!unifiedResult.graphCheckSkipped && unifiedResult.graphCheck.missed > 0 && unifiedResult.graphCheck.staleNodesFound === 0) {
-      print(`\n  ${warn("!")} Graph check — ${unifiedResult.graphCheck.missed} relation(s) differ (likely inferred, not blocking):`);
-      for (const miss of unifiedResult.graphCheck.report.graphMissed) {
-        print(`    ${sym.bullet} ${miss.nodeId}: ${miss.reason}`);
-      }
-    }
-
-    print(`  ${info("Resolution")}: ${unifiedResult.resolutionReason}`);
-
-    // ── 6b. Retry mechanism: if local check failed, re-prompt once ──
+    // ── 7b. One retry for files the first pass missed ───────────────
     if (!unifiedResult.overallPassed && unifiedResult.localCheck.missed > 0) {
-      const retryPrompt = unifiedResult.localCheck.report.retryPrompt;
-      if (retryPrompt) {
-        print();
-        print(`  ${warn("!")} Attempting one retry to fix ${unifiedResult.localCheck.missed} missed file(s)...`);
-        const retrySpin = spinner("Re-generating for missed files...");
-        retrySpin.start();
-        const retryStart = Date.now();
+      print();
+      print(`  ${warn("!")} Attempting one retry to fix ${unifiedResult.localCheck.missed} missed file(s)...`);
+      const retrySpin = spinner("Re-generating for missed files...");
+      retrySpin.start();
+      const retryStart = Date.now();
 
-        // Build the retry query with missed files appended
-        const retryQuery = query + retryPrompt;
+      const missedPaths = unifiedResult.localCheck.report.missed.map((m) => m.filePath);
+      const schemaChange = describeBreakingChanges(changes);
+      const oldFields = [...new Set(changes.flatMap((c) => c.breakingFieldNames))];
+      const retryActions: EditPlan = [];
+      const retryNotes: string[] = [];
 
+      // Retry each missed file individually rather than re-running the whole
+      // plan. The file is already known, so the model is asked one narrow
+      // question with the file in front of it, and the answer is checked before
+      // it is accepted.
+      for (const filePath of missedPaths) {
+        const abs = path.resolve(projectRoot, filePath);
+        if (!fs.existsSync(abs)) continue;
         try {
-          const retryPlan = await extractIntentWithRetry(retryQuery, context);
-          const retryActions = await codeGen(retryPlan, retryQuery, context);
-
-          if (retryActions?.length) {
-            // Build generated files for retry verification: first-pass verified + retry-generated
-            // This ensures the retry check sees the union, not just the retry output
-            const retryGeneratedFiles: GeneratedFile[] = [...generatedFilesForValidation];
-            for (const action of retryActions) {
-              if (action.type !== "file") continue;
-              const fe = action as FileEdit;
-              const absPath = path.isAbsolute(fe.filePath)
-                ? fe.filePath
-                : path.resolve(projectRoot, fe.filePath);
-              if (!fs.existsSync(absPath)) continue;
-              try {
-                const current = fs.readFileSync(absPath, "utf-8");
-                const content = applyScopedEdits(current, fe.edits, fe.filePath);
-                // Replace or add the file entry (retry overrides first-pass for same path)
-                const rel = path.relative(projectRoot, absPath).replace(/\\/g, "/");
-                const existingIdx = retryGeneratedFiles.findIndex((f) => {
-                  const fRel = path.relative(projectRoot, f.path).replace(/\\/g, "/");
-                  return fRel === rel;
-                });
-                if (existingIdx >= 0) {
-                  retryGeneratedFiles[existingIdx] = { path: absPath, content };
-                } else {
-                  retryGeneratedFiles.push({ path: absPath, content });
-                }
-              } catch {
-                // If edits can't be applied, skip this file
-              }
-            }
-
-            // Re-run local verification with the retry results
-            const retryResult = await runUnifiedValidation({
-              blastRadius: blastResults[0],
-              breakingFieldNames: breakingFieldNamesPerModel.flat(),
-              generatedFiles: retryGeneratedFiles,
-              expectedDeltas: [],  // Skip graph check on retry — only re-check local
-              blastRadiusAffectedNodeIds: allAffectedNodeIds,
-              projectRoot,
-              proposedSchemaSource,
-            });
-
-            const retryElapsed = Date.now() - retryStart;
-
-            if (retryResult.localCheck.missed === 0) {
-              // Retry succeeded — merge: keep first-pass verified edits + retry edits for missed files
-              retrySpin.succeed(`Retry succeeded ${info(fmtElapsed(retryElapsed))}`);
-              print(`  ${sym.ok} All ${retryResult.localCheck.addressed + retryResult.localCheck.missed} blast-radius files now addressed`);
-
-              // Collect the file paths that were missed in the first pass (now fixed by retry)
-              const missedFilePaths = new Set(
-                unifiedResult.localCheck.report.missed.map((m) => m.filePath)
-              );
-
-              // Start with all first-pass actions that are NOT file edits for missed paths
-              const mergedActions = actions.filter((a) => {
-                if (a.type !== "file") return true; // keep schema, command, create_file
-                const fe = a as FileEdit;
-                const abs = path.isAbsolute(fe.filePath)
-                  ? fe.filePath
-                  : path.resolve(projectRoot, fe.filePath);
-                const rel = path.relative(projectRoot, abs).replace(/\\/g, "/");
-                return !missedFilePaths.has(rel); // keep only if NOT in missed list
-              });
-
-              // Add all retry actions (they cover the missed files)
-              mergedActions.push(...retryActions);
-
-              verifiedActions = mergedActions;
-              jsonResult.verification = "passed (after retry)";
-              print();
-            } else {
-              // Retry still failed — hard block
-              retrySpin.fail(`Retry failed ${info(fmtElapsed(retryElapsed))}`);
-              printErr(`\n  ${error("✗")} Retry still missed ${retryResult.localCheck.missed} file(s):`);
-              for (const m of retryResult.localCheck.report.missed) {
-                printErr(`    ${sym.bullet} ${m.filePath}`);
-                printErr(`      ${m.reason}`);
-              }
-              print();
-              throw new StepError(
-                stepIndex, description,
-                `Verification failed after retry: ${retryResult.localCheck.missed} file(s) still not addressed`,
-                opts.cumulativeResult.allWrittenPaths,
-                opts.cumulativeResult.allCreatedPaths
-              );
-            }
+          const outcome = await regenerateAffectedFile({
+            filePath,
+            currentContent: fs.readFileSync(abs, "utf-8"),
+            schemaChange,
+            oldFields,
+            context: context + "\n" + promptInjection,
+          });
+          if (outcome.edit) {
+            retryActions.push(outcome.edit);
+            retryNotes.push(`    ${sym.ok} ${filePath} ${info(`(${outcome.strategy})`)}`);
           } else {
-            // Retry returned no actions
-            retrySpin.fail("Retry returned no actions");
-            print();
-            throw new StepError(
-              stepIndex, description,
-              `Verification failed: retry returned no actions for ${unifiedResult.localCheck.missed} missed file(s)`,
-              opts.cumulativeResult.allWrittenPaths,
-              opts.cumulativeResult.allCreatedPaths
-            );
+            retryNotes.push(`    ${warn("!")} ${filePath} — ${outcome.reason}`);
           }
         } catch (err) {
-          if (err instanceof StepError) throw err;
-          retrySpin.fail(`Retry error: ${err instanceof Error ? err.message : err}`);
-          print();
-          throw new StepError(
-            stepIndex, description,
-            `Verification retry failed: ${err instanceof Error ? err.message : err}`,
-            opts.cumulativeResult.allWrittenPaths,
-            opts.cumulativeResult.allCreatedPaths
+          retryNotes.push(
+            `    ${warn("!")} ${filePath} — ${err instanceof Error ? err.message : err}`
           );
         }
-      } else {
-        // No retry prompt available — hard block
+      }
+
+      // Stop the spinner before printing: ora redraws its own line, so anything
+      // printed while it is live can be overwritten — which silently ate the
+      // one note that mattered.
+      retrySpin.stop();
+      for (const note of retryNotes) print(note);
+
+      if (retryActions.length === 0) {
+        retrySpin.fail("Retry produced no usable edits");
         print();
-        throw new StepError(
-          stepIndex, description,
-          `Structural verification failed: ${unifiedResult.resolutionReason}`,
-          opts.cumulativeResult.allWrittenPaths,
-          opts.cumulativeResult.allCreatedPaths
+        throw fail(
+          `Verification failed: retry produced no edits for ${unifiedResult.localCheck.missed} missed file(s)`
         );
       }
-    } else if (!unifiedResult.overallPassed) {
-      // Failed but no missed files (e.g. stale nodes) — hard block
+
+      // Merge: first-pass actions minus the file edits for missed paths, plus
+      // everything the retry produced. Then re-verify the union.
+      const merged: EditPlan = actions.filter((a) => {
+        if (a.type !== "file") return true;
+        const resolved = resolveProjectPath(a.filePath, projectRoot);
+        return !resolved || !missedPaths.includes(resolved.rel);
+      });
+      merged.push(...retryActions);
+
+      const retryResult = await runUnifiedValidation({
+        changes,
+        generatedFiles: materialize(merged, projectRoot).files,
+        projectRoot,
+        proposedSchemaSource,
+        skipGraphCheck: true,
+      });
+
+      const retryElapsed = Date.now() - retryStart;
+
+      if (retryResult.localCheck.missed > 0) {
+        retrySpin.fail(`Retry failed ${info(fmtElapsed(retryElapsed))}`);
+        printErr(`\n  ${error("✗")} Retry still missed ${retryResult.localCheck.missed} file(s):`);
+        for (const m of retryResult.localCheck.report.missed) {
+          printErr(`    ${sym.bullet} ${m.filePath}`);
+          printErr(`      ${m.reason}`);
+        }
+        print();
+        throw fail(
+          `Verification failed after retry: ${retryResult.localCheck.missed} file(s) still not addressed`
+        );
+      }
+
+      retrySpin.succeed(`Retry succeeded ${info(fmtElapsed(retryElapsed))}`);
+      print(`  ${sym.ok} All ${retryResult.localCheck.addressed} blast-radius file(s) now addressed`);
+      verifiedActions = merged;
       print();
-      throw new StepError(
-        stepIndex, description,
-        `Structural verification failed: ${unifiedResult.resolutionReason}`,
-        opts.cumulativeResult.allWrittenPaths,
-        opts.cumulativeResult.allCreatedPaths
-      );
+    } else if (!unifiedResult.overallPassed) {
+      print();
+      throw fail(`Structural verification failed: ${unifiedResult.resolutionReason}`);
     }
 
     print();
-    jsonResult.verification = "passed";
   }
 
-  // ── 7. Write ──────────────────────────────────────────────────────
+  // ── 8. Write ──────────────────────────────────────────────────────
   print(section(dryRun ? "Preview" : "Execution"));
   const writeSpin = spinner(dryRun ? "Previewing changes..." : "Writing files...");
   writeSpin.start();
@@ -1147,114 +827,121 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
     onBeforeCommand: () => { writeSpin.stop(); },
   });
 
-  const writeElapsed = Date.now() - writeStart;
-  console.log(`    ${sym.ok} ${dryRun ? "Preview" : "Write"} complete ${info(fmtElapsed(writeElapsed))}`);
+  console.log(
+    `    ${sym.ok} ${dryRun ? "Preview" : "Write"} complete ${info(fmtElapsed(Date.now() - writeStart))}`
+  );
   print();
 
-  jsonResult.filesWritten = result.writtenPaths.map((p) => path.relative(projectRoot, p));
+  // ── Handle schema failures ────────────────────────────────────────
+  // Reported before anything else: a failed schema edit aborts the whole write,
+  // so there is nothing on disk and nothing else worth reporting.
+  if (result.schemaFailures.length > 0) {
+    printErr(`\n  ${error("✗")} ${result.schemaFailures.length} schema edit(s) failed:`);
+    for (const { edit, error: msg } of result.schemaFailures) {
+      printErr(`    ${sym.bullet} ${edit.op} on ${edit.model}.${edit.fieldName ?? ""} — ${msg}`);
+    }
+    throw fail(
+      `${result.schemaFailures.length} schema edit(s) failed — nothing was written`
+    );
+  }
 
   // ── Handle stale edits ────────────────────────────────────────────
   if (result.staleEdits.length > 0 && !dryRun) {
     print(section("Retrying stale edits"));
-    const retrySpin = spinner("Retrying with current file content...");
-    retrySpin.start();
+    const staleSpin = spinner("Retrying with current file content...");
+    staleSpin.start();
 
     const failedPaths: string[] = [];
-    for (const { edit, error: editError } of result.staleEdits) {
-      const absPath = path.isAbsolute(edit.filePath)
-        ? edit.filePath
-        : path.resolve(projectRoot, edit.filePath);
-
-      if (!fs.existsSync(absPath)) {
+    for (const { edit } of result.staleEdits) {
+      const resolved = resolveProjectPath(edit.filePath, projectRoot);
+      if (!resolved || !fs.existsSync(resolved.abs)) {
         failedPaths.push(edit.filePath);
         continue;
       }
 
-      const currentContent = fs.readFileSync(absPath, "utf-8");
-      const retryQuery = `${query}\n\nFILE ${edit.filePath} CURRENT CONTENT:\n\`\`\`\n${currentContent}\n\`\`\`\n\nYour previous oldText didn't match. Provide corrected oldText/newText pairs for ONLY the changes you need to make to this file. Make the minimal change necessary.`;
+      const currentContent = fs.readFileSync(resolved.abs, "utf-8");
+      const retryQuery =
+        `${query}\n\nYour previous oldText for ${resolved.rel} did not match the file. ` +
+        `Provide corrected, minimal oldText/newText pairs for ONLY that file.\n\n` +
+        `FILE ${resolved.rel} CURRENT CONTENT:\n\`\`\`\n${clampForPrompt(currentContent)}\n\`\`\``;
 
       try {
-        const retryPlan = await extractIntentWithRetry(retryQuery, context);
+        // schemaSource is passed here too: without it the retry has no view of
+        // the models and readily proposes a text edit on schema.prisma, which is
+        // rejected and burns the single retry this path gets.
+        const retryPlan = await extractIntentWithRetry(retryQuery, context, schemaSource);
         const retryActions = await codeGen(retryPlan, retryQuery, context);
-        if (retryActions?.length) {
-          const retryResult = await handleAgentOutput(retryActions, {
-            dryRun: false,
-            yes: true,
-            projectRoot,
-          });
-          if (retryResult.staleEdits.length > 0) {
-            failedPaths.push(edit.filePath);
-          }
+        if (!retryActions?.length) {
+          failedPaths.push(resolved.rel);
+          continue;
+        }
+        const retryResult = await handleAgentOutput(retryActions, {
+          dryRun: false,
+          yes: true,
+          projectRoot,
+        });
+        if (retryResult.staleEdits.length > 0) {
+          failedPaths.push(resolved.rel);
         } else {
-          failedPaths.push(edit.filePath);
+          result.writtenPaths.push(...retryResult.writtenPaths);
+          result.createdPaths.push(...retryResult.createdPaths);
         }
       } catch {
-        failedPaths.push(edit.filePath);
+        failedPaths.push(resolved.rel);
       }
     }
 
-    retrySpin.stop();
+    staleSpin.stop();
     if (failedPaths.length > 0) {
-      printErr(
-        `\n  ${error("✗")} Stale edit retry failed for ${failedPaths.length} file(s):`
-      );
-      for (const p of failedPaths) {
-        printErr(`    ${sym.bullet} ${p}`);
-      }
+      printErr(`\n  ${error("✗")} Stale edit retry failed for ${failedPaths.length} file(s):`);
+      for (const p of failedPaths) printErr(`    ${sym.bullet} ${p}`);
       throw new StepError(
-        stepIndex, description,
+        stepIndex,
+        description,
         `Stale edit retry failed for ${failedPaths.length} file(s)`,
         [...opts.cumulativeResult.allWrittenPaths, ...result.writtenPaths],
         [...opts.cumulativeResult.allCreatedPaths, ...result.createdPaths]
       );
-    } else {
-      print(`  ${sym.ok} All stale edits retried successfully`);
     }
+    print(`  ${sym.ok} All stale edits retried successfully`);
     print();
   }
 
   // ── Handle create-file failures ──────────────────────────────────
   if (result.createFailures.length > 0) {
-    printErr(
-      `\n  ${error("✗")} ${result.createFailures.length} create-file operation(s) failed:`
-    );
+    printErr(`\n  ${error("✗")} ${result.createFailures.length} create-file operation(s) failed:`);
     for (const { edit, error: msg } of result.createFailures) {
       printErr(`    ${sym.bullet} ${edit.filePath} — ${msg}`);
     }
     throw new StepError(
-      stepIndex, description,
+      stepIndex,
+      description,
       `${result.createFailures.length} create-file operation(s) failed`,
       [...opts.cumulativeResult.allWrittenPaths, ...result.writtenPaths],
       [...opts.cumulativeResult.allCreatedPaths, ...result.createdPaths]
     );
   }
 
-  if (dryRun) {
-    return {
-      stepIndex,
-      description,
-      success: true,
-      writtenPaths: [],
-      createdPaths: [],
-    };
-  }
+  if (dryRun) return noChange();
 
-  // ── 8. Reingest ───────────────────────────────────────────────────
-  if (result.writtenPaths.length > 0 || result.createdPaths.length > 0) {
+  // ── 9. Reingest ───────────────────────────────────────────────────
+  const allPaths = [...new Set([...result.writtenPaths, ...result.createdPaths])];
+  if (allPaths.length > 0) {
     print(section("Graph Index"));
     const idxSpin = spinner("Updating graph index...");
     idxSpin.start();
     const idxStart = Date.now();
-    const allPaths = [...result.writtenPaths, ...result.createdPaths];
     for (const absPath of allPaths) {
       try {
         await reingestFile(absPath, projectRoot);
       } catch (err) {
-        printErr(`  ${warn("!")} reingest failed for ${absPath}:`, err instanceof Error ? err.message : err);
+        printErr(
+          `  ${warn("!")} reingest failed for ${absPath}:`,
+          err instanceof Error ? err.message : err
+        );
       }
     }
     idxSpin.succeed(`Graph index updated ${info(fmtElapsed(Date.now() - idxStart))}`);
-    jsonResult.graphIndexUpdated = true;
     print();
   }
 
@@ -1265,4 +952,192 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
     writtenPaths: result.writtenPaths,
     createdPaths: result.createdPaths,
   };
+}
+
+// ---------------------------------------------------------------------------
+// runStep helpers
+// ---------------------------------------------------------------------------
+
+function printOperations(plan: EditPlan): void {
+  for (const op of plan) {
+    if (op.type === "schema") {
+      if (op.op === "create_model") {
+        print(`      ${sym.bullet} ${bold("schema")}  ${bold("create_model")} ${op.model}`);
+      } else if (op.op === "remove_model") {
+        print(`      ${sym.bullet} ${bold("schema")}  ${bold("remove_model")} ${op.model}`);
+      } else {
+        print(`      ${sym.bullet} ${bold("schema")}  ${op.op} on ${op.model}.${op.fieldName ?? ""}`);
+      }
+    } else if (op.type === "file") {
+      const n = op.edits.length;
+      print(`      ${sym.bullet} ${bold("file")}    ${op.filePath} ${info(`(${n} edit${n > 1 ? "s" : ""})`)}`);
+    } else if (op.type === "command") {
+      print(`      ${sym.bullet} ${bold("cmd")}     ${op.command}`);
+    } else if (op.type === "create_file") {
+      print(`      ${sym.bullet} ${bold("create")}  ${op.filePath} ${info(`— ${op.reason}`)}`);
+    }
+  }
+}
+
+/** Project-relative paths already covered by a file operation in this plan. */
+function editedPaths(plan: EditPlan, projectRoot: string): Set<string> {
+  const paths = new Set<string>();
+  for (const op of plan) {
+    if (op.type !== "file" && op.type !== "create_file") continue;
+    const resolved = resolveProjectPath(op.filePath, projectRoot);
+    if (resolved) paths.add(resolved.rel);
+  }
+  return paths;
+}
+
+/**
+ * Apply every file edit in memory, so verification judges post-edit content.
+ *
+ * Edits that will not apply are reported rather than dropped. Dropping them
+ * silently made verification blame the model for ignoring a file when the real
+ * cause was an `oldText` that never matched — two very different problems with
+ * identical output.
+ */
+function materialize(
+  plan: EditPlan,
+  projectRoot: string
+): { files: GeneratedFile[]; unapplied: Array<{ filePath: string; reason: string }> } {
+  const files: GeneratedFile[] = [];
+  const unapplied: Array<{ filePath: string; reason: string }> = [];
+
+  for (const op of plan) {
+    if (op.type === "create_file") {
+      const resolved = resolveProjectPath(op.filePath, projectRoot);
+      if (resolved) files.push({ path: resolved.abs, content: op.content });
+      continue;
+    }
+    if (op.type !== "file") continue;
+    const resolved = resolveProjectPath(op.filePath, projectRoot);
+    if (!resolved || !fs.existsSync(resolved.abs)) continue;
+    try {
+      const current = fs.readFileSync(resolved.abs, "utf-8");
+      files.push({
+        path: resolved.abs,
+        content: applyScopedEdits(current, op.edits, op.filePath),
+      });
+    } catch (err) {
+      unapplied.push({
+        filePath: resolved.rel,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return { files, unapplied };
+}
+
+/**
+ * The schema as it will look after every schema op in the plan.
+ *
+ * `write: false` matters: this used to commit the change to disk during
+ * verification, so the write phase then applied the same edit to an already
+ * edited file — harmless for a rename, but it appends a second copy of an
+ * added field.
+ */
+function proposeSchema(plan: EditPlan, projectRoot: string): string | undefined {
+  const schemaEdits = schemaEditsOf(plan);
+  if (schemaEdits.length === 0) return undefined;
+  const schemaPath = findSchemaPath(projectRoot);
+  if (!schemaPath) return undefined;
+
+  let source = fs.readFileSync(schemaPath, "utf-8");
+  for (const edit of schemaEdits) {
+    try {
+      source = applySchemaEdit(source, edit, schemaPath, projectRoot, { write: false });
+    } catch {
+      return undefined;
+    }
+  }
+  return source;
+}
+
+/** Append `prisma migrate dev` / `prisma generate` after schema changes. */
+function injectPrismaCommands(actions: EditPlan): void {
+  const schemaOps = schemaEditsOf(actions);
+  if (schemaOps.length === 0) return;
+
+  const migrationName = schemaOps
+    .map((op) => {
+      const field = op.fieldName ?? op.model;
+      switch (op.op) {
+        case "add_field": return `add_${field}`;
+        case "remove_field": return `remove_${field}`;
+        case "rename_field": return `rename_${field}`;
+        case "change_type": return `change_${field}`;
+        case "create_model": return `create_${op.model}`;
+        case "remove_model": return `drop_${op.model}`;
+        default: return op.op;
+      }
+    })
+    .join("_")
+    .slice(0, 64);
+
+  const has = (needle: string) =>
+    actions.some((a) => a.type === "command" && a.command.includes(needle));
+
+  if (!has("prisma migrate")) {
+    actions.push({ type: "command", command: `npx prisma migrate dev --name ${migrationName}` });
+  }
+  if (!has("prisma generate")) {
+    actions.push({ type: "command", command: "npx prisma generate" });
+  }
+}
+
+/** Print both validation layers distinctly, as two independent checks. */
+function reportValidation(result: UnifiedValidationResult): void {
+  const totalAffected = result.localCheck.addressed + result.localCheck.missed;
+  const localStatus = result.localCheck.missed === 0 ? success("PASSED") : error("FAILED");
+
+  let graphLine: string;
+  if (result.graphCheckSkipped) {
+    graphLine = `  Graph structural check: ${info("SKIPPED")}`;
+  } else {
+    const graphStatus =
+      result.graphCheck.staleNodesFound > 0 || result.graphCheck.missed > 0
+          ? warn("PASSED (with warnings)")
+          : success("PASSED");
+    graphLine = `  Graph structural check: ${graphStatus} (${result.graphCheck.addressed} relations confirmed, ${result.graphCheck.staleNodesFound} stale nodes)`;
+  }
+
+  print(
+    `  Local structural check: ${localStatus} (${result.localCheck.addressed}/${totalAffected} files verified)`
+  );
+  print(graphLine);
+
+  if (result.localCheck.missed > 0) {
+    printErr(`\n  ${error("✗")} Local check — missed files:`);
+    for (const m of result.localCheck.report.missed) {
+      printErr(`    ${sym.bullet} ${m.filePath}`);
+      printErr(`      ${m.reason}`);
+    }
+  }
+
+  if (!result.graphCheckSkipped && result.graphCheck.staleNodesFound > 0) {
+    printErr(
+      `\n  ${warn("!")} Graph check — stale relations in HydraDB (not blocking; disk is correct):`
+    );
+    for (const stale of result.graphCheck.report.staleNodesFound) {
+      printErr(`    ${sym.bullet} ${stale.nodeId} — still references ${stale.staleRef}`);
+    }
+    printErr(`    ${info("Run 'graphyti init-graph' to resync the graph.")}`);
+  }
+
+  if (
+    !result.graphCheckSkipped &&
+    result.graphCheck.missed > 0 &&
+    result.graphCheck.staleNodesFound === 0
+  ) {
+    print(
+      `\n  ${warn("!")} Graph check — ${result.graphCheck.missed} relation(s) differ (likely inferred, not blocking):`
+    );
+    for (const miss of result.graphCheck.report.graphMissed) {
+      print(`    ${sym.bullet} ${miss.nodeId}: ${miss.reason}`);
+    }
+  }
+
+  print(`  ${info("Resolution")}: ${result.resolutionReason}`);
 }

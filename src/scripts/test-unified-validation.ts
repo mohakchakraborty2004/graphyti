@@ -3,14 +3,13 @@
  *
  * Run with: npx tsx src/scripts/test-unified-validation.ts
  *
- * Tests:
- * (a) A clean rename that should pass both checks
- * (b) A forced local-check failure (missed file)
- * (c) A case with stale nodes (graph check catches what local can't)
+ * These cover the resolution rule and the local gate. The HydraDB round trip is
+ * skipped (`skipGraphCheck`) because it needs a live database; the graph layer's
+ * own behaviour is exercised by an integration run against sample-project.
  */
 
-import { runUnifiedValidation, type UnifiedValidationResult } from "../verify/unifiedValidation";
-import type { BlastRadiusResult } from "../graph/blastRadius";
+import { runUnifiedValidation, type ValidationChange } from "../verify/unifiedValidation";
+import type { BlastRadiusResult, AffectedNode } from "../graph/blastRadius";
 import type { ExpectedDelta } from "../graph/expectedDelta";
 
 // ---------------------------------------------------------------------------
@@ -37,58 +36,108 @@ function assertEqual<T>(actual: T, expected: T, label: string) {
   }
 }
 
+/** Build a complete BlastRadiusResult from just the nodes a test cares about. */
+function blast(
+  changedName: string,
+  nodes: { routes?: AffectedNode[]; components?: AffectedNode[]; files?: AffectedNode[] }
+): BlastRadiusResult {
+  const affectedRoutes = nodes.routes ?? [];
+  const affectedComponents = nodes.components ?? [];
+  const affectedFiles = nodes.files ?? [];
+  return {
+    changedNode: {
+      id: `field:${changedName}`,
+      name: changedName,
+      kind: "ModelField",
+      filePath: "prisma/schema.prisma",
+    },
+    affectedRoutes,
+    affectedComponents,
+    affectedFiles,
+    advisoryFiles: [],
+    affectedFilePaths: [
+      ...new Set(
+        [...affectedRoutes, ...affectedComponents, ...affectedFiles].map((n) => n.filePath)
+      ),
+    ],
+    filteredOut: [],
+    staleNodes: [],
+  };
+}
+
+function renameDelta(
+  model: string,
+  oldName: string,
+  newName: string,
+  refs: string[]
+): ExpectedDelta {
+  return {
+    changeType: "rename",
+    targetModel: model,
+    targetNodeId: `field:${model}.${oldName}`,
+    oldName,
+    newName,
+    expectedRemovedRefs: refs,
+    expectedAddedRefs: refs,
+  };
+}
+
+const ROOT = "/testbed";
+
 // ---------------------------------------------------------------------------
 // Test cases
 // ---------------------------------------------------------------------------
 
 async function testCleanRename() {
-  console.log("\n=== Test (a): Clean rename — both checks should pass ===\n");
+  console.log("\n=== Test (a): Clean rename — local check passes ===\n");
 
-  // Simulate a blast radius where all affected files were correctly updated
-  const blastRadius: BlastRadiusResult = {
-    changedNode: { id: "model:Post", name: "Post", kind: "PrismaModel", filePath: "prisma/schema.prisma" },
-    affectedRoutes: [
-      { id: "route:/api/posts", name: "posts", filePath: "app/api/posts/route.ts", reason: "queries Post.title" },
+  const blastRadius = blast("Post.title", {
+    routes: [
+      {
+        id: "route:/api/posts",
+        name: "/api/posts",
+        filePath: "app/api/posts/route.ts",
+        reason: "selects Post.title",
+      },
     ],
-    affectedComponents: [
-      { id: "component:app/components/PostCard.tsx", name: "PostCard", filePath: "app/components/PostCard.tsx", reason: "renders post.title" },
+    components: [
+      {
+        id: "component:app/components/PostCard.tsx",
+        name: "PostCard",
+        filePath: "app/components/PostCard.tsx",
+        reason: "renders Post.title",
+      },
     ],
-    affectedFiles: [
-      { id: "file:lib/posts.ts", name: "posts", filePath: "lib/posts.ts", reason: "references Post.title" },
+    files: [
+      {
+        id: "file:lib/posts.ts",
+        name: "lib/posts.ts",
+        filePath: "lib/posts.ts",
+        reason: "imports app/api/posts/route.ts",
+      },
     ],
-  };
+  });
 
-  const breakingFieldNames = ["title"];
-
-  // All files are correctly generated (no old references)
-  const generatedFiles = [
-    { path: "/testbed/app/api/posts/route.ts", content: 'const heading = post.heading;' },
-    { path: "/testbed/app/components/PostCard.tsx", content: 'return <div>{post.heading}</div>;' },
-    { path: "/testbed/lib/posts.ts", content: 'export const getPost = () => prisma.post.findMany({ select: { heading: true } });' },
+  const changes: ValidationChange[] = [
+    {
+      blastRadius,
+      breakingFieldNames: ["title"],
+      delta: renameDelta("Post", "title", "heading", blastRadius.affectedFilePaths),
+    },
   ];
 
-  const expectedDeltas: ExpectedDelta[] = [{
-    changeType: "rename",
-    targetModel: "Post",
-    targetNodeId: "field:Post.title",
-    oldName: "title",
-    newName: "heading",
-    expectedRemovedRefs: ["field:Post.title"],
-    expectedAddedRefs: ["field:Post.heading"],
-  }];
-
-  // Since we can't actually talk to HydraDB in this test, we mock it
-  // by passing an empty expectedDeltas array to skip the graph check
   const result = await runUnifiedValidation({
-    blastRadius,
-    breakingFieldNames,
-    generatedFiles,
-    expectedDeltas: [],  // Skip graph check for unit test
-    blastRadiusAffectedNodeIds: blastRadius.affectedRoutes
-      .concat(blastRadius.affectedComponents)
-      .concat(blastRadius.affectedFiles)
-      .map((n) => n.id),
-    projectRoot: "/testbed",
+    changes,
+    generatedFiles: [
+      { path: `${ROOT}/app/api/posts/route.ts`, content: "const heading = post.heading;" },
+      { path: `${ROOT}/app/components/PostCard.tsx`, content: "return <div>{post.heading}</div>;" },
+      {
+        path: `${ROOT}/lib/posts.ts`,
+        content: "export const getPost = () => prisma.post.findMany({ select: { heading: true } });",
+      },
+    ],
+    projectRoot: ROOT,
+    skipGraphCheck: true,
   });
 
   assert(result.overallPassed, "overallPassed should be true");
@@ -96,88 +145,122 @@ async function testCleanRename() {
   assertEqual(result.localCheck.addressed, 3, "local check: 3 addressed");
   assert(result.summary.includes("PASSED"), "summary should include PASSED");
   console.log(`  Summary: ${result.summary}`);
-  console.log(`  Resolution: ${result.resolutionReason}`);
 }
 
 async function testLocalCheckFailure() {
-  console.log("\n=== Test (b): Forced local-check failure — should block ===\n");
+  console.log("\n=== Test (b): A leftover reference blocks the write ===\n");
 
-  // Use file nodes (not route nodes) so the text-search verification is used
-  // instead of the TypeScript AST extractor which needs proper code structure
-  const blastRadius: BlastRadiusResult = {
-    changedNode: { id: "model:Post", name: "Post", kind: "PrismaModel", filePath: "prisma/schema.prisma" },
-    affectedRoutes: [],
-    affectedComponents: [],
-    affectedFiles: [
-      { id: "file:lib/utils.ts", name: "utils", filePath: "lib/utils.ts", reason: "references Post.title" },
+  const blastRadius = blast("Post.title", {
+    files: [
+      {
+        id: "file:lib/utils.ts",
+        name: "lib/utils.ts",
+        filePath: "lib/utils.ts",
+        reason: "references Post.title",
+      },
     ],
-  };
-
-  const breakingFieldNames = ["title"];
-
-  // File still references old field — local check should catch this via text search
-  const generatedFiles = [
-    { path: "/testbed/lib/utils.ts", content: 'export const getPostTitle = (post: any) => post.title;' },
-  ];
-
-  const result = await runUnifiedValidation({
-    blastRadius,
-    breakingFieldNames,
-    generatedFiles,
-    expectedDeltas: [],  // Skip graph check
-    blastRadiusAffectedNodeIds: ["file:lib/utils.ts"],
-    projectRoot: "/testbed",
   });
 
-  assert(!result.overallPassed, "overallPassed should be false (local check failed)");
+  const result = await runUnifiedValidation({
+    changes: [
+      {
+        blastRadius,
+        breakingFieldNames: ["title"],
+        delta: renameDelta("Post", "title", "heading", ["file:lib/utils.ts"]),
+      },
+    ],
+    generatedFiles: [
+      {
+        path: `${ROOT}/lib/utils.ts`,
+        content: "export const getPostTitle = (post: any) => post.title;",
+      },
+    ],
+    projectRoot: ROOT,
+    skipGraphCheck: true,
+  });
+
+  assert(!result.overallPassed, "overallPassed should be false");
   assertEqual(result.localCheck.missed, 1, "local check: 1 missed");
   assert(result.resolutionReason.includes("BLOCKED"), "resolution should say BLOCKED");
-  assert(result.resolutionReason.includes("local"), "resolution should mention local check");
-  console.log(`  Summary: ${result.summary}`);
+  assert(result.graphCheckSkipped, "graph check is skipped once local has failed");
+  assert(
+    result.localCheck.report.retryPrompt.includes("lib/utils.ts"),
+    "retry prompt names the offending file"
+  );
   console.log(`  Resolution: ${result.resolutionReason}`);
 }
 
-async function testStaleNodesDetected() {
-  console.log("\n=== Test (c): Stale nodes in graph — should block even if local passes ===\n");
+async function testFieldNamesDoNotCross() {
+  console.log("\n=== Test (c): Two changes are checked independently ===\n");
 
-  const blastRadius: BlastRadiusResult = {
-    changedNode: { id: "model:Post", name: "Post", kind: "PrismaModel", filePath: "prisma/schema.prisma" },
-    affectedRoutes: [
-      { id: "route:/api/posts", name: "posts", filePath: "app/api/posts/route.ts", reason: "queries Post.title" },
+  const postBlast = blast("Post.title", {
+    files: [
+      {
+        id: "file:lib/posts.ts",
+        name: "lib/posts.ts",
+        filePath: "lib/posts.ts",
+        reason: "references Post.title",
+      },
     ],
-    affectedComponents: [],
-    affectedFiles: [],
-  };
-
-  const breakingFieldNames = ["title"];
-
-  // Local check passes — file was correctly updated
-  const generatedFiles = [
-    { path: "/testbed/app/api/posts/route.ts", content: 'const heading = post.heading;' },
-  ];
-
-  // We simulate a graph check failure by directly testing the resolution logic.
-  // In a real scenario, verifyGraphConsistency would return staleNodesFound.
-  // Since we can't mock HydraDB, we verify the logic by checking the code path.
-  console.log("  (This test verifies the resolution rule logic, not actual HydraDB queries.)");
-  console.log("  The unifiedValidation function correctly blocks when staleNodesFound > 0.");
-  console.log("  See integration tests for actual HydraDB graph verification.");
-
-  // Verify the resolution rule is correctly implemented
-  const result = await runUnifiedValidation({
-    blastRadius,
-    breakingFieldNames,
-    generatedFiles,
-    expectedDeltas: [],  // Skip graph check (no HydraDB in test)
-    blastRadiusAffectedNodeIds: ["route:/api/posts"],
-    projectRoot: "/testbed",
+  });
+  const userBlast = blast("User.email", {
+    files: [
+      {
+        id: "file:lib/users.ts",
+        name: "lib/users.ts",
+        filePath: "lib/users.ts",
+        reason: "references User.email",
+      },
+    ],
   });
 
-  // Without graph check, local passes => overall passes
-  assert(result.overallPassed, "overallPassed should be true (no graph check available)");
-  assert(result.resolutionReason.includes("PASSED"), "resolution should say PASSED");
-  console.log(`  Summary: ${result.summary}`);
-  console.log(`  Resolution: ${result.resolutionReason}`);
+  const result = await runUnifiedValidation({
+    changes: [
+      {
+        blastRadius: postBlast,
+        breakingFieldNames: ["title"],
+        delta: renameDelta("Post", "title", "heading", ["file:lib/posts.ts"]),
+      },
+      {
+        blastRadius: userBlast,
+        breakingFieldNames: ["email"],
+        delta: renameDelta("User", "email", "contact", ["file:lib/users.ts"]),
+      },
+    ],
+    generatedFiles: [
+      // Still contains `email` — irrelevant, this file belongs to the Post change.
+      {
+        path: `${ROOT}/lib/posts.ts`,
+        content: "export const heading = (p: any) => p.heading; export const email = 1;",
+      },
+      // Still contains `title` — irrelevant, this file belongs to the User change.
+      {
+        path: `${ROOT}/lib/users.ts`,
+        content: "export const contact = (u: any) => u.contact; export const title = 1;",
+      },
+    ],
+    projectRoot: ROOT,
+    skipGraphCheck: true,
+  });
+
+  assert(result.overallPassed, "each file is checked only for its own change's field");
+  assertEqual(result.localCheck.missed, 0, "local check: 0 missed");
+  assertEqual(result.localCheck.addressed, 2, "local check: 2 addressed");
+}
+
+async function testAdditiveChangeIsANoOp() {
+  console.log("\n=== Test (d): No breaking change => nothing to verify ===\n");
+
+  const result = await runUnifiedValidation({
+    changes: [],
+    generatedFiles: [],
+    projectRoot: ROOT,
+    skipGraphCheck: true,
+  });
+
+  assert(result.overallPassed, "an additive change passes trivially");
+  assertEqual(result.localCheck.missed, 0, "local check: 0 missed");
+  assertEqual(result.localCheck.addressed, 0, "local check: 0 addressed");
 }
 
 // ---------------------------------------------------------------------------
@@ -185,23 +268,22 @@ async function testStaleNodesDetected() {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  console.log("=== Unified Structural Validation Tests ===\n");
+  console.log("=== Unified Structural Validation Tests ===");
 
   await testCleanRename();
   await testLocalCheckFailure();
-  await testStaleNodesDetected();
+  await testFieldNamesDoNotCross();
+  await testAdditiveChangeIsANoOp();
 
-  console.log("\n=== All tests completed ===\n");
-
+  console.log("");
   if (process.exitCode) {
     console.log("Some tests failed!");
     process.exit(1);
-  } else {
-    console.log("All tests passed!");
   }
+  console.log("All tests passed!");
 }
 
 main().catch((err) => {
-  console.error("Test runner error:", err);
+  console.error(err);
   process.exit(1);
 });
