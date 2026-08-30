@@ -1,6 +1,4 @@
-import { requireOpenRouterApiKey } from "../config";
-
-const DEFAULT_MODEL = "google/gemini-3.5-flash-lite";
+import { requireOpenRouterApiKey, requireOpenRouterModel } from "../config";
 
 /**
  * Output budget for every call.
@@ -12,7 +10,7 @@ const DEFAULT_MODEL = "google/gemini-3.5-flash-lite";
 const MAX_OUTPUT_TOKENS = 8192;
 
 function getModel(): string {
-  return process.env.OPENROUTER_MODEL || DEFAULT_MODEL;
+  return requireOpenRouterModel();
 }
 
 function extractText(result: unknown): string {

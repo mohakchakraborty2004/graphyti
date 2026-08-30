@@ -555,6 +555,33 @@ function testSchemaEditIsPure(root: string) {
   );
 }
 
+function testRemoveModelCleansRelations(root: string) {
+  console.log("\n=== remove_model cleans relations ===\n");
+
+  const schemaPath = path.join(root, "prisma/schema.prisma");
+  const before = fs.readFileSync(schemaPath, "utf-8");
+  const source = `${before}
+model Comment {
+  id     Int @id
+  postId Int
+  post   Post @relation(fields: [postId], references: [id])
+}
+`;
+  const removed = applySchemaEdit(
+    source,
+    { type: "schema", model: "Post", op: "remove_model" },
+    schemaPath,
+    root,
+    { write: false }
+  );
+
+  assert(!/model\s+Post\s*\{/.test(removed), "the requested model is removed");
+  assert(!/posts\s+Post\[\]/.test(removed), "inverse relation fields are removed");
+  assert(!/post\s+Post\b/.test(removed), "external relation fields are removed");
+  assert(!/postId\s+Int\b/.test(removed), "relation-owned scalar foreign keys are removed");
+  assert(fs.readFileSync(schemaPath, "utf-8") === before, "remove_model preview leaves disk untouched");
+}
+
 // ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------
@@ -574,6 +601,7 @@ async function main() {
     testPathNormalisation(root);
     testPlanGuards();
     testSchemaEditIsPure(root);
+    testRemoveModelCleansRelations(root);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

@@ -88,7 +88,7 @@ function allBlocks(): Block[] {
     { kind: "system", id: "s2", text: LONG_PROMPT },
 
     { kind: "error", id: "e1", title: "Command failed", context: LONG_COMMAND, detail: STACK_TRACE, hint: "Check that npm is installed and on PATH." },
-    { kind: "error", id: "e2", title: "Missing API key", detail: "GEMINI_API_KEY is not set" },
+        { kind: "error", id: "e2", title: "Missing API key", detail: "OPENROUTER_API_KEY is not set" },
 
     { kind: "tool", id: "t1", call: { id: "t1", kind: "read", target: LONG_PATH, status: "success", result: "142 lines", elapsedMs: 320 } },
     { kind: "tool", id: "t2", call: { id: "t2", kind: "run", target: LONG_COMMAND, status: "running" } },

@@ -152,7 +152,7 @@ async function mount(columns = 80, rows = 30) {
       autoConfirm={false}
       legacyContext={false}
       version="1.0.0"
-      model="gemini"
+      model="configured-model"
     />,
     {
       stdout: stdout as unknown as NodeJS.WriteStream,

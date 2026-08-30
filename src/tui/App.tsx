@@ -574,9 +574,9 @@ function describeError(error: unknown): Block {
   let title = "Something went wrong";
   let hint: string | undefined;
 
-  if (/GEMINI_API_KEY|API key/i.test(message)) {
+  if (/OPENROUTER_API_KEY|OPENROUTER_MODEL|API key/i.test(message)) {
     title = "Missing or invalid API key";
-    hint = "Set GEMINI_API_KEY in graphyti's .env, then try again.";
+    hint = "Set OPENROUTER_API_KEY and OPENROUTER_MODEL in graphyti's .env, then try again.";
   } else if (/HYDRA_DB|hydra/i.test(message)) {
     title = "Graph database unavailable";
     hint = "Check HYDRA_DB_API_KEY and HYDRA_DB_DATABASE, or rerun with --legacy-context.";

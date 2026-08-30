@@ -34,7 +34,7 @@ const INFO: SessionInfo = {
   cwd: "~/projects/storefront",
   git: { branch: "main", dirty: true, ahead: 2, behind: 0 },
   version: "1.0.0",
-  model: "gemini",
+  model: "configured-model",
 };
 
 // ── Scenes ───────────────────────────────────────────────────────────────────

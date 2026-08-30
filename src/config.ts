@@ -45,6 +45,7 @@ export const env = {
   hydraDbDatabase: normalize(process.env.HYDRA_DB_DATABASE),
   hydraDbCollection: normalize(process.env.HYDRA_DB_COLLECTION),
   openrouterApiKey: normalize(process.env.OPENROUTER_API_KEY),
+  openrouterModel: normalize(process.env.OPENROUTER_MODEL),
 } as const;
 
 export interface HydraConfig {
@@ -64,6 +65,10 @@ const hydraSchema = z.object({
 
 const openrouterSchema = z.object({
   OPENROUTER_API_KEY: z.string().min(1),
+});
+
+const openrouterModelSchema = z.object({
+  OPENROUTER_MODEL: z.string().min(1),
 });
 
 /** Name every missing variable in one message instead of failing on the first. */
@@ -110,6 +115,13 @@ export function requireOpenRouterApiKey(): string {
   return parsed.data.OPENROUTER_API_KEY;
 }
 
+/** The model is an explicit deployment setting; there is no provider fallback. */
+export function requireOpenRouterModel(): string {
+  const parsed = openrouterModelSchema.safeParse({ OPENROUTER_MODEL: env.openrouterModel });
+  if (!parsed.success) throw missingConfigError(parsed.error);
+  return parsed.data.OPENROUTER_MODEL;
+}
+
 /** Human-readable config state for debug logs. Never prints secret values. */
 export function configSummary(): string {
   const secret = (value: string | undefined) => (value ? "set" : "MISSING");
@@ -118,5 +130,6 @@ export function configSummary(): string {
     `collection=${env.hydraDbCollection ?? "(default)"}`,
     `HYDRA_DB_API_KEY=${secret(env.hydraDbApiKey)}`,
     `OPENROUTER_API_KEY=${secret(env.openrouterApiKey)}`,
+    `OPENROUTER_MODEL=${env.openrouterModel ?? "MISSING"}`,
   ].join(" ");
 }

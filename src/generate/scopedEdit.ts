@@ -707,6 +707,30 @@ export function applySchemaEdit(
     const relationField = new RegExp(
       `^\\s*[A-Za-z_][A-Za-z0-9_]*\\s+${escapeRegex(edit.model)}(?:\\[\\]|\\?)?(?:\\s|$)`
     );
+    // A relation such as `post Post @relation(fields: [postId], ...)` owns
+    // its local scalar foreign key. Removing only `post` leaves `postId` as a
+    // misleading orphan, so discover those fields before mutating any lines.
+    const relationScalarFields = new Set<string>();
+    let scanModel: string | undefined;
+    for (const candidate of lines) {
+      const header = candidate.match(/^\s*model\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{/);
+      if (header) {
+        scanModel = header[1];
+        continue;
+      }
+      if (/^\s*}\s*$/.test(candidate)) {
+        scanModel = undefined;
+        continue;
+      }
+      if (!scanModel || scanModel === edit.model || !relationField.test(candidate)) continue;
+      const fieldsMatch = candidate.match(/@relation\s*\(\s*fields\s*:\s*\[([^\]]*)\]/);
+      if (!fieldsMatch) continue;
+      for (const field of fieldsMatch[1].split(",").map((name) => name.trim()).filter(Boolean)) {
+        relationScalarFields.add(`${scanModel}.${field}`);
+      }
+    }
+
+    let currentModel: string | undefined;
     while (i < lines.length) {
       const line = lines[i];
       const modelMatch = line.match(/^\s*model\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{/);
@@ -722,14 +746,20 @@ export function applySchemaEdit(
         }
         continue;
       }
+      if (modelMatch) currentModel = modelMatch[1];
       // A Prisma relation field whose type is the deleted model cannot remain
       // in another model. Remove it in the same deterministic schema edit so
       // `remove_model` leaves a valid schema instead of dangling relations.
-      if (relationField.test(line)) {
+      const fieldMatch = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s+/);
+      if (
+        relationField.test(line) ||
+        (currentModel && fieldMatch && relationScalarFields.has(`${currentModel}.${fieldMatch[1]}`))
+      ) {
         i++;
         continue;
       }
       result.push(line);
+      if (/^\s*}\s*$/.test(line)) currentModel = undefined;
       i++;
     }
     if (!removed) {
