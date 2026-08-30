@@ -410,13 +410,10 @@ async function executeStep(
       const schemaChange = describeBreakingChanges(changes);
       const oldFields = [...new Set(changes.flatMap((c) => c.breakingFieldNames))];
       const referenceMode = changes.some((c) => c.referenceMode === "model") ? "model" : "field";
-      let added = 0;
-
-      for (const filePath of uncovered) {
+      const regenerated = await Promise.all(uncovered.map(async (filePath) => {
         throwIfAborted(signal);
         const absPath = path.resolve(projectRoot, filePath);
-        if (!fs.existsSync(absPath)) continue;
-
+        if (!fs.existsSync(absPath)) return { filePath, reason: "file no longer exists" };
         try {
           const outcome = await regenerateAffectedFile({
             filePath,
@@ -426,18 +423,16 @@ async function executeStep(
             referenceMode,
             context: context + "\n" + promptInjection,
           });
-          if (outcome.edit) {
-            actions.push(outcome.edit);
-            added++;
-          } else {
-            events.message(`Could not update ${filePath}: ${outcome.reason}`);
-          }
+          return outcome.edit ? { filePath, edit: outcome.edit } : { filePath, reason: outcome.reason };
         } catch (err) {
-          events.message(
-            `Could not update ${filePath}: ${err instanceof Error ? err.message : err}`
-          );
+          return { filePath, reason: err instanceof Error ? err.message : String(err) };
         }
+      }));
+      for (const outcome of regenerated) {
+        if (outcome.edit) actions.push(outcome.edit);
+        else events.message(`Could not update ${outcome.filePath}: ${outcome.reason}`);
       }
+      const added = regenerated.filter((outcome) => outcome.edit).length;
 
       events.toolUpdate(reGenTool, {
         status: added === uncovered.length ? "success" : "warning",
@@ -506,10 +501,10 @@ async function executeStep(
       const oldFields = [...new Set(changes.flatMap((c) => c.breakingFieldNames))];
       const referenceMode = changes.some((c) => c.referenceMode === "model") ? "model" : "field";
 
-      for (const filePath of missedPaths) {
+      const retries = await Promise.all(missedPaths.map(async (filePath) => {
         throwIfAborted(signal);
         const absPath = path.resolve(projectRoot, filePath);
-        if (!fs.existsSync(absPath)) continue;
+        if (!fs.existsSync(absPath)) return { filePath, reason: "file no longer exists" };
         try {
           const outcome = await regenerateAffectedFile({
             filePath,
@@ -519,13 +514,14 @@ async function executeStep(
             referenceMode,
             context: context + "\n" + promptInjection,
           });
-          if (outcome.edit) retryActions.push(outcome.edit);
-          else events.message(`Retry could not fix ${filePath}: ${outcome.reason}`);
+          return outcome.edit ? { filePath, edit: outcome.edit } : { filePath, reason: outcome.reason };
         } catch (err) {
-          events.message(
-            `Retry could not fix ${filePath}: ${err instanceof Error ? err.message : err}`
-          );
+          return { filePath, reason: err instanceof Error ? err.message : String(err) };
         }
+      }));
+      for (const outcome of retries) {
+        if (outcome.edit) retryActions.push(outcome.edit);
+        else events.message(`Retry could not fix ${outcome.filePath}: ${outcome.reason}`);
       }
 
       if (retryActions.length === 0) {
