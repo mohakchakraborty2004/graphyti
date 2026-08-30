@@ -45,5 +45,6 @@ model Comment {
   content String?
   postId  Int
   post    Post    @relation(fields: [postId], references: [id])
+  streamDemo  Boolean
 }
 
