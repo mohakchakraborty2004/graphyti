@@ -34,6 +34,7 @@ model Post {
   likes     LikeDislike[]
   summary  String?
   mobileNotes  String?
+  reviewNotes  String?
 }
 
 model Comment {
