@@ -14,6 +14,7 @@ import { runUnifiedValidation, type UnifiedValidationResult } from "./verify/uni
 import { reingestFile } from "./graph/incremental";
 import { resolveProjectPath } from "./utils/paths";
 import { regenerateAffectedFile, clampForPrompt } from "./generate/regenerateFile";
+import { injectPrismaCommands } from "./utils/prismaCommands";
 import {
   analyzeBreakingChanges,
   affectedFilePaths,
@@ -61,7 +62,15 @@ const isHelp = args.includes("--help") || args.includes("-h");
 const isTui = !hasArgs && !isHelp;
 
 function spinner(text: string) {
-  return ora({ text, color: "cyan", isEnabled: !isJsonMode() });
+  // `isEnabled` overrides ora's own TTY detection rather than adding to it, so
+  // passing it unconditionally made every redirected run — a log file, a pipe,
+  // CI — replay one spinner frame per tick as a separate line, burying the real
+  // output under thousands of them. Re-apply the TTY test here.
+  return ora({
+    text,
+    color: "cyan",
+    isEnabled: !isJsonMode() && Boolean(process.stdout.isTTY),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -78,15 +87,23 @@ interface StepResult {
 }
 
 class StepError extends Error {
+  public writtenPaths: string[];
+  public createdPaths: string[];
+
   constructor(
     public stepIndex: number,
     public description: string,
     public reason: string,
-    public writtenPaths: string[] = [],
-    public createdPaths: string[] = []
+    writtenPaths: readonly string[] = [],
+    createdPaths: readonly string[] = []
   ) {
     super(`Step ${stepIndex + 1} (${description}) failed: ${reason}`);
     this.name = "StepError";
+    // A failed step must carry a snapshot. The multi-step accumulator is
+    // mutable. Retaining its array instance made the old catch path append the
+    // accumulator to itself and duplicate every prior write in the summary.
+    this.writtenPaths = [...writtenPaths];
+    this.createdPaths = [...createdPaths];
   }
 }
 
@@ -339,16 +356,27 @@ if (isTui) {
         print();
       } catch (err) {
         if (err instanceof StepError) {
+          // A StepError carries CUMULATIVE totals — everything earlier steps
+          // wrote plus whatever this one managed before failing. Replace the
+          // accumulator rather than append those totals; appending used to
+          // count every earlier write twice. Copy out defensively in case a
+          // third-party caller constructs a legacy, aliased StepError.
+          const written = [...new Set(err.writtenPaths)];
+          const created = [...new Set(err.createdPaths)];
+
           stepResults.push({
             stepIndex: err.stepIndex,
             description: err.description,
             success: false,
-            writtenPaths: err.writtenPaths,
-            createdPaths: err.createdPaths,
+            writtenPaths: written,
+            createdPaths: created,
             error: err.reason,
           });
-          allWrittenPaths.push(...err.writtenPaths);
-          allCreatedPaths.push(...err.createdPaths);
+
+          allWrittenPaths.length = 0;
+          allWrittenPaths.push(...written);
+          allCreatedPaths.length = 0;
+          allCreatedPaths.push(...created);
 
           printErr(`\n  ${error("✗")} Step ${i + 1}/${classification.steps.length} FAILED: ${err.reason}`);
           printErr(`  ${warn("!")} Stopping — remaining steps may depend on this step's output.`);
@@ -1053,38 +1081,6 @@ function proposeSchema(plan: EditPlan, projectRoot: string): string | undefined 
     }
   }
   return source;
-}
-
-/** Append `prisma migrate dev` / `prisma generate` after schema changes. */
-function injectPrismaCommands(actions: EditPlan): void {
-  const schemaOps = schemaEditsOf(actions);
-  if (schemaOps.length === 0) return;
-
-  const migrationName = schemaOps
-    .map((op) => {
-      const field = op.fieldName ?? op.model;
-      switch (op.op) {
-        case "add_field": return `add_${field}`;
-        case "remove_field": return `remove_${field}`;
-        case "rename_field": return `rename_${field}`;
-        case "change_type": return `change_${field}`;
-        case "create_model": return `create_${op.model}`;
-        case "remove_model": return `drop_${op.model}`;
-        default: return op.op;
-      }
-    })
-    .join("_")
-    .slice(0, 64);
-
-  const has = (needle: string) =>
-    actions.some((a) => a.type === "command" && a.command.includes(needle));
-
-  if (!has("prisma migrate")) {
-    actions.push({ type: "command", command: `npx prisma migrate dev --name ${migrationName}` });
-  }
-  if (!has("prisma generate")) {
-    actions.push({ type: "command", command: "npx prisma generate" });
-  }
 }
 
 /** Print both validation layers distinctly, as two independent checks. */

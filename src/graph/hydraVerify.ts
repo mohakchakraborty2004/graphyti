@@ -150,6 +150,10 @@ function fieldRefForms(model: string, field: string): { strict: string[]; loose:
 
 function fieldRefFormsFor(delta: ExpectedDelta): { strict: string[]; loose: string[] } {
   if (delta.changeType === "add") return { strict: [], loose: [] };
+  if (delta.targetNodeId.startsWith("model:")) {
+    const model = delta.targetModel.toLowerCase();
+    return { strict: [`model:${model}`, model], loose: [model] };
+  }
   const field = delta.targetNodeId.replace(/^field:/, "").split(".").slice(1).join(".");
   return fieldRefForms(delta.targetModel, field);
 }
@@ -404,6 +408,7 @@ async function queryAndVerify(
 
   const { strict, loose } = fieldRefFormsFor(delta);
   const oldLabel = delta.changeType === "rename" ? delta.oldName : delta.targetNodeId;
+  const targetKind = delta.targetNodeId.startsWith("model:") ? "model" : "field";
 
   // For rename/remove: query relations for each affected node.
   for (const nodeId of affectedNodeIds) {
@@ -427,7 +432,7 @@ async function queryAndVerify(
         nodeId,
         reason: `HydraDB relations still mention "${hit}" for the ${
           delta.changeType === "rename" ? "renamed" : "removed"
-        } field ${oldLabel}`,
+        } ${targetKind} ${oldLabel}`,
       });
       continue;
     }

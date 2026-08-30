@@ -78,6 +78,8 @@ export function computeExpectedDelta(
       return computeAddDelta(edit);
     case "remove_field":
       return computeRemoveDelta(edit, blastRadius, projectRoot);
+    case "remove_model":
+      return computeRemoveModelDelta(edit, blastRadius);
     case "change_type":
       // change_type is structurally similar to remove+add at the reference level:
       // old type refs become invalid, new type refs are expected.  For now we model
@@ -146,6 +148,19 @@ function computeRemoveDelta(
     targetModel: modelName,
     targetNodeId,
     expectedRemovedRefs,
+  };
+}
+
+/** Removing a model invalidates every consumer of the model node itself. */
+function computeRemoveModelDelta(
+  edit: SchemaEdit,
+  blastRadius: BlastRadiusResult
+): ExpectedRemoveDelta {
+  return {
+    changeType: "remove",
+    targetModel: edit.model,
+    targetNodeId: `model:${edit.model}`,
+    expectedRemovedRefs: enforcedNodes(blastRadius).map((n) => n.id),
   };
 }
 

@@ -11,7 +11,7 @@ const DEFAULT_MODEL = "google/gemini-3.5-flash-lite";
  */
 const MAX_OUTPUT_TOKENS = 8192;
 
-function getModel(): string {
+export function getConfiguredModel(): string {
   return process.env.OPENROUTER_MODEL || DEFAULT_MODEL;
 }
 
@@ -59,7 +59,7 @@ export async function generateCompletion(
   prompt: string,
   opts?: { model?: string; responseFormat?: "text" | "json" }
 ): Promise<string> {
-  const model = opts?.model ?? getModel();
+  const model = opts?.model ?? getConfiguredModel();
   const format = opts?.responseFormat ?? "text";
 
   const chatRequest: Record<string, unknown> = {

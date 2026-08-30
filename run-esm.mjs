@@ -34,7 +34,10 @@ let exitCode = 1;
 
 try {
   await esbuild.build({
-    entryPoints: [entry],
+    absWorkingDir: process.cwd(),
+    // esbuild treats `src/foo.tsx` as a package-style entry in some Windows
+    // shells. Resolving it first makes the live TUI test run from any cwd.
+    entryPoints: [path.resolve(process.cwd(), entry)],
     bundle: true,
     platform: "node",
     format: "esm",

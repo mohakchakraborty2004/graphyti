@@ -124,7 +124,7 @@ local graph map, so the graph stays current without a full re-ingest.
 | `client.context.ingest` — changed nodes only | [`src/graph/incremental.ts:79`](src/graph/incremental.ts#L79) |
 | `waitForIndexed` before the run reports success | [`src/graph/incremental.ts:115`](src/graph/incremental.ts#L115) |
 
-Called per written file from [`src/index.ts:204`](src/index.ts#L204).
+Called per written file from [`src/index.ts:964`](src/index.ts#L964).
 
 ### 3. Graph-grounded retrieval — `src/generate/retrieveContext.ts`
 
@@ -139,7 +139,7 @@ dump. This is the "grounding at generation time" step.
 | **`buildString(result)`** — SDK helper formats the envelope for the LLM; no hand-rolled JSON in the prompt | [`src/generate/retrieveContext.ts:33`](src/generate/retrieveContext.ts#L33) |
 | `HydraDBError` handling — logs `error_code` + `request_id`, returns null | [`src/generate/retrieveContext.ts:35`](src/generate/retrieveContext.ts#L35) |
 
-Consumed at [`src/index.ts:73`](src/index.ts#L73).
+Consumed at [`src/index.ts:201`](src/index.ts#L201).
 
 ### 4. Blast-radius cross-check — `src/graph/blastRadius.ts`
 
@@ -166,11 +166,11 @@ of the node's relations, warning on any genuinely stale remote node
 
 | What | Where |
 | --- | --- |
-| **`client.context.relations`** — HydraDB's neighbours for the changed node | [`src/graph/blastRadius.ts:248`](src/graph/blastRadius.ts#L248) |
-| `checkHydraConsistency()` — the cross-check itself | [`src/graph/blastRadius.ts:236`](src/graph/blastRadius.ts#L236) |
-| Endpoint names read out of the returned relation triplets | [`src/graph/blastRadius.ts:244`](src/graph/blastRadius.ts#L244) |
-| remote ids absent from the local graph → agree ✅ or warn ⚠️ | [`src/graph/blastRadius.ts:251`](src/graph/blastRadius.ts#L251) |
-| `computeBlastRadius()` — directed walk + reference gate + the cross-check | [`src/graph/blastRadius.ts:352`](src/graph/blastRadius.ts#L352) |
+| **`client.context.relations`** — HydraDB's neighbours for the changed node | [`src/graph/blastRadius.ts:266`](src/graph/blastRadius.ts#L266) |
+| `checkHydraConsistency()` — the cross-check itself | [`src/graph/blastRadius.ts:254`](src/graph/blastRadius.ts#L254) |
+| Endpoint names read out of the returned relation triplets | [`src/graph/blastRadius.ts:281`](src/graph/blastRadius.ts#L281) |
+| remote ids absent from the local graph → agree ✅ or warn ⚠️ | [`src/graph/blastRadius.ts:288`](src/graph/blastRadius.ts#L288) |
+| `computeBlastRadius()` — directed walk + reference gate + the cross-check | [`src/graph/blastRadius.ts:385`](src/graph/blastRadius.ts#L385) |
 
 Driven by the schema diff in [`src/generate/preWriteCheck.ts:295`](src/generate/preWriteCheck.ts#L295), and
 consumed by the unified structural validator at [`src/verify/unifiedValidation.ts`](src/verify/unifiedValidation.ts)

@@ -86,6 +86,14 @@ export class CancelledError extends Error {
   }
 }
 
+/** A recoverable pipeline failure that was not initiated by the user. */
+export class PipelineError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PipelineError";
+  }
+}
+
 function throwIfAborted(signal: AbortSignal) {
   if (signal.aborted) throw new CancelledError();
 }
@@ -239,7 +247,8 @@ async function executeStep(
     schemaEditsOf,
   } = await import("../../graph/changeAnalysis");
   const { codeGen } = await import("../../utils/agent");
-  const { regenerateAffectedFile } = await import("../../generate/regenerateFile");
+  const { injectPrismaCommands } = await import("../../utils/prismaCommands");
+  const { regenerateAffectedFile, clampForPrompt } = await import("../../generate/regenerateFile");
 
   type Plan = import("../../generate/scopedEdit").EditPlan;
   type GenFile = import("../../verify/verifyChange").GeneratedFile;
@@ -362,6 +371,18 @@ async function executeStep(
       }))
     );
 
+    // The radius fell back to scanning source because the graph had no node for
+    // the target. It is still enforceable, but the user needs to know the index
+    // is behind — otherwise the next run is guesswork too.
+    const stale = changes.filter(({ blastRadius }) => blastRadius.graphMissing);
+    if (stale.length > 0) {
+      const names = stale.map(({ blastRadius }) => blastRadius.changedNode.name).join(", ");
+      events.message(
+        `The graph has no node for ${names}, so I scanned the source files directly. ` +
+          `Run "graphyti init-graph" to resync the index.`
+      );
+    }
+
     if (mustChange.length > 0 && !options.dryRun && !options.autoConfirm) {
       const approved = await events.confirm({
         title: "Breaking schema change",
@@ -384,6 +405,11 @@ async function executeStep(
     events.message("The generation step produced no changes.");
     return;
   }
+
+  // The TUI must finish schema work just as the CLI does. `yes: true` is used
+  // below because Ink owns stdin; it therefore runs these allowlisted commands
+  // directly instead of handing the user a second terminal prompt.
+  injectPrismaCommands(actions);
 
   // ── Re-generation for uncovered blast-radius files ────────────────────────
   if (mustChange.length > 0 && !options.dryRun) {
@@ -466,7 +492,7 @@ async function executeStep(
         elapsedMs: Date.now() - verifyStart,
       });
       throwIfAborted(signal);
-      throw new CancelledError();
+      throw new PipelineError(`Structural validation crashed: ${err instanceof Error ? err.message : err}`);
     }
 
     const verifyElapsed = Date.now() - verifyStart;
@@ -519,7 +545,7 @@ async function executeStep(
           elapsedMs: Date.now() - retryStart,
         });
         throwIfAborted(signal);
-        throw new CancelledError();
+        throw new PipelineError("Structural validation retry produced no usable edits.");
       }
 
       const merged: Plan = actions.filter((a) => {
@@ -546,7 +572,9 @@ async function executeStep(
           elapsedMs: Date.now() - retryStart,
         });
         throwIfAborted(signal);
-        throw new CancelledError();
+        throw new PipelineError(
+          `Structural validation retry still missed ${retryResult.localCheck.missed} file(s).`
+        );
       }
 
       verifiedActions = merged;
@@ -562,7 +590,7 @@ async function executeStep(
         elapsedMs: verifyElapsed,
       });
       throwIfAborted(signal);
-      throw new CancelledError();
+      throw new PipelineError(unifiedResult.resolutionReason);
     }
   }
 
@@ -636,15 +664,86 @@ async function executeStep(
     events.message(
       `The schema change could not be applied, so nothing was written. Your working tree is unchanged.`
     );
-    throw new CancelledError();
+    throw new PipelineError("The schema change could not be applied, so no files were written.");
   }
 
-  for (const stale of writeResult.staleEdits) {
-    const tool = events.toolStart("edit", stale.edit.filePath);
-    events.toolUpdate(tool, {
-      status: "error",
-      error: "file changed since it was read",
-    });
+  // `handleAgentOutput` deliberately leaves a stale file untouched. Treating
+  // that as success made the TUI say the agent had finished even though a
+  // requested edit was missing. The CLI retries once with the current file;
+  // keep the TUI on the same path and fail clearly if that retry cannot land.
+  if (writeResult.staleEdits.length > 0) {
+    const unresolved: string[] = [];
+    const retriedWrittenPaths: string[] = [];
+    const retriedCreatedPaths: string[] = [];
+    for (const { edit } of writeResult.staleEdits) {
+      const resolved = resolveProjectPath(edit.filePath, projectRoot);
+      if (!resolved || !fs.existsSync(resolved.abs)) {
+        unresolved.push(edit.filePath);
+        continue;
+      }
+
+      const currentContent = fs.readFileSync(resolved.abs, "utf-8");
+      const retryQuery =
+        `${stepQuery}\n\nYour previous oldText for ${resolved.rel} did not match the file. ` +
+        `Provide corrected, minimal oldText/newText pairs for ONLY that file.\n\n` +
+        `FILE ${resolved.rel} CURRENT CONTENT:\n\`\`\`\n${clampForPrompt(currentContent)}\n\`\`\``;
+
+      try {
+        const retryPlan = await extractIntentWithRetry(retryQuery, context, schemaSource);
+        const retryActions = await codeGen(retryPlan, retryQuery, context);
+        if (!retryActions?.length) {
+          unresolved.push(resolved.rel);
+          continue;
+        }
+        const retryResult = await handleAgentOutput(retryActions, {
+          dryRun: false,
+          yes: true,
+          projectRoot,
+        });
+        if (
+          retryResult.staleEdits.length > 0 ||
+          retryResult.schemaFailures.length > 0 ||
+          retryResult.createFailures.length > 0
+        ) {
+          unresolved.push(resolved.rel);
+          continue;
+        }
+        writeResult.writtenPaths.push(...retryResult.writtenPaths);
+        writeResult.createdPaths.push(...retryResult.createdPaths);
+        writeResult.executedCommands.push(...retryResult.executedCommands);
+        retriedWrittenPaths.push(...retryResult.writtenPaths);
+        retriedCreatedPaths.push(...retryResult.createdPaths);
+      } catch {
+        unresolved.push(resolved.rel);
+      }
+    }
+
+    if (unresolved.length > 0) {
+      throw new PipelineError(
+        `Could not apply ${unresolved.length} stale edit(s): ${[...new Set(unresolved)].join(", ")}. ` +
+          "Other completed writes remain on disk."
+      );
+    }
+
+    // The normal diff/result reporting ran before the retry. Report successful
+    // retry writes too, otherwise the work reaches disk but is missing from the
+    // transcript and final summary.
+    for (const absolute of retriedWrittenPaths) {
+      const relative = path.relative(projectRoot, absolute);
+      const patch = diffAgainstDisk(absolute, before.get(absolute) ?? null);
+      if (patch) events.diff(relative, patch);
+      result.filesWritten.push(relative);
+      const tool = events.toolStart("edit", relative);
+      events.toolUpdate(tool, { status: "success", result: "updated after retry" });
+    }
+    for (const absolute of retriedCreatedPaths) {
+      const relative = path.relative(projectRoot, absolute);
+      const patch = diffAgainstDisk(absolute, null);
+      if (patch) events.diff(relative, patch);
+      result.filesCreated.push(relative);
+      const tool = events.toolStart("create", relative);
+      events.toolUpdate(tool, { status: "success", result: "created after retry" });
+    }
   }
 
   result.commands.push(...writeResult.executedCommands);

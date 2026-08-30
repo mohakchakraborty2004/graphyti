@@ -1,5 +1,6 @@
 import * as path from "path";
 import * as fs from "fs";
+import { referencesIdentifier } from "../utils/paths";
 import { extractPrismaSchemaFromSource } from "../extract/prismaExtractor";
 import { extractTypeScriptFromSource } from "../extract/tsExtractor";
 import { findPrismaSchemas, extractPrismaSchema } from "../extract/prismaExtractor";
@@ -115,6 +116,7 @@ interface NodeVerdict {
 function verifyNode(
   node: AffectedNode,
   oldFields: string[],
+  removedModel: string | undefined,
   genMap: Map<string, string>,
   models: PrismaModel[],
   projectRoot: string
@@ -155,6 +157,15 @@ function verifyNode(
     };
   }
 
+  if (removedModel && referencesIdentifier(content, removedModel)) {
+    return {
+      outcome: "missed",
+      detail: regenerated
+        ? `still references removed model ${removedModel} after the edit`
+        : `references removed model ${removedModel} and was not updated`,
+    };
+  }
+
   if (node.id.startsWith("route:") || node.id.startsWith("component:")) {
     try {
       const result = extractTypeScriptFromSource(projectRoot, absPath, content, models);
@@ -190,6 +201,8 @@ export interface VerifyTarget {
   blastRadius: BlastRadiusResult;
   /** The field names *this* change breaks — never another change's. */
   oldFields: string[];
+  /** A removed model is verified as an identifier rather than a field. */
+  removedModel?: string;
 }
 
 /**
@@ -214,8 +227,8 @@ export function verifyStructuralChange(
   // and let a miss win over an addressed so a real failure is never masked.
   const verdicts = new Map<string, { entry: VerifyEntry; missed: boolean }>();
 
-  for (const { blastRadius, oldFields } of targets) {
-    if (oldFields.length === 0) continue;
+  for (const { blastRadius, oldFields, removedModel } of targets) {
+    if (oldFields.length === 0 && !removedModel) continue;
 
     const nodes: AffectedNode[] = [
       ...blastRadius.affectedRoutes,
@@ -224,7 +237,7 @@ export function verifyStructuralChange(
     ];
 
     for (const node of nodes) {
-      const verdict = verifyNode(node, oldFields, genMap, models, projectRoot);
+      const verdict = verifyNode(node, oldFields, removedModel, genMap, models, projectRoot);
       const missed = verdict.outcome === "missed";
       const existing = verdicts.get(node.filePath);
       if (existing && (existing.missed || !missed)) continue;
