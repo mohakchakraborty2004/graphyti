@@ -29,6 +29,8 @@ export interface PipelineOptions {
   autoConfirm: boolean;
   legacyContext: boolean;
   projectRoot: string;
+  /** Runs after validation and immediately before the first write. */
+  onBeforeWrite?: () => void | Promise<void>;
 }
 
 export interface PipelineEvents {
@@ -200,7 +202,7 @@ async function loadContextFor(
   const { loadContext } = await import("../../utils/StrAnalyzer");
 
   if (options.legacyContext) {
-    return { text: formatLegacyContext(loadContext()), label: "legacy context" };
+    return { text: formatLegacyContext(loadContext(options.projectRoot)), label: "legacy context" };
   }
 
   try {
@@ -212,7 +214,7 @@ async function loadContextFor(
     // should not end the run.
   }
 
-  return { text: formatLegacyContext(loadContext()), label: "fallback context" };
+  return { text: formatLegacyContext(loadContext(options.projectRoot)), label: "fallback context" };
 }
 
 async function executeStep(
@@ -569,6 +571,11 @@ async function executeStep(
   // ── Write ──────────────────────────────────────────────────────────────────
   events.state("tool_running");
   events.activity(options.dryRun ? "Previewing changes" : "Writing files");
+
+  // Callers such as the HTTP API can establish a safe write boundary here.
+  // This is deliberately after verification, so a rejected plan never creates
+  // external state such as an empty git branch.
+  if (!options.dryRun) await options.onBeforeWrite?.();
 
   // Snapshot every file the plan targets before anything is written, so the diff
   // shown to the user is the real before/after rather than a re-derivation. The

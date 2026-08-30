@@ -113,8 +113,8 @@ export function saveContextFile(ctx: any, rootDir: string) {
 }
 
 /** FALLBACK ONLY — reads the flat .dbagent/context.json. */
-export function loadContext(): string {
-  const contextPath = path.resolve(process.cwd(), '.dbagent/context.json');
+export function loadContext(projectRoot: string = process.cwd()): string {
+  const contextPath = path.resolve(projectRoot, '.dbagent/context.json');
 
   if (!fs.existsSync(contextPath)) {
     throw new Error(`${themeError("✗")} Context file not found. Please run \`npx dbagent init\` first.`);
