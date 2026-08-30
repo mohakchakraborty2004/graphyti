@@ -115,8 +115,12 @@ function discardEmptyBranch(projectRoot: string, branch: QueryBranch): boolean {
 
 function commitQuery(projectRoot: string, branch: QueryBranch, query: string) {
   git(projectRoot, ["add", "-A"]);
+  // A generator can target a file but leave it byte-for-byte unchanged. Do not
+  // turn that safe no-op into a 500 from `git commit`; the caller will remove
+  // the empty branch and return the normal blocked/no-write result instead.
+  if (!git(projectRoot, ["status", "--porcelain"])) return false;
   git(projectRoot, ["commit", "-m", `graphyti: ${query.slice(0, 160)}`]);
-  return branch.name;
+  return true;
 }
 
 const events: PipelineEvents = {
@@ -129,6 +133,7 @@ async function executeQuery(query: string, dryRun: boolean, projectRoot: string)
   const startedAt = Date.now();
   if (!dryRun) ensureCleanGitRepo(projectRoot);
   let branch: QueryBranch | undefined;
+  let noChangesToCommit = false;
   try {
     const result = await runPipeline(query, {
       dryRun,
@@ -143,7 +148,11 @@ async function executeQuery(query: string, dryRun: boolean, projectRoot: string)
 
     const changed = result.filesWritten.length > 0 || result.filesCreated.length > 0;
     if (branch && changed) {
-      commitQuery(projectRoot, branch, query);
+      if (!commitQuery(projectRoot, branch, query)) {
+        discardEmptyBranch(projectRoot, branch);
+        branch = undefined;
+        noChangesToCommit = true;
+      }
     } else if (branch) {
       discardEmptyBranch(projectRoot, branch);
       branch = undefined;
@@ -156,7 +165,7 @@ async function executeQuery(query: string, dryRun: boolean, projectRoot: string)
       verification: "skipped",
       graphIndexUpdated: result.graphIndexUpdated,
       elapsedMs: result.elapsedMs,
-      exitCode: 0,
+      exitCode: noChangesToCommit ? 1 : 0,
       ...(branch ? { branch: branch.name } : {}),
     };
   } catch (error) {
