@@ -230,11 +230,6 @@ function fileMentionsSymbol(absPath: string, symbols: string[]): boolean {
 /** route beats component beats file when several nodes share one path. */
 const SPECIFICITY: Record<string, number> = { route: 3, component: 2, file: 1 };
 
-/** Build output is regenerated from the schema; it is never a source edit target. */
-function isGeneratedArtifactPath(filePath: string): boolean {
-  return /(^|\/)(generated|node_modules|\.next|dist|build|\.dbagent)(\/|$)/.test(filePath);
-}
-
 // ---------------------------------------------------------------------------
 // HydraDB consistency check (non-blocking, advisory)
 // ---------------------------------------------------------------------------
@@ -398,7 +393,6 @@ export async function computeBlastRadius(
   for (const [id, reason] of candidates) {
     const entry = map[id];
     if (!entry?.filePath) continue;
-    if (isGeneratedArtifactPath(entry.filePath)) continue;
     const abs = path.resolve(absRoot, entry.filePath);
     if (!fs.existsSync(abs)) {
       staleNodes.push({ id, filePath: entry.filePath });
@@ -420,7 +414,6 @@ export async function computeBlastRadius(
   // graph-only radius is not a safe radius.
   for (const abs of safeListSourceFiles(absRoot)) {
     const rel = toPosix(path.relative(absRoot, abs));
-    if (isGeneratedArtifactPath(rel)) continue;
     if (rel === changedEntry.filePath) continue;
     if (kept.some((n) => n.filePath === rel)) continue;
     if (!fileReferencesSymbol(abs, rel, symbols, !parsed.field)) continue;
@@ -496,9 +489,7 @@ export function nodeIdFor(target: BlastRadiusTarget): string {
 
 function safeListSourceFiles(absRoot: string): string[] {
   try {
-    return listSourceFiles(absRoot).filter(
-      (abs) => !isGeneratedArtifactPath(toPosix(path.relative(absRoot, abs)))
-    );
+    return listSourceFiles(absRoot);
   } catch {
     return [];
   }
