@@ -31,7 +31,14 @@ function requiredTargetProject(): string {
   const configured = process.env.GRAPHYTI_TARGET_PROJECT?.trim();
   if (!configured) throw new Error("GRAPHYTI_TARGET_PROJECT must point to the project Graphyti may change.");
 
-  const projectRoot = path.resolve(configured);
+  // dotenv intentionally does not expand shell expressions. Supporting $PWD
+  // keeps a local `.env` ergonomic while still resolving to one fixed path.
+  const expanded = configured === "$PWD"
+    ? process.cwd()
+    : configured.startsWith("$PWD/")
+      ? path.join(process.cwd(), configured.slice("$PWD/".length))
+      : configured;
+  const projectRoot = path.resolve(expanded);
   if (!fs.existsSync(projectRoot) || !fs.statSync(projectRoot).isDirectory()) {
     throw new Error(`GRAPHYTI_TARGET_PROJECT is not a directory: ${projectRoot}`);
   }
