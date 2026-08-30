@@ -36,6 +36,7 @@ model Post {
   mobileNotes  String?
   reviewNotes  String?
   mobileSummary  String?
+  summary  String?
 }
 
 model Comment {
