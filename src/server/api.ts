@@ -120,12 +120,14 @@ function discardEmptyBranch(projectRoot: string, branch: QueryBranch): boolean {
   return true;
 }
 
-function commitQuery(projectRoot: string, branch: QueryBranch, query: string) {
-  git(projectRoot, ["add", "-A"]);
+function commitQuery(projectRoot: string, branch: QueryBranch, query: string, paths: string[]) {
+  // Only stage files reported by the pipeline. Never scoop up unrelated files
+  // created by another editor or process while this request was running.
+  git(projectRoot, ["add", "-A", "--", ...paths]);
   // A generator can target a file but leave it byte-for-byte unchanged. Do not
   // turn that safe no-op into a 500 from `git commit`; the caller will remove
   // the empty branch and return the normal blocked/no-write result instead.
-  if (!git(projectRoot, ["status", "--porcelain"])) return false;
+  if (!git(projectRoot, ["diff", "--cached", "--name-only"])) return false;
   git(projectRoot, ["commit", "-m", `graphyti: ${query.slice(0, 160)}`]);
   return true;
 }
@@ -181,7 +183,7 @@ async function executeQuery(query: string, dryRun: boolean, projectRoot: string)
     let push: CliJsonResult["push"];
     let prUrl: string | undefined;
     if (branch && changed) {
-      if (!commitQuery(projectRoot, branch, query)) {
+      if (!commitQuery(projectRoot, branch, query, [...result.filesWritten, ...result.filesCreated])) {
         discardEmptyBranch(projectRoot, branch);
         branch = undefined;
         noChangesToCommit = true;
