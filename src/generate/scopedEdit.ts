@@ -703,10 +703,15 @@ export function applySchemaEdit(
     const lines = existingSource.split("\n");
     const result: string[] = [];
     let i = 0;
+    let removed = false;
+    const relationField = new RegExp(
+      `^\\s*[A-Za-z_][A-Za-z0-9_]*\\s+${escapeRegex(edit.model)}(?:\\[\\]|\\?)?(?:\\s|$)`
+    );
     while (i < lines.length) {
       const line = lines[i];
       const modelMatch = line.match(/^\s*model\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{/);
       if (modelMatch && modelMatch[1] === edit.model) {
+        removed = true;
         // Skip the entire model block
         let depth = 1;
         i++;
@@ -717,8 +722,18 @@ export function applySchemaEdit(
         }
         continue;
       }
+      // A Prisma relation field whose type is the deleted model cannot remain
+      // in another model. Remove it in the same deterministic schema edit so
+      // `remove_model` leaves a valid schema instead of dangling relations.
+      if (relationField.test(line)) {
+        i++;
+        continue;
+      }
       result.push(line);
       i++;
+    }
+    if (!removed) {
+      throw new Error(`Model ${edit.model} was not found in schema.prisma`);
     }
     const mutated = result.join("\n");
     const absSchemaPath = path.isAbsolute(schemaPath)

@@ -31,7 +31,8 @@ export type ReferenceKind =
   | "element-access"
   | "destructuring"
   | "type-member"
-  | "call-argument-key";
+  | "call-argument-key"
+  | "identifier";
 
 export interface SymbolReference {
   kind: ReferenceKind;
@@ -185,4 +186,26 @@ export function referencesField(
   fieldName: string
 ): boolean {
   return findFieldReferences(content, filePath, fieldName).length > 0;
+}
+
+/**
+ * Whole-model removals invalidate every exact identifier use: `LikeDislike`
+ * types/imports and the `prisma.likeDislike` delegate alike. Unlike a field
+ * rename, treating a bare model identifier as meaningful is both necessary
+ * and safe.
+ */
+export function findIdentifierReferences(
+  content: string,
+  identifiers: string[]
+): SymbolReference[] {
+  const wanted = identifiers.filter(Boolean);
+  if (wanted.length === 0) return [];
+  const lines = content.split("\n");
+  const refs: SymbolReference[] = [];
+  for (let index = 0; index < lines.length; index++) {
+    if (wanted.some((name) => new RegExp(`\\b${name.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}\\b`).test(lines[index]))) {
+      refs.push({ kind: "identifier", line: index + 1 });
+    }
+  }
+  return refs;
 }

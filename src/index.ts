@@ -639,6 +639,7 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
       const reStart = Date.now();
       const schemaChange = describeBreakingChanges(changes);
       const oldFields = [...new Set(changes.flatMap((c) => c.breakingFieldNames))];
+      const referenceMode = changes.some((c) => c.referenceMode === "model") ? "model" : "field";
       const outcomes: string[] = [];
       let added = 0;
 
@@ -651,6 +652,7 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
           currentContent: fs.readFileSync(abs, "utf-8"),
           schemaChange,
           oldFields,
+          referenceMode,
           context: context + "\n" + promptInjection,
         });
 
@@ -724,6 +726,7 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
       const missedPaths = unifiedResult.localCheck.report.missed.map((m) => m.filePath);
       const schemaChange = describeBreakingChanges(changes);
       const oldFields = [...new Set(changes.flatMap((c) => c.breakingFieldNames))];
+      const referenceMode = changes.some((c) => c.referenceMode === "model") ? "model" : "field";
       const retryActions: EditPlan = [];
       const retryNotes: string[] = [];
 
@@ -740,6 +743,7 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
             currentContent: fs.readFileSync(abs, "utf-8"),
             schemaChange,
             oldFields,
+            referenceMode,
             context: context + "\n" + promptInjection,
           });
           if (outcome.edit) {

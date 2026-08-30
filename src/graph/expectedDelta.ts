@@ -7,7 +7,7 @@ import type { SchemaEdit } from "../generate/scopedEdit";
 // ---------------------------------------------------------------------------
 
 export interface ExpectedDeltaBase {
-  changeType: "rename" | "add" | "remove";
+  changeType: "rename" | "add" | "remove" | "remove_model";
   targetModel: string;
 }
 
@@ -36,10 +36,18 @@ export interface ExpectedRemoveDelta extends ExpectedDeltaBase {
   expectedRemovedRefs: string[];
 }
 
+/** A whole Prisma model was removed, along with its relation fields. */
+export interface ExpectedRemoveModelDelta extends ExpectedDeltaBase {
+  changeType: "remove_model";
+  targetNodeId: string;
+  expectedRemovedRefs: string[];
+}
+
 export type ExpectedDelta =
   | ExpectedRenameDelta
   | ExpectedAddDelta
-  | ExpectedRemoveDelta;
+  | ExpectedRemoveDelta
+  | ExpectedRemoveModelDelta;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -88,9 +96,23 @@ export function computeExpectedDelta(
         blastRadius,
         projectRoot
       );
+    case "remove_model":
+      return computeRemoveModelDelta(edit, blastRadius);
     default:
       throw new Error(`Unknown op: ${(edit as SchemaEdit).op}`);
   }
+}
+
+function computeRemoveModelDelta(
+  edit: SchemaEdit,
+  blastRadius: BlastRadiusResult
+): ExpectedRemoveModelDelta {
+  return {
+    changeType: "remove_model",
+    targetModel: edit.model,
+    targetNodeId: `model:${edit.model}`,
+    expectedRemovedRefs: enforcedNodes(blastRadius).map((n) => n.id),
+  };
 }
 
 function computeRenameDelta(

@@ -24,6 +24,8 @@ export interface BreakingChange {
   delta: ExpectedDelta;
   /** The field names this specific change breaks — never another model's. */
   breakingFieldNames: string[];
+  /** Whole-model removals need identifier-level checks, not field-only checks. */
+  referenceMode: "field" | "model";
 }
 
 const BREAKING_OPS = new Set(["remove_field", "rename_field", "change_type", "remove_model"]);
@@ -64,7 +66,10 @@ export async function analyzeBreakingChanges(
         edit,
         blastRadius,
         delta: computeExpectedDelta(edit, blastRadius, projectRoot),
-        breakingFieldNames: edit.fieldName ? [edit.fieldName] : [],
+        breakingFieldNames: edit.fieldName
+          ? [edit.fieldName]
+          : [edit.model, edit.model.charAt(0).toLowerCase() + edit.model.slice(1)],
+        referenceMode: edit.op === "remove_model" ? "model" : "field",
       };
     })
   );

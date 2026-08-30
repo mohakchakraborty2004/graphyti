@@ -205,9 +205,18 @@ function readOrNull(absPath: string): string | null {
  * `metadata = { title: "…" }` out of the radius, and complete enough to catch a
  * component the extractor failed to link.
  */
-function fileReferencesSymbol(absPath: string, relPath: string, symbols: string[]): boolean {
+function fileReferencesSymbol(
+  absPath: string,
+  relPath: string,
+  symbols: string[],
+  wholeModel: boolean
+): boolean {
   const content = readOrNull(absPath);
   if (content === null) return false;
+  // Deleting a model invalidates type annotations, imports, and Prisma-client
+  // delegates as well as property accesses. Field-only syntax is deliberately
+  // too narrow for this case.
+  if (wholeModel) return symbols.some((s) => referencesIdentifier(content, s));
   return symbols.some((s) => referencesField(content, relPath, s));
 }
 
@@ -389,7 +398,7 @@ export async function computeBlastRadius(
       staleNodes.push({ id, filePath: entry.filePath });
       continue;
     }
-    if (!fileReferencesSymbol(abs, entry.filePath, symbols)) {
+    if (!fileReferencesSymbol(abs, entry.filePath, symbols, !parsed.field)) {
       filteredOut.push({ id, filePath: entry.filePath });
       continue;
     }
@@ -407,7 +416,7 @@ export async function computeBlastRadius(
     const rel = toPosix(path.relative(absRoot, abs));
     if (rel === changedEntry.filePath) continue;
     if (kept.some((n) => n.filePath === rel)) continue;
-    if (!fileReferencesSymbol(abs, rel, symbols)) continue;
+    if (!fileReferencesSymbol(abs, rel, symbols, !parsed.field)) continue;
 
     const nodeId = map[`component:${rel}`]
       ? `component:${rel}`

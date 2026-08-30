@@ -409,6 +409,7 @@ async function executeStep(
 
       const schemaChange = describeBreakingChanges(changes);
       const oldFields = [...new Set(changes.flatMap((c) => c.breakingFieldNames))];
+      const referenceMode = changes.some((c) => c.referenceMode === "model") ? "model" : "field";
       let added = 0;
 
       for (const filePath of uncovered) {
@@ -422,6 +423,7 @@ async function executeStep(
             currentContent: fs.readFileSync(absPath, "utf-8"),
             schemaChange,
             oldFields,
+            referenceMode,
             context: context + "\n" + promptInjection,
           });
           if (outcome.edit) {
@@ -502,6 +504,7 @@ async function executeStep(
       // accepted — a retry that returns here is guaranteed to verify.
       const schemaChange = describeBreakingChanges(changes);
       const oldFields = [...new Set(changes.flatMap((c) => c.breakingFieldNames))];
+      const referenceMode = changes.some((c) => c.referenceMode === "model") ? "model" : "field";
 
       for (const filePath of missedPaths) {
         throwIfAborted(signal);
@@ -513,6 +516,7 @@ async function executeStep(
             currentContent: fs.readFileSync(absPath, "utf-8"),
             schemaChange,
             oldFields,
+            referenceMode,
             context: context + "\n" + promptInjection,
           });
           if (outcome.edit) retryActions.push(outcome.edit);

@@ -23,6 +23,8 @@ type CliJsonResult = {
   graphIndexUpdated: boolean;
   elapsedMs: number;
   exitCode: number;
+  /** Present when the pipeline could not reach a safe write. */
+  error?: string;
   branch?: string;
   push?: { pushed: boolean; note?: string };
   prUrl?: string;
@@ -224,7 +226,17 @@ async function executeQuery(query: string, dryRun: boolean, projectRoot: string)
     // Match the CLI's --json behavior for unexpected pipeline failures: the
     // response remains machine-readable and signals the failure via exitCode.
     console.error("Pipeline failed:", error instanceof Error ? error.message : String(error));
-    return { query, filesWritten: [], blastRadiusSize: 0, blastRadius: [], verification: [], graphIndexUpdated: false, elapsedMs: Date.now() - startedAt, exitCode: 2 };
+    return {
+      query,
+      filesWritten: [],
+      blastRadiusSize: 0,
+      blastRadius: [],
+      verification: [],
+      graphIndexUpdated: false,
+      elapsedMs: Date.now() - startedAt,
+      exitCode: 2,
+      error: error instanceof Error ? error.message : String(error),
+    };
   }
 }
 

@@ -9,6 +9,7 @@ import {
   type FileEdit,
 } from "./scopedEdit";
 import { findFieldReferences, referencesField, type ReferenceKind } from "../verify/symbolRefs";
+import { referencesIdentifier } from "../utils/paths";
 
 /** "title at line 1 (property-access), line 1 (call-argument-key)" */
 function describeRefs(refs: Array<{ field: string; line: number; kind: ReferenceKind }>): string {
@@ -37,6 +38,8 @@ export interface RegenerateOptions {
   schemaChange: string;
   /** Field names that must no longer be referenced afterwards. */
   oldFields: string[];
+  /** Model deletion invalidates all identifier uses, not just field syntax. */
+  referenceMode?: "field" | "model";
   /** Retrieved codebase context plus the blast-radius injection. */
   context: string;
   timeoutMs?: number;
@@ -96,7 +99,9 @@ export async function regenerateAffectedFile(
   const timeoutMs = opts.timeoutMs ?? 90_000;
 
   const stillBroken = (content: string): boolean =>
-    oldFields.some((f) => referencesField(content, filePath, f));
+    opts.referenceMode === "model"
+      ? oldFields.some((f) => referencesIdentifier(content, f))
+      : oldFields.some((f) => referencesField(content, filePath, f));
 
   const fileBlock = `\n\nFull current content of ${filePath}:\n\`\`\`\n${clampForPrompt(
     currentContent
