@@ -1,7 +1,7 @@
 import { StatusBar } from 'expo-status-bar';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Button, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
-import { getStatus, initGraph, runQuery, type QueryResult } from './src/api';
+import { getStatus, initGraph, streamQuery, type QueryResult, type QueryStreamEvent } from './src/api';
 
 type LaunchState =
   | { kind: 'checking' }
@@ -16,8 +16,7 @@ function errorMessage(error: unknown) {
 
 type QueryState =
   | { kind: 'idle' }
-  | { kind: 'running'; query: string }
-  | { kind: 'result'; result: QueryResult }
+  | { kind: 'running'; query: string; events: QueryStreamEvent[]; connectionLost?: string; result?: QueryResult }
   | { kind: 'error'; detail: string };
 
 type ResultTone = 'success' | 'blocked' | 'error';
@@ -32,11 +31,11 @@ function resultStatus(result: QueryResult): { tone: ResultTone; title: string; d
   return { tone: 'error', title: 'Query failed', detail: 'The server reported an unexpected error' };
 }
 
-function ResultsView({ result, onReset }: { result: QueryResult; onReset: () => void }) {
+function ResultsSummary({ result, onReset }: { result: QueryResult; onReset: () => void }) {
   const status = resultStatus(result);
 
   return (
-    <ScrollView contentContainerStyle={styles.resultsContainer}>
+    <View style={styles.resultsContainer}>
       <View style={[styles.statusBanner, styles[status.tone]]}>
         <Text style={styles.statusTitle}>{status.title}</Text>
         <Text style={styles.statusDetail}>{status.detail}</Text>
@@ -48,6 +47,7 @@ function ResultsView({ result, onReset }: { result: QueryResult; onReset: () => 
           <Text style={styles.branchName}>{result.branch}</Text>
         </View>
       )}
+      {result.prUrl && <Text style={styles.prLink}>Draft PR: {result.prUrl}</Text>}
 
       <Text style={styles.sectionTitle}>Files written</Text>
       {result.filesWritten.length > 0 ? (
@@ -86,6 +86,81 @@ function ResultsView({ result, onReset }: { result: QueryResult; onReset: () => 
 
       <Text style={styles.elapsed}>Completed in {(result.elapsedMs / 1000).toFixed(1)}s</Text>
       <Button title="Run another query" onPress={onReset} />
+    </View>
+  );
+}
+
+function LiveQueryView({
+  state,
+  onReset,
+}: {
+  state: Extract<QueryState, { kind: 'running' }>;
+  onReset: () => void;
+}) {
+  const scrollRef = useRef<ScrollView>(null);
+  const [autoScroll, setAutoScroll] = useState(true);
+  const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => () => {
+    if (idleTimer.current) clearTimeout(idleTimer.current);
+  }, []);
+
+  const pauseAutoScroll = () => {
+    setAutoScroll(false);
+    if (idleTimer.current) clearTimeout(idleTimer.current);
+    idleTimer.current = setTimeout(() => setAutoScroll(true), 4000);
+  };
+
+  const jumpToLatest = () => {
+    setAutoScroll(true);
+    scrollRef.current?.scrollToEnd({ animated: true });
+  };
+
+  return (
+    <ScrollView
+      ref={scrollRef}
+      style={styles.liveScreen}
+      contentContainerStyle={styles.liveContent}
+      onScrollBeginDrag={pauseAutoScroll}
+      onContentSizeChange={() => {
+        if (autoScroll) scrollRef.current?.scrollToEnd({ animated: true });
+      }}
+      scrollEventThrottle={16}
+    >
+      <Text style={styles.liveTitle}>Running query</Text>
+      <Text style={styles.liveQuery}>{state.query}</Text>
+      <View style={styles.terminal}>
+        {state.events.map((event, index) => {
+          const blast = event.stage === 'blast radius' && Array.isArray(event.data)
+            ? event.data as Array<{ affectedRoutes?: Array<{ filePath: string; reason: string }>; affectedComponents?: Array<{ filePath: string; reason: string }>; affectedFiles?: Array<{ filePath: string; reason: string }> }>
+            : null;
+          return (
+            <View key={`${event.stage}-${index}`}>
+              <Text style={[styles.logLine, event.status === 'done' ? styles.logDone : event.status === 'error' ? styles.logError : styles.logMuted]}>
+                [{event.status ?? 'update'}] {event.stage}: {event.message ?? ''}{event.elapsedMs === undefined ? '' : ` (${(event.elapsedMs / 1000).toFixed(1)}s)`}
+              </Text>
+              {blast && blast.flatMap((item) => [
+                ...(item.affectedRoutes ?? []),
+                ...(item.affectedComponents ?? []),
+                ...(item.affectedFiles ?? []),
+              ]).length > 0 && (
+                <View style={styles.blastBlock}>
+                  <Text style={styles.blastTitle}>Affected files</Text>
+                  {blast.flatMap((item) => [
+                    ...(item.affectedRoutes ?? []),
+                    ...(item.affectedComponents ?? []),
+                    ...(item.affectedFiles ?? []),
+                  ]).map((file, fileIndex) => <Text key={`${file.filePath}-${fileIndex}`} style={styles.blastFile}>• {file.filePath} — {file.reason}</Text>)}
+                </View>
+              )}
+            </View>
+          );
+        })}
+        {!state.result && !state.connectionLost && <ActivityIndicator color="#cbd5e1" style={styles.logSpinner} />}
+      </View>
+      {!autoScroll && <Button title="Jump to latest" onPress={jumpToLatest} />}
+      {state.connectionLost && <View style={styles.connectionLost}><Text style={styles.connectionLostText}>{state.connectionLost}</Text></View>}
+      {state.result && <ResultsSummary result={state.result} onReset={onReset} />}
       <StatusBar style="auto" />
     </ScrollView>
   );
@@ -95,32 +170,28 @@ function QueryScreen({ nodeCount }: { nodeCount?: number }) {
   const [query, setQuery] = useState('');
   const [queryState, setQueryState] = useState<QueryState>({ kind: 'idle' });
 
-  const submit = async () => {
+  const submit = () => {
     const submittedQuery = query.trim();
     if (!submittedQuery) return;
 
-    setQueryState({ kind: 'running', query: submittedQuery });
-    try {
-      setQueryState({ kind: 'result', result: await runQuery(submittedQuery) });
-    } catch (error) {
-      setQueryState({ kind: 'error', detail: errorMessage(error) });
-    }
+    setQueryState({ kind: 'running', query: submittedQuery, events: [] });
+    streamQuery(submittedQuery, {
+      onEvent: (event) => setQueryState((current) => {
+        if (current.kind !== 'running') return current;
+        return {
+          ...current,
+          events: [...current.events, event],
+          ...(event.stage === 'complete' && event.result ? { result: event.result } : {}),
+        };
+      }),
+      onConnectionLost: (detail) => setQueryState((current) =>
+        current.kind === 'running' && !current.result ? { ...current, connectionLost: detail } : current
+      ),
+    });
   };
 
   if (queryState.kind === 'running') {
-    return (
-      <View style={styles.container}>
-        <Text style={styles.subtitle}>Running query</Text>
-        <Text style={styles.runningQuery}>{queryState.query}</Text>
-        <ActivityIndicator size="large" />
-        <Text style={styles.detail}>Graphyti is analyzing your project. This can take a minute or more.</Text>
-        <StatusBar style="auto" />
-      </View>
-    );
-  }
-
-  if (queryState.kind === 'result') {
-    return <ResultsView result={queryState.result} onReset={() => {
+    return <LiveQueryView state={queryState} onReset={() => {
       setQuery('');
       setQueryState({ kind: 'idle' });
     }} />;
@@ -142,7 +213,7 @@ function QueryScreen({ nodeCount }: { nodeCount?: number }) {
         onChangeText={setQuery}
       />
       {queryState.kind === 'error' && <Text style={styles.queryError}>{queryState.detail}</Text>}
-      <Button title="Run" disabled={!query.trim()} onPress={() => void submit()} />
+      <Button title="Run" disabled={!query.trim()} onPress={submit} />
       <StatusBar style="auto" />
     </View>
   );
@@ -265,9 +336,8 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   resultsContainer: {
-    flexGrow: 1,
     backgroundColor: '#fff',
-    padding: 24,
+    marginTop: 20,
   },
   statusBanner: {
     borderRadius: 10,
@@ -338,4 +408,59 @@ const styles = StyleSheet.create({
     marginBottom: 8,
     padding: 10,
   },
+  prLink: {
+    color: '#1d4ed8',
+    marginBottom: 8,
+  },
+  liveScreen: {
+    backgroundColor: '#020617',
+    flex: 1,
+  },
+  liveContent: {
+    padding: 18,
+  },
+  liveTitle: {
+    color: '#e2e8f0',
+    fontSize: 20,
+    fontWeight: '700',
+  },
+  liveQuery: {
+    color: '#94a3b8',
+    marginBottom: 16,
+    marginTop: 6,
+  },
+  terminal: {
+    backgroundColor: '#111827',
+    borderColor: '#334155',
+    borderRadius: 8,
+    borderWidth: 1,
+    padding: 12,
+  },
+  logLine: {
+    fontFamily: 'monospace',
+    fontSize: 12,
+    lineHeight: 18,
+    marginBottom: 5,
+  },
+  logMuted: { color: '#94a3b8' },
+  logDone: { color: '#86efac' },
+  logError: { color: '#fca5a5' },
+  logSpinner: { marginTop: 10 },
+  blastBlock: {
+    backgroundColor: '#172554',
+    borderColor: '#3b82f6',
+    borderLeftWidth: 3,
+    marginBottom: 8,
+    marginLeft: 8,
+    padding: 8,
+  },
+  blastTitle: { color: '#bfdbfe', fontFamily: 'monospace', fontWeight: '700' },
+  blastFile: { color: '#dbeafe', fontFamily: 'monospace', fontSize: 12, marginTop: 3 },
+  connectionLost: {
+    backgroundColor: '#7f1d1d',
+    borderRadius: 8,
+    marginTop: 12,
+    padding: 12,
+  },
+  connectionLostText: { color: '#fecaca', textAlign: 'center' },
 });

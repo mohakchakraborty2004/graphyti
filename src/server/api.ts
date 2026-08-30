@@ -3,6 +3,8 @@ import cors from "cors";
 import fs from "fs";
 import path from "path";
 import { execFileSync } from "child_process";
+import { createServer, type IncomingMessage } from "http";
+import { WebSocket, WebSocketServer } from "ws";
 import { CancelledError, runPipeline, type PipelineEvents } from "../tui/engine/runPipeline";
 import { runInitGraph } from "../cli/init-graph";
 import { graphMapPath, loadGraphMap } from "../graph/ingest";
@@ -10,6 +12,15 @@ import type { BlastRadiusResult } from "../graph/blastRadius";
 import type { UnifiedValidationResult } from "../verify/unifiedValidation";
 
 type QueryBody = { query?: unknown; yes?: unknown; dryRun?: unknown };
+type StreamStatus = "start" | "update" | "done" | "error";
+type StreamMessage = {
+  stage: string;
+  status?: StreamStatus;
+  message?: string;
+  data?: unknown;
+  elapsedMs?: number;
+  result?: CliJsonResult;
+};
 
 /** The exact result envelope printed by the CLI's --json mode. */
 type CliJsonResult = {
@@ -158,18 +169,65 @@ function createDraftPr(projectRoot: string, query: string): string | undefined {
   return output?.match(/https:\/\/github\.com\/\S+/)?.[0];
 }
 
-const events: PipelineEvents = {
+const silentEvents: PipelineEvents = {
   message: () => {}, activity: () => {}, toolStart: () => "api", toolUpdate: () => {},
   operations: () => {}, plan: () => {}, planProgress: () => {}, blast: () => {}, diff: () => {},
   confirm: async () => true, logs: () => {}, state: () => {},
 };
 
-async function executeQuery(query: string, dryRun: boolean, projectRoot: string): Promise<CliJsonResult> {
+function streamEvents(send: (message: StreamMessage) => void): PipelineEvents {
+  const emit = (
+    stage: string,
+    status: StreamStatus,
+    message: string,
+    data?: unknown,
+    elapsedMs?: number
+  ) => send({ stage, status, message, ...(data === undefined ? {} : { data }), ...(elapsedMs === undefined ? {} : { elapsedMs }) });
+
+  return {
+    message: (message) => emit("pipeline", "update", message),
+    activity: (label) => {
+      if (label) emit(label, "update", label);
+    },
+    toolStart: (kind, target) => {
+      emit(target, "start", `${kind}: ${target}`);
+      return target;
+    },
+    toolUpdate: (target, patch) => {
+      const status: StreamStatus = patch.status === "error"
+        ? "error"
+        : patch.status === "success"
+          ? "done"
+          : "update";
+      emit(target, status, patch.error ?? patch.result ?? target, patch, patch.elapsedMs);
+    },
+    operations: (operations) => emit("intent extraction", "done", "Intent extracted", operations),
+    plan: (plan) => emit("plan", "start", "Multi-step plan created", plan),
+    planProgress: (currentIndex, completed, failed) =>
+      emit("plan", "update", "Plan progress updated", { currentIndex, completed, failed }),
+    blast: (results) => emit("blast radius", "done", "Blast radius computed", results),
+    diff: (filePath, patch) => emit("write", "update", `Prepared ${filePath}`, { filePath, patch }),
+    confirm: async (request) => {
+      emit("confirmation", "done", "Auto-confirmed for API request", request);
+      return true;
+    },
+    logs: (lines) => lines.forEach((line) => emit("pipeline", "update", line)),
+    state: (state) => emit(state, "update", state),
+  };
+}
+
+async function executeQuery(
+  query: string,
+  dryRun: boolean,
+  projectRoot: string,
+  events: PipelineEvents = silentEvents,
+  signal: AbortSignal = new AbortController().signal
+): Promise<CliJsonResult> {
   const startedAt = Date.now();
-  if (!dryRun) ensureCleanGitRepo(projectRoot);
   let branch: QueryBranch | undefined;
   let noChangesToCommit = false;
   try {
+    if (!dryRun) ensureCleanGitRepo(projectRoot);
     const result = await runPipeline(query, {
       dryRun,
       // HTTP has no interactive TTY. This endpoint is always equivalent to --yes.
@@ -179,7 +237,7 @@ async function executeQuery(query: string, dryRun: boolean, projectRoot: string)
       onBeforeWrite: () => {
         branch = createQueryBranch(projectRoot, query);
       },
-    }, events, new AbortController().signal);
+    }, events, signal);
 
     const changed = result.filesWritten.length > 0 || result.filesCreated.length > 0;
     let push: CliJsonResult["push"];
@@ -285,5 +343,80 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
   res.status(error instanceof ApiError ? error.status : 500).json({ error: message });
 });
 
+const server = createServer(app);
+const wss = new WebSocketServer({ noServer: true });
+
+wss.on("connection", (socket: WebSocket, _request: IncomingMessage, context: { query: string; dryRun: boolean }) => {
+  const abort = new AbortController();
+  let completed = false;
+  const send = (message: StreamMessage) => {
+    if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
+  };
+
+  socket.on("close", () => {
+    if (!completed) abort.abort();
+  });
+
+  void (async () => {
+    try {
+      const result = await executeQuery(
+        context.query,
+        context.dryRun,
+        projectRoot,
+        streamEvents(send),
+        abort.signal
+      );
+      completed = true;
+      send({ stage: "complete", result });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      completed = true;
+      send({ stage: "complete", status: "error", message, result: {
+        query: context.query,
+        filesWritten: [],
+        blastRadiusSize: 0,
+        blastRadius: [],
+        verification: [],
+        graphIndexUpdated: false,
+        elapsedMs: 0,
+        exitCode: 2,
+        error: message,
+      } });
+    } finally {
+      if (socket.readyState === WebSocket.OPEN) socket.close();
+    }
+  })();
+});
+
+server.on("upgrade", (request, socket, head) => {
+  const requestUrl = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
+  if (requestUrl.pathname !== "/api/query/stream") {
+    socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  const expected = process.env.GRAPHYTI_API_TOKEN;
+  if (!expected || request.headers.authorization !== `Bearer ${expected}`) {
+    socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  const query = requestUrl.searchParams.get("query")?.trim() ?? "";
+  if (!query) {
+    socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  wss.handleUpgrade(request, socket, head, (websocket) => {
+    wss.emit("connection", websocket, request, {
+      query,
+      dryRun: requestUrl.searchParams.get("dryRun") === "true",
+    });
+  });
+});
+
 const port = Number(process.env.PORT ?? 4000);
-app.listen(port, () => console.log(`Graphyti API listening on http://127.0.0.1:${port} for ${projectRoot}`));
+server.listen(port, () => console.log(`Graphyti API listening on http://127.0.0.1:${port} for ${projectRoot}`));

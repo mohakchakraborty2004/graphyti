@@ -24,7 +24,19 @@ export type QueryResult = {
   graphIndexUpdated: boolean;
   elapsedMs: number;
   exitCode: number;
+  error?: string;
   branch?: string;
+  prUrl?: string;
+  push?: { pushed: boolean; note?: string };
+};
+
+export type QueryStreamEvent = {
+  stage: string;
+  status?: 'start' | 'update' | 'done' | 'error';
+  message?: string;
+  data?: unknown;
+  elapsedMs?: number;
+  result?: QueryResult;
 };
 
 export type AffectedNode = {
@@ -95,4 +107,50 @@ export function runQuery(query: string, opts?: QueryOptions) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ query, ...(opts?.dryRun === undefined ? {} : { dryRun: opts.dryRun }) }),
   });
+}
+
+function streamUrl(path: string) {
+  return apiUrl(path).replace(/^http:/, 'ws:').replace(/^https:/, 'wss:');
+}
+
+export function streamQuery(
+  query: string,
+  handlers: {
+    onEvent: (event: QueryStreamEvent) => void;
+    onConnectionLost: (message: string) => void;
+  }
+) {
+  // React Native supports custom handshake headers even though the DOM's
+  // TypeScript declaration (also present in Expo) only exposes two arguments.
+  const NativeWebSocket = WebSocket as unknown as new (
+    url: string,
+    protocols?: string | string[],
+    options?: { headers: Record<string, string> }
+  ) => WebSocket;
+  const socket = new NativeWebSocket(
+    `${streamUrl('/api/query/stream')}?query=${encodeURIComponent(query)}`,
+    undefined,
+    { headers: { Authorization: `Bearer ${API_TOKEN}` } }
+  );
+  let completed = false;
+
+  socket.onmessage = (message) => {
+    try {
+      const event = JSON.parse(String(message.data)) as QueryStreamEvent;
+      if (event.stage === 'complete') completed = true;
+      handlers.onEvent(event);
+    } catch {
+      handlers.onConnectionLost('Graphyti sent an unreadable stream message.');
+    }
+  };
+  socket.onerror = () => {
+    if (!completed) handlers.onConnectionLost("Connection lost — check Graphyti's API and tunnel.");
+  };
+  socket.onclose = (event) => {
+    if (!completed && event.code !== 1000) {
+      handlers.onConnectionLost(`Connection lost (socket closed with code ${event.code || 'unknown'}).`);
+    }
+  };
+
+  return () => socket.close();
 }
