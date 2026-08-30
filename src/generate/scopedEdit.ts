@@ -156,45 +156,81 @@ export type EditPlan = z.infer<typeof EditPlanSchema>;
  */
 function normalizeEditPlan(raw: unknown): unknown {
   if (!Array.isArray(raw)) return raw;
-  return raw.map((item: any) => {
-    if (!item || typeof item !== "object") return item;
-    const normalized = { ...item };
+  return raw.map(normalizeOperation).filter(isProductiveOperation);
+}
 
-    // Normalize FileEdit entries
-    if (normalized.type === "file" && Array.isArray(normalized.edits)) {
-      normalized.edits = normalized.edits
-        .filter((e: any) => e && typeof e === "object")
-        .map((e: any) => ({
-          filePath: e.filePath ?? normalized.filePath ?? "",
-          oldText: e.oldText ?? "",
-          newText: e.newText ?? "",
-        }))
-        .filter((e: any) => e.oldText !== "" || e.newText !== ""); // drop empty edits
+/**
+ * A file operation whose edits all normalised away changes nothing.
+ *
+ * Keeping it made a run *look* productive: the CLI printed "2 operation(s)
+ * extracted", listed "file X (0 edit)", previewed "no changes", and reported
+ * the step complete — while the model had in fact answered nothing. Dropping it
+ * lets the caller see an empty plan and say so honestly.
+ */
+function isProductiveOperation(item: any): boolean {
+  if (!item || typeof item !== "object") return true;
+  if (item.type !== "file") return true;
+  return Array.isArray(item.edits) && item.edits.length > 0;
+}
+
+function normalizeOperation(item: any): unknown {
+  if (!item || typeof item !== "object") return item;
+  const normalized = { ...item };
+
+  // Normalize FileEdit entries
+  if (normalized.type === "file" && Array.isArray(normalized.edits)) {
+    const edits = normalized.edits
+      .filter((e: any) => e && typeof e === "object")
+      .map((e: any) => ({
+        filePath: e.filePath ?? normalized.filePath ?? "",
+        oldText: e.oldText ?? "",
+        newText: e.newText ?? "",
+      }));
+
+    // A whole file expressed as one edit with an empty oldText is a *creation*
+    // wearing the edit shape. The prompt used to ask for exactly this and the
+    // schema rejected it — `oldText` is min(1) — so every request to create a
+    // file died in validation with "Too small: expected string to have >=1
+    // characters" and took the step, and in a multi-step plan the whole run,
+    // with it. The prompt now asks for `create_file`; this converts the old
+    // shape rather than failing on it.
+    const soleEdit = edits.length === 1 ? edits[0] : undefined;
+    if (soleEdit && soleEdit.oldText === "" && soleEdit.newText !== "") {
+      return {
+        type: "create_file",
+        filePath: normalized.filePath ?? soleEdit.filePath,
+        content: soleEdit.newText,
+        reason: normalized.reason ?? "new file",
+      };
     }
 
-    // Normalize SchemaEdit fields — do NOT default fieldName/fieldType;
-    // missing values must fail validation and trigger a retry.
-    if (normalized.type === "schema") {
-      if (normalized.fieldName === null) normalized.fieldName = undefined;
-      if (normalized.newFieldName === null) normalized.newFieldName = undefined;
-      if (normalized.fieldType === null) normalized.fieldType = undefined;
-      if (normalized.newFieldType === null) normalized.newFieldType = undefined;
-      normalized.modelBody = normalized.modelBody ?? undefined;
-    }
+    // An empty oldText among several edits cannot be applied to an existing
+    // file and would fail the same validation. Drop it so the rest survive.
+    normalized.edits = edits.filter((e: any) => e.oldText !== "");
+  }
 
-    // Normalize CommandAction
-    if (normalized.type === "command") {
-      normalized.command = normalized.command ?? "";
-    }
+  // Normalize SchemaEdit fields — do NOT default fieldName/fieldType;
+  // missing values must fail validation and trigger a retry.
+  if (normalized.type === "schema") {
+    if (normalized.fieldName === null) normalized.fieldName = undefined;
+    if (normalized.newFieldName === null) normalized.newFieldName = undefined;
+    if (normalized.fieldType === null) normalized.fieldType = undefined;
+    if (normalized.newFieldType === null) normalized.newFieldType = undefined;
+    normalized.modelBody = normalized.modelBody ?? undefined;
+  }
 
-    // Normalize CreateFile entries
-    if (normalized.type === "create_file") {
-      normalized.content = normalized.content ?? "";
-      normalized.reason = normalized.reason ?? "";
-    }
+  // Normalize CommandAction
+  if (normalized.type === "command") {
+    normalized.command = normalized.command ?? "";
+  }
 
-    return normalized;
-  });
+  // Normalize CreateFile entries
+  if (normalized.type === "create_file") {
+    normalized.content = normalized.content ?? "";
+    normalized.reason = normalized.reason ?? "";
+  }
+
+  return normalized;
 }
 
 /**
@@ -340,13 +376,53 @@ export function validateClassification(raw: unknown): {
 } {
   const result = ClassificationSchema.safeParse(raw);
   if (result.success) {
-    return { ok: true, classification: result.data };
+    return { ok: true, classification: pruneRedundantSteps(result.data) };
   }
   return {
     ok: false,
     reason: result.error.issues
       .map((i) => `${i.path.join(".")}: ${i.message}`)
       .join("; "),
+  };
+}
+
+/** Descriptions that only restate work the blast radius already performs. */
+const PROPAGATION_ONLY =
+  /\b(references?|usages?|call ?sites?|consumers?|occurrences?)\b|\b(that|which)\s+(use|uses|using|reference|references|render|renders)\b/i;
+
+/**
+ * Drop follow-up steps that only ask for downstream propagation.
+ *
+ * The prompt forbids them, but the classifier runs on whatever model the user
+ * configured and a small one emits them anyway. They are never merely wasteful:
+ * a propagation step carries no schema edit, so it is the one path through the
+ * pipeline that runs with no blast radius and no structural verification, and
+ * it is handed a file its predecessor has already rewritten — so it either
+ * produces nothing or quotes pre-change text and fails the whole plan.
+ *
+ * Pruning is deliberately conservative: it needs an earlier step to have done
+ * the real work, it never touches `new_file` steps, and it never empties a plan.
+ */
+export function pruneRedundantSteps(classification: Classification): Classification {
+  // A one-step plan is single-step whatever the model called it. Left as
+  // `decomposable: true` it took the multi-step path — extra confirmation
+  // prompt, plan banner and per-step framing — to do exactly one thing.
+  if (classification.steps.length < 2) {
+    return classification.decomposable
+      ? { decomposable: false, steps: classification.steps }
+      : classification;
+  }
+
+  const kept = classification.steps.filter(
+    (step, i) =>
+      i === 0 || step.kind === "new_file" || !PROPAGATION_ONLY.test(step.description)
+  );
+
+  if (kept.length === classification.steps.length) return classification;
+
+  return {
+    decomposable: kept.length > 1,
+    steps: kept,
   };
 }
 
@@ -364,9 +440,26 @@ Return a JSON object with exactly this shape:
   ]
 }
 
+DOWNSTREAM PROPAGATION IS AUTOMATIC — DO NOT PLAN IT.
+When a Prisma field or model changes, the system already computes which routes,
+components and files reference it and updates every one of them in the same
+step, then verifies the result. So a schema change and all the call-site updates
+it forces are ONE step, never two.
+
+Never emit a step like "update references to X", "update the components that use
+X", "fix call sites", "update types/imports/usages", or "update the API routes"
+as a follow-up to a schema step. Those are already covered.
+
+Wrong (two steps):
+  1. Rename User.phone to phoneNo in the Prisma schema
+  2. Update phone references in the routes and components
+Right (one step):
+  1. Rename User.phone to phoneNo
+
 RULES:
 - If the request is a SINGLE change to an existing file or model, set "decomposable" to false and "steps" to exactly one entry with kind "structural_edit".
 - If the request requires creating new files, setting up multiple routes, or combining several unrelated changes, set "decomposable" to true and list each step in order.
+- Decompose only genuinely INDEPENDENT changes — two different features, or a new file plus an edit to an existing one. Never decompose one change into "do it" plus "propagate it".
 - Steps that create a file that does not currently exist must have kind "new_file".
 - Steps that modify an existing file or Prisma model must have kind "structural_edit".
 - Keep descriptions short (under 15 words). Use imperative mood (e.g. "Add login route", "Rename field").
@@ -380,7 +473,8 @@ RULES:
  * (which only ever retried *validation* failures), killing the whole run before
  * a single file was touched.
  */
-const CLASSIFICATION_TIMEOUT_MS = 60_000;
+const CLASSIFICATION_TIMEOUT_MS = 30_000;
+const CLASSIFICATION_MAX_TOKENS = 512;
 
 export async function classifyQuery(
   query: string,
@@ -389,7 +483,11 @@ export async function classifyQuery(
   const contents = `${CLASSIFICATION_PROMPT}\n\nUser request: ${query}\n\nProject context:\n${context}\n\nReturn ONLY a JSON object. No prose, no explanation.`;
 
   const text = await withTimeout(
-    generateCompletion(contents, { responseFormat: "json" }),
+    generateCompletion(contents, {
+      responseFormat: "json",
+      maxTokens: CLASSIFICATION_MAX_TOKENS,
+      timeoutMs: CLASSIFICATION_TIMEOUT_MS,
+    }),
     CLASSIFICATION_TIMEOUT_MS,
     "Classification"
   );
@@ -466,7 +564,7 @@ For schema changes (Prisma, database models):
   "modelBody": "<full model body for create_model, e.g. 'id Int @id @default(autoincrement())\\nname String?\\nposts Post[]'>"
 }
 
-For code changes (routes, components, utilities — both NEW and EXISTING files):
+For edits to an EXISTING file (routes, components, utilities):
 {
   "type": "file",
   "filePath": "<relative path to the file>",
@@ -477,6 +575,14 @@ For code changes (routes, components, utilities — both NEW and EXISTING files)
       "newText": "<the replacement snippet>"
     }
   ]
+}
+
+For creating a file that does NOT yet exist:
+{
+  "type": "create_file",
+  "filePath": "<relative path to the new file>",
+  "content": "<the COMPLETE contents of the new file>",
+  "reason": "<short reason this file is being created>"
 }
 
 For commands:
@@ -491,9 +597,8 @@ RULES:
 - Return an ARRAY of operations. Each operation addresses exactly one thing the user asked for.
 - Make the MINIMAL change necessary. Do NOT propose edits outside what the operation describes.
 - If the request is ambiguous, choose the NARROWEST reasonable scope rather than reinterpreting the whole file.
-- For editing EXISTING files: oldText must be a SMALL, UNIQUE snippet (2-10 lines) from the current file.
-- For creating NEW files: use oldText = "" (empty string) and provide the COMPLETE file content in newText.
-- The system will detect oldText = "" and create the file automatically.
+- For editing EXISTING files use "file": oldText must be a SMALL, UNIQUE snippet (2-10 lines) copied exactly from the current file, and it must be non-empty. Never use "file" for a path that does not exist yet.
+- For creating NEW files use "create_file" and put the whole file in "content". Never express a new file as a "file" edit with an empty oldText — that shape is rejected.
 - Never modify code or fields unrelated to the request.
 - If the user asks for multiple unrelated changes, return multiple separate operations.
 - For schema operations: only include the model and field that change. Do not describe the rest of the schema.
@@ -504,11 +609,51 @@ RULES:
  * Extract the user's intent as a structured EditPlan via a narrow LLM call.
  * Retries once if the LLM output doesn't validate against the Zod schema.
  */
+const INTENT_TIMEOUT_MS = 60_000;
+const INTENT_RETRY_TIMEOUT_MS = 30_000;
+const INTENT_MAX_TOKENS = 1_600;
+const INTENT_CONTEXT_CHAR_LIMIT = 16_000;
+
+function compactIntentContext(context: string): string {
+  if (context.length <= INTENT_CONTEXT_CHAR_LIMIT) return context;
+  const head = Math.floor(INTENT_CONTEXT_CHAR_LIMIT * 0.75);
+  const tail = INTENT_CONTEXT_CHAR_LIMIT - head;
+  return (
+    context.slice(0, head) +
+    `\n… (${context.length - INTENT_CONTEXT_CHAR_LIMIT} characters omitted for retry) …\n` +
+    context.slice(-tail)
+  );
+}
+
+/**
+ * Recognise a verified, unambiguous request to remove a Prisma model.
+ *
+ * This is deliberately narrow: the schema proves the model exists before we
+ * bypass the LLM. It makes an operation such as "remove Post model" immediate
+ * even when a queued free-tier provider is slow or temporarily unavailable.
+ */
+export function inferSchemaIntent(query: string, schemaSource?: string): EditPlan | null {
+  if (!schemaSource) return null;
+  const match = query.match(
+    /\b(?:remove|delete|drop)\s+(?:the\s+)?(?:(?:model\s+)([A-Za-z][A-Za-z0-9_]*)\b|([A-Za-z][A-Za-z0-9_]*)\s+(?:model|schema model)\b)/i
+  );
+  if (!match) return null;
+
+  const requested = match[1] ?? match[2];
+  if (!requested) return null;
+  const models = [...schemaSource.matchAll(/^\s*model\s+([A-Za-z][A-Za-z0-9_]*)\b/gm)].map(
+    (model) => model[1]!
+  );
+  const model = models.find((name) => name.toLowerCase() === requested.toLowerCase());
+  return model ? [{ type: "schema", model, op: "remove_model" }] : null;
+}
+
 export async function extractIntent(
   query: string,
   context: string,
   /** Current schema.prisma source — needed so the LLM can reference exact field names. */
-  schemaSource?: string
+  schemaSource?: string,
+  timeoutMs = INTENT_TIMEOUT_MS
 ): Promise<{ plan: EditPlan; raw: unknown }> {
   const userContent = [
     `User query: ${query}`,
@@ -522,8 +667,10 @@ export async function extractIntent(
   const text = await withTimeout(
     generateCompletion(`${INTENT_EXTRACTION_PROMPT}\n\n${userContent}`, {
       responseFormat: "json",
+      maxTokens: INTENT_MAX_TOKENS,
+      timeoutMs,
     }),
-    INTENT_TIMEOUT_MS,
+    timeoutMs,
     "Intent extraction"
   );
 
@@ -531,33 +678,45 @@ export async function extractIntent(
   return { plan: raw as EditPlan, raw };
 }
 
-const INTENT_TIMEOUT_MS = 60_000;
-
 /**
- * High-level intent extraction with one retry on validation failure.
+ * High-level intent extraction with one retry on every recoverable model
+ * failure. The retry uses a compact context and a smaller deadline, preventing
+ * a queued provider from turning a single user request into a dead end.
  */
 export async function extractIntentWithRetry(
   query: string,
   context: string,
   schemaSource?: string
 ): Promise<EditPlan> {
-  const first = await extractIntent(query, context, schemaSource);
-  const check = validateEditPlan(first.plan);
-  if (check.ok) return check.plan;
+  const inferred = inferSchemaIntent(query, schemaSource);
+  if (inferred) return inferred;
 
-  // Retry once with the validation error fed back
-  const retry = await extractIntent(
-    `${query}\n\nPREVIOUS ATTEMPT WAS REJECTED: ${check.reason}\nFix the output and try again. Return ONLY a JSON array.`,
-    context,
-    schemaSource
-  );
-  const retryCheck = validateEditPlan(retry.plan);
-  if (!retryCheck.ok) {
+  let firstReason: string;
+  try {
+    const first = await extractIntent(query, context, schemaSource);
+    const check = validateEditPlan(first.plan);
+    if (check.ok) return check.plan;
+    firstReason = check.reason;
+  } catch (err) {
+    firstReason = err instanceof Error ? err.message : String(err);
+  }
+
+  try {
+    const retry = await extractIntent(
+      `${query}\n\nPREVIOUS ATTEMPT FAILED: ${firstReason}\nReturn a valid JSON array of minimal operations only.`,
+      compactIntentContext(context),
+      schemaSource,
+      INTENT_RETRY_TIMEOUT_MS
+    );
+    const retryCheck = validateEditPlan(retry.plan);
+    if (retryCheck.ok) return retryCheck.plan;
+    throw new Error(retryCheck.reason);
+  } catch (err) {
+    const retryReason = err instanceof Error ? err.message : String(err);
     throw new Error(
-      `Intent extraction failed validation after retry: ${retryCheck.reason}`
+      `Intent extraction failed after retry. First attempt: ${firstReason}. Retry: ${retryReason}`
     );
   }
-  return retryCheck.plan;
 }
 
 // ---------------------------------------------------------------------------
@@ -597,20 +756,34 @@ export function applyScopedEdits(
       return { ...edit, index, count };
     });
 
-  // Fail on any edit whose oldText isn't found
-  const notFound = positioned.filter((p) => p.index === -1);
-  if (notFound.length > 0) {
+  // An edit whose oldText is missing but whose newText is already present is
+  // not stale — it is *already applied*.
+  //
+  // This is the ordinary case when a multi-step plan revisits a file an earlier
+  // step already fixed: step 1 renames Post.title everywhere, step 2 is handed
+  // "update the title references" and quotes the pre-rename text. Treating that
+  // as a failure aborted the entire run — "Stopping — remaining steps may
+  // depend on this step's output" — over work that had in fact been completed
+  // correctly. Skipping it is both safe and what the model meant.
+  const missing = positioned.filter((p) => p.index === -1);
+  const stale = missing.filter(
+    (p) => p.newText.length === 0 || !currentContent.includes(p.newText)
+  );
+  if (stale.length > 0) {
     throw new StaleEditError(
       `oldText not found in ${filePath} (stale view):`,
-      notFound.map((e) => ({
+      stale.map((e) => ({
         filePath,
         oldText: e.oldText.slice(0, 80) + (e.oldText.length > 80 ? "..." : ""),
       }))
     );
   }
 
+  // Only edits that still have work to do take part from here on.
+  const applicable = positioned.filter((p) => p.index !== -1);
+
   // Fail on any edit whose oldText matches more than once (ambiguous)
-  const ambiguous = positioned.filter((p) => p.count > 1);
+  const ambiguous = applicable.filter((p) => p.count > 1);
   if (ambiguous.length > 0) {
     throw new AmbiguousEditError(
       `oldText is ambiguous (matches ${ambiguous.length} occurrence(s)) in ${filePath}:`,
@@ -623,10 +796,10 @@ export function applyScopedEdits(
   }
 
   // Sort by index descending (apply from bottom to top)
-  positioned.sort((a, b) => b.index - a.index);
+  applicable.sort((a, b) => b.index - a.index);
 
   let result = currentContent;
-  for (const edit of positioned) {
+  for (const edit of applicable) {
     result =
       result.slice(0, edit.index) +
       edit.newText +
@@ -703,12 +876,19 @@ export function applySchemaEdit(
     const lines = existingSource.split("\n");
     const result: string[] = [];
     let i = 0;
+    let removedTarget = false;
+    let currentModel: string | null = null;
+    let depth = 0;
+    const relationType = new RegExp(
+      `^\\s*[A-Za-z_][A-Za-z0-9_]*\\s+${escapeRegex(edit.model)}(?:\\[\\])?\\??(?:\\s|$)`
+    );
     while (i < lines.length) {
       const line = lines[i];
       const modelMatch = line.match(/^\s*model\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{/);
       if (modelMatch && modelMatch[1] === edit.model) {
         // Skip the entire model block
-        let depth = 1;
+        removedTarget = true;
+        depth = 1;
         i++;
         while (i < lines.length && depth > 0) {
           if (lines[i].includes("{")) depth++;
@@ -717,8 +897,26 @@ export function applySchemaEdit(
         }
         continue;
       }
+      if (modelMatch) {
+        currentModel = modelMatch[1];
+        depth = 1;
+      } else if (currentModel !== null) {
+        // A relation to the deleted model cannot stay in the schema. Remove it
+        // deterministically alongside the model so Prisma format/migrate never
+        // sees a dangling `LikeDislike[]` (or optional singular) field.
+        if (relationType.test(line)) {
+          i++;
+          continue;
+        }
+        if (line.includes("{")) depth++;
+        if (line.includes("}")) depth--;
+        if (depth === 0) currentModel = null;
+      }
       result.push(line);
       i++;
+    }
+    if (!removedTarget) {
+      throw new Error(`Model ${edit.model} was not found in schema.prisma`);
     }
     const mutated = result.join("\n");
     const absSchemaPath = path.isAbsolute(schemaPath)
@@ -874,15 +1072,17 @@ For each operation in the plan, produce the actual code changes. You have three 
    For "create_model": pass through the full descriptor including modelBody.
    For "remove_model": pass through the descriptor with just the model name.
 
-2. FILE EDITS (type: "file"):
+2. FILE EDITS (type: "file") — for a file that ALREADY EXISTS:
    For each file edit, you MUST:
-   - Check if the file exists in the project context
-   - If the file EXISTS: produce EXACT oldText (verbatim from the current file) and newText (minimal replacement). oldText must be a SMALL, UNIQUE snippet (2-10 lines).
-   - If the file does NOT exist (new file): use oldText = "" and provide the COMPLETE file content in newText
+   - Produce EXACT oldText (verbatim from the current file) and newText (minimal replacement). oldText must be a SMALL, UNIQUE snippet (2-10 lines) and must never be empty.
    - Do NOT modify any code outside the oldText/newText snippets
    - Do NOT add imports, exports, or code that wasn't in the original unless the operation explicitly requires it
 
-3. COMMANDS (type: "command"):
+3. NEW FILES (type: "create_file") — for a file that does NOT exist yet:
+   { "type": "create_file", "filePath": "<relative path>", "content": "<the COMPLETE file>", "reason": "<why>" }
+   Never express a new file as a "file" edit with an empty oldText.
+
+4. COMMANDS (type: "command"):
    Pass through the command string as-is.
 
 CRITICAL RULES:
@@ -890,7 +1090,7 @@ CRITICAL RULES:
 - Do NOT modify code or fields unrelated to the request.
 - If the request is ambiguous, choose the NARROWEST reasonable scope.
 - For EXISTING files: produce ONLY targeted oldText/newText pairs — NOT the whole file content.
-- For NEW files: produce the COMPLETE file content in newText with oldText = "".
+- For NEW files: emit a "create_file" operation carrying the COMPLETE file content.
 
 PRISMA RULES:
 - Do NOT modify or remove anything that Prisma generates by default.

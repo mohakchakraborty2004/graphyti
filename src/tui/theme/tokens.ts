@@ -214,4 +214,7 @@ export const STATUS_VISUALS: Record<
  * spinner animating can never reflow the line it sits on (§10, §28).
  */
 export const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
-export const SPINNER_INTERVAL_MS = 80;
+// Ink redraws the live terminal for every frame. Four frames per second keeps
+// the activity indicator responsive without the visible flicker that 80ms
+// updates caused in Windows terminals.
+export const SPINNER_INTERVAL_MS = 250;

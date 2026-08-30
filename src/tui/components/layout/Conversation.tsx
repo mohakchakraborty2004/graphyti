@@ -48,17 +48,7 @@ export function Conversation({
 
   return (
     <>
-      {/*
-        Static rows leave the live frame permanently once written. Keying by a
-        stable id is what lets Ink append only what is new.
-      */}
-      <Static items={history}>
-        {(item) => (
-          <Box key={item.id} flexDirection="column">
-            <Lines lines={item.lines} width={width} />
-          </Box>
-        )}
-      </Static>
+      <FinalizedHistory history={history} width={width} />
 
       <Box flexDirection="column" flexShrink={0}>
         {markers.above && (
@@ -84,6 +74,26 @@ export function Conversation({
     </>
   );
 }
+
+/**
+ * Keep Ink's append-only output out of the live animation render path. The
+ * parent still updates for spinner frames, but this component only re-renders
+ * when a completed block or terminal width actually changes.
+ */
+const FinalizedHistory = React.memo(function FinalizedHistory({
+  history,
+  width,
+}: Pick<ConversationProps, "history" | "width">) {
+  return (
+    <Static items={history}>
+      {(item) => (
+        <Box key={item.id} flexDirection="column">
+          <Lines lines={item.lines} width={width} />
+        </Box>
+      )}
+    </Static>
+  );
+});
 
 /**
  * Marks content outside the window, so being scrolled up is never ambiguous —

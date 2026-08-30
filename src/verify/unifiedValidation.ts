@@ -88,6 +88,10 @@ export async function runUnifiedValidation(
   const targets: VerifyTarget[] = changes.map((c) => ({
     blastRadius: c.blastRadius,
     oldFields: c.breakingFieldNames,
+    removedModel:
+      c.delta.changeType === "remove" && c.delta.targetNodeId.startsWith("model:")
+        ? c.delta.targetModel
+        : undefined,
   }));
 
   const localReport = verifyStructuralChange(targets, generatedFiles, projectRoot);

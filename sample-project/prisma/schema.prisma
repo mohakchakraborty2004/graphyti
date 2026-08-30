@@ -16,7 +16,6 @@ model User {
   username  String
   phone  String
   bio      String?
-  likes     LikeDislike[]
 }
 
 model Post {
@@ -31,7 +30,6 @@ model Post {
   authorId  Int?
   author    User?     @relation(fields: [authorId], references: [id])
   comments  Comment[]
-  likes     LikeDislike[]
 }
 
 model Comment {
@@ -43,11 +41,3 @@ model Comment {
   post    Post    @relation(fields: [postId], references: [id])
 }
 
-model LikeDislike {
-id Int @id @default(autoincrement())
-isLike Boolean
-postId Int
-post Post @relation(fields: [postId], references: [id])
-userId Int
-user User @relation(fields: [userId], references: [id])
-}
