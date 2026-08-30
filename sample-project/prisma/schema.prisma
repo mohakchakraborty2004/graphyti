@@ -16,6 +16,7 @@ model User {
   username  String
   mobilePhone  String
   bio      String?
+  address  String?
 }
 
 model Post {
