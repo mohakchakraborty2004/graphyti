@@ -6,12 +6,13 @@
     "graphyti": "./run.mjs"
   },
   "scripts": {
-    "test": "npm run test:commands && npm run test:prisma-commands && npm run test:pipeline && npm run test:config && npm run test:docs && npm run test:blast && npm run test:validation && npm run test:tui",
+    "test": "npm run test:commands && npm run test:intent && npm run test:prisma-commands && npm run test:pipeline && npm run test:config && npm run test:docs && npm run test:blast && npm run test:validation && npm run test:tui",
     "dev": "ts-node src/index.ts",
     "build": "node build-tui.mjs",
     "relink": "npm unlink -g graphyti && npm run build && npm link",
     "extract:test": "tsx src/extract/test-extract.ts",
     "test:commands": "tsx src/scripts/test-command-allowlist.ts",
+    "test:intent": "tsx src/scripts/test-intent-inference.ts",
     "test:prisma-commands": "tsx src/scripts/test-prisma-commands.ts",
     "test:pipeline": "tsx src/scripts/test-pipeline.ts",
     "test:config": "tsx src/scripts/test-config.ts",

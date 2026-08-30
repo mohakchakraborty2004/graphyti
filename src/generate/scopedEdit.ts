@@ -473,7 +473,8 @@ RULES:
  * (which only ever retried *validation* failures), killing the whole run before
  * a single file was touched.
  */
-const CLASSIFICATION_TIMEOUT_MS = 60_000;
+const CLASSIFICATION_TIMEOUT_MS = 30_000;
+const CLASSIFICATION_MAX_TOKENS = 512;
 
 export async function classifyQuery(
   query: string,
@@ -482,7 +483,11 @@ export async function classifyQuery(
   const contents = `${CLASSIFICATION_PROMPT}\n\nUser request: ${query}\n\nProject context:\n${context}\n\nReturn ONLY a JSON object. No prose, no explanation.`;
 
   const text = await withTimeout(
-    generateCompletion(contents, { responseFormat: "json" }),
+    generateCompletion(contents, {
+      responseFormat: "json",
+      maxTokens: CLASSIFICATION_MAX_TOKENS,
+      timeoutMs: CLASSIFICATION_TIMEOUT_MS,
+    }),
     CLASSIFICATION_TIMEOUT_MS,
     "Classification"
   );
@@ -604,11 +609,51 @@ RULES:
  * Extract the user's intent as a structured EditPlan via a narrow LLM call.
  * Retries once if the LLM output doesn't validate against the Zod schema.
  */
+const INTENT_TIMEOUT_MS = 60_000;
+const INTENT_RETRY_TIMEOUT_MS = 30_000;
+const INTENT_MAX_TOKENS = 1_600;
+const INTENT_CONTEXT_CHAR_LIMIT = 16_000;
+
+function compactIntentContext(context: string): string {
+  if (context.length <= INTENT_CONTEXT_CHAR_LIMIT) return context;
+  const head = Math.floor(INTENT_CONTEXT_CHAR_LIMIT * 0.75);
+  const tail = INTENT_CONTEXT_CHAR_LIMIT - head;
+  return (
+    context.slice(0, head) +
+    `\n… (${context.length - INTENT_CONTEXT_CHAR_LIMIT} characters omitted for retry) …\n` +
+    context.slice(-tail)
+  );
+}
+
+/**
+ * Recognise a verified, unambiguous request to remove a Prisma model.
+ *
+ * This is deliberately narrow: the schema proves the model exists before we
+ * bypass the LLM. It makes an operation such as "remove Post model" immediate
+ * even when a queued free-tier provider is slow or temporarily unavailable.
+ */
+export function inferSchemaIntent(query: string, schemaSource?: string): EditPlan | null {
+  if (!schemaSource) return null;
+  const match = query.match(
+    /\b(?:remove|delete|drop)\s+(?:the\s+)?(?:(?:model\s+)([A-Za-z][A-Za-z0-9_]*)\b|([A-Za-z][A-Za-z0-9_]*)\s+(?:model|schema model)\b)/i
+  );
+  if (!match) return null;
+
+  const requested = match[1] ?? match[2];
+  if (!requested) return null;
+  const models = [...schemaSource.matchAll(/^\s*model\s+([A-Za-z][A-Za-z0-9_]*)\b/gm)].map(
+    (model) => model[1]!
+  );
+  const model = models.find((name) => name.toLowerCase() === requested.toLowerCase());
+  return model ? [{ type: "schema", model, op: "remove_model" }] : null;
+}
+
 export async function extractIntent(
   query: string,
   context: string,
   /** Current schema.prisma source — needed so the LLM can reference exact field names. */
-  schemaSource?: string
+  schemaSource?: string,
+  timeoutMs = INTENT_TIMEOUT_MS
 ): Promise<{ plan: EditPlan; raw: unknown }> {
   const userContent = [
     `User query: ${query}`,
@@ -622,8 +667,10 @@ export async function extractIntent(
   const text = await withTimeout(
     generateCompletion(`${INTENT_EXTRACTION_PROMPT}\n\n${userContent}`, {
       responseFormat: "json",
+      maxTokens: INTENT_MAX_TOKENS,
+      timeoutMs,
     }),
-    INTENT_TIMEOUT_MS,
+    timeoutMs,
     "Intent extraction"
   );
 
@@ -631,33 +678,45 @@ export async function extractIntent(
   return { plan: raw as EditPlan, raw };
 }
 
-const INTENT_TIMEOUT_MS = 60_000;
-
 /**
- * High-level intent extraction with one retry on validation failure.
+ * High-level intent extraction with one retry on every recoverable model
+ * failure. The retry uses a compact context and a smaller deadline, preventing
+ * a queued provider from turning a single user request into a dead end.
  */
 export async function extractIntentWithRetry(
   query: string,
   context: string,
   schemaSource?: string
 ): Promise<EditPlan> {
-  const first = await extractIntent(query, context, schemaSource);
-  const check = validateEditPlan(first.plan);
-  if (check.ok) return check.plan;
+  const inferred = inferSchemaIntent(query, schemaSource);
+  if (inferred) return inferred;
 
-  // Retry once with the validation error fed back
-  const retry = await extractIntent(
-    `${query}\n\nPREVIOUS ATTEMPT WAS REJECTED: ${check.reason}\nFix the output and try again. Return ONLY a JSON array.`,
-    context,
-    schemaSource
-  );
-  const retryCheck = validateEditPlan(retry.plan);
-  if (!retryCheck.ok) {
+  let firstReason: string;
+  try {
+    const first = await extractIntent(query, context, schemaSource);
+    const check = validateEditPlan(first.plan);
+    if (check.ok) return check.plan;
+    firstReason = check.reason;
+  } catch (err) {
+    firstReason = err instanceof Error ? err.message : String(err);
+  }
+
+  try {
+    const retry = await extractIntent(
+      `${query}\n\nPREVIOUS ATTEMPT FAILED: ${firstReason}\nReturn a valid JSON array of minimal operations only.`,
+      compactIntentContext(context),
+      schemaSource,
+      INTENT_RETRY_TIMEOUT_MS
+    );
+    const retryCheck = validateEditPlan(retry.plan);
+    if (retryCheck.ok) return retryCheck.plan;
+    throw new Error(retryCheck.reason);
+  } catch (err) {
+    const retryReason = err instanceof Error ? err.message : String(err);
     throw new Error(
-      `Intent extraction failed validation after retry: ${retryCheck.reason}`
+      `Intent extraction failed after retry. First attempt: ${firstReason}. Retry: ${retryReason}`
     );
   }
-  return retryCheck.plan;
 }
 
 // ---------------------------------------------------------------------------

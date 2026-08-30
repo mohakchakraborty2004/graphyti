@@ -141,10 +141,20 @@ export async function runPipeline(
 
     // ── Classification ───────────────────────────────────────────────────────
     events.activity("Classifying request");
-    const { classifyQueryWithRetry } = await import("../../generate/scopedEdit");
+    const { classifyQueryWithRetry, inferSchemaIntent, singleStepClassification } = await import("../../generate/scopedEdit");
     // Never throws: a classification timeout used to abort the entire run
     // before any work happened. A failure degrades to a single step instead.
-    const { classification, degraded } = await classifyQueryWithRetry(query, context.text);
+    const schemaPath = findSchema(options.projectRoot);
+    const localIntent = inferSchemaIntent(
+      query,
+      schemaPath ? fs.readFileSync(schemaPath, "utf-8") : undefined
+    );
+    const { classification, degraded } = localIntent
+      ? { classification: singleStepClassification(query), degraded: null }
+      : await classifyQueryWithRetry(query, context.text);
+    if (localIntent) {
+      events.message("Recognized a direct Prisma model removal; skipping model planning for this step.");
+    }
     if (degraded) {
       events.message(`Could not plan multi-step work (${degraded}) — treating this as a single change.`);
     }
