@@ -6,6 +6,8 @@ import { execFileSync } from "child_process";
 import { CancelledError, runPipeline, type PipelineEvents } from "../tui/engine/runPipeline";
 import { runInitGraph } from "../cli/init-graph";
 import { graphMapPath, loadGraphMap } from "../graph/ingest";
+import type { BlastRadiusResult } from "../graph/blastRadius";
+import type { UnifiedValidationResult } from "../verify/unifiedValidation";
 
 type QueryBody = { query?: unknown; yes?: unknown; dryRun?: unknown };
 
@@ -14,11 +16,16 @@ type CliJsonResult = {
   query: string;
   filesWritten: string[];
   blastRadiusSize: number;
-  verification: "skipped";
+  /** Full existing pipeline reports; empty means no breaking-change verification ran. */
+  verification: UnifiedValidationResult[];
+  /** Full existing graph blast-radius reports; empty means no breaking schema change. */
+  blastRadius: BlastRadiusResult[];
   graphIndexUpdated: boolean;
   elapsedMs: number;
   exitCode: number;
   branch?: string;
+  push?: { pushed: boolean; note?: string };
+  prUrl?: string;
 };
 
 class ApiError extends Error {
@@ -123,6 +130,30 @@ function commitQuery(projectRoot: string, branch: QueryBranch, query: string) {
   return true;
 }
 
+function commandOutput(command: string, args: string[], projectRoot: string): string | null {
+  try {
+    return execFileSync(command, args, { cwd: projectRoot, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  } catch {
+    return null;
+  }
+}
+
+function pushBranch(projectRoot: string, branch: string): { pushed: boolean; note?: string } {
+  if (!commandOutput("git", ["remote", "get-url", "origin"], projectRoot)) {
+    return { pushed: false, note: "No origin remote is configured; branch remains local." };
+  }
+  const output = commandOutput("git", ["push", "-u", "origin", branch], projectRoot);
+  return output === null
+    ? { pushed: false, note: "Push failed; the write and local commit succeeded, but the branch remains local." }
+    : { pushed: true };
+}
+
+function createDraftPr(projectRoot: string, query: string): string | undefined {
+  if (commandOutput("gh", ["auth", "status"], projectRoot) === null) return undefined;
+  const output = commandOutput("gh", ["pr", "create", "--draft", "--title", query, "--body", "Created by Graphyti"], projectRoot);
+  return output?.match(/https:\/\/github\.com\/\S+/)?.[0];
+}
+
 const events: PipelineEvents = {
   message: () => {}, activity: () => {}, toolStart: () => "api", toolUpdate: () => {},
   operations: () => {}, plan: () => {}, planProgress: () => {}, blast: () => {}, diff: () => {},
@@ -147,11 +178,16 @@ async function executeQuery(query: string, dryRun: boolean, projectRoot: string)
     }, events, new AbortController().signal);
 
     const changed = result.filesWritten.length > 0 || result.filesCreated.length > 0;
+    let push: CliJsonResult["push"];
+    let prUrl: string | undefined;
     if (branch && changed) {
       if (!commitQuery(projectRoot, branch, query)) {
         discardEmptyBranch(projectRoot, branch);
         branch = undefined;
         noChangesToCommit = true;
+      } else {
+        push = pushBranch(projectRoot, branch.name);
+        if (push.pushed) prUrl = createDraftPr(projectRoot, query);
       }
     } else if (branch) {
       discardEmptyBranch(projectRoot, branch);
@@ -162,11 +198,14 @@ async function executeQuery(query: string, dryRun: boolean, projectRoot: string)
       query,
       filesWritten: result.filesWritten,
       blastRadiusSize: result.blastRadiusSize,
-      verification: "skipped",
+      blastRadius: result.blastRadius,
+      verification: result.verification,
       graphIndexUpdated: result.graphIndexUpdated,
       elapsedMs: result.elapsedMs,
       exitCode: noChangesToCommit ? 1 : 0,
       ...(branch ? { branch: branch.name } : {}),
+      ...(push ? { push } : {}),
+      ...(prUrl ? { prUrl } : {}),
     };
   } catch (error) {
     if (branch) {
@@ -178,12 +217,12 @@ async function executeQuery(query: string, dryRun: boolean, projectRoot: string)
     }
     if (error instanceof ApiError) throw error;
     if (error instanceof CancelledError) {
-      return { query, filesWritten: [], blastRadiusSize: 0, verification: "skipped", graphIndexUpdated: false, elapsedMs: Date.now() - startedAt, exitCode: 1 };
+      return { query, filesWritten: [], blastRadiusSize: 0, blastRadius: [], verification: [], graphIndexUpdated: false, elapsedMs: Date.now() - startedAt, exitCode: 1 };
     }
     // Match the CLI's --json behavior for unexpected pipeline failures: the
     // response remains machine-readable and signals the failure via exitCode.
     console.error("Pipeline failed:", error instanceof Error ? error.message : String(error));
-    return { query, filesWritten: [], blastRadiusSize: 0, verification: "skipped", graphIndexUpdated: false, elapsedMs: Date.now() - startedAt, exitCode: 2 };
+    return { query, filesWritten: [], blastRadiusSize: 0, blastRadius: [], verification: [], graphIndexUpdated: false, elapsedMs: Date.now() - startedAt, exitCode: 2 };
   }
 }
 

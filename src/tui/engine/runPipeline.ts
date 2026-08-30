@@ -23,6 +23,8 @@ import {
 } from "./captureConsole";
 import type { PermissionRequest, ToolCall, ToolKind } from "../state/types";
 import type { StatusKind } from "../theme/tokens";
+import type { BlastRadiusResult } from "../../graph/blastRadius";
+import type { UnifiedValidationResult } from "../../verify/unifiedValidation";
 
 export interface PipelineOptions {
   dryRun: boolean;
@@ -76,6 +78,10 @@ export interface PipelineResult {
   filesCreated: string[];
   commands: string[];
   blastRadiusSize: number;
+  /** Complete enforced/advisory blast-radius reports, one per breaking change. */
+  blastRadius: BlastRadiusResult[];
+  /** Complete verification reports, one per verification pass. */
+  verification: UnifiedValidationResult[];
   graphIndexUpdated: boolean;
   elapsedMs: number;
 }
@@ -113,6 +119,8 @@ export async function runPipeline(
     filesCreated: [],
     commands: [],
     blastRadiusSize: 0,
+    blastRadius: [],
+    verification: [],
     graphIndexUpdated: false,
     elapsedMs: 0,
   };
@@ -341,6 +349,7 @@ async function executeStep(
   const mustChange = affectedFilePaths(changes);
   const promptInjection = changes.length > 0 ? promptInjectionFor(changes) : "";
   result.blastRadiusSize += mustChange.length;
+  result.blastRadius.push(...changes.map(({ blastRadius }) => blastRadius));
 
   if (changes.length === 0) {
     events.toolUpdate(blastTool, {
@@ -472,6 +481,7 @@ async function executeStep(
     }
 
     const verifyElapsed = Date.now() - verifyStart;
+    result.verification.push(unifiedResult);
     events.toolUpdate(verifyTool, {
       status: unifiedResult.overallPassed ? "success" : "error",
       result: unifiedResult.summary,
@@ -538,6 +548,7 @@ async function executeStep(
         proposedSchemaSource,
         skipGraphCheck: true,
       });
+      result.verification.push(retryResult);
 
       if (retryResult.localCheck.missed > 0) {
         events.toolUpdate(retryTool, {
