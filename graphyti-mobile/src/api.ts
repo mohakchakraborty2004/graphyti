@@ -4,6 +4,28 @@ type QueryOptions = {
   dryRun?: boolean;
 };
 
+export type GraphStatus = {
+  graphReady: boolean;
+  nodeCount?: number;
+};
+
+export type GraphInitResult = {
+  success: boolean;
+  nodeCount: number;
+  edgeCount: number;
+};
+
+export type QueryResult = {
+  query: string;
+  filesWritten: string[];
+  blastRadiusSize: number;
+  verification: string;
+  graphIndexUpdated: boolean;
+  elapsedMs: number;
+  exitCode: number;
+  branch?: string;
+};
+
 function apiUrl(path: string) {
   return `${API_BASE_URL.replace(/\/$/, '')}${path}`;
 }
@@ -29,16 +51,18 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
 }
 
-export function getStatus<T = unknown>() {
-  return request<T>('/api/status');
+export function getStatus() {
+  return request<GraphStatus>('/api/status');
 }
 
-export function initGraph<T = unknown>() {
-  return request<T>('/api/init', { method: 'POST' });
+export function initGraph() {
+  return request<GraphInitResult>('/api/init', { method: 'POST' });
 }
 
-export function runQuery<T = unknown>(query: string, opts?: QueryOptions) {
-  return request<T>('/api/query', {
+export function runQuery(query: string, opts?: QueryOptions) {
+  // React Native fetch has no default request timeout; longer Graphyti runs are
+  // intentionally allowed to finish rather than being aborted by the client.
+  return request<QueryResult>('/api/query', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ query, ...(opts?.dryRun === undefined ? {} : { dryRun: opts.dryRun }) }),
