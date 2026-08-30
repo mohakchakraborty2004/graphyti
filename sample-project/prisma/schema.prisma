@@ -14,7 +14,7 @@ model User {
   posts    Post[]
   password String
   username  String
-  phone  String
+  mobilePhone  String
   bio      String?
   likes     LikeDislike[]
 }
