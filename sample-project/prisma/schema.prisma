@@ -46,5 +46,6 @@ model Comment {
   postId  Int
   post    Post    @relation(fields: [postId], references: [id])
   streamDemo  Boolean
+  featured  Boolean
 }
 
