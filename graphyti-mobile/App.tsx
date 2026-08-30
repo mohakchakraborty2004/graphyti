@@ -57,20 +57,32 @@ function ResultsView({ result, onReset }: { result: QueryResult; onReset: () => 
       )}
 
       <Text style={styles.sectionTitle}>Blast radius</Text>
-      {result.blastRadiusSize > 0 ? (
-        <Text style={styles.muted}>
-          Computed for {result.blastRadiusSize} affected file(s). This API response does not include their names or reasons yet.
-        </Text>
+      {result.blastRadius.length > 0 ? (
+        result.blastRadius.flatMap((blast) => [
+          ...blast.affectedRoutes,
+          ...blast.affectedComponents,
+          ...blast.affectedFiles,
+        ]).map((file) => (
+          <Text key={file.id} style={styles.fileRow}>{file.filePath}: {file.reason}</Text>
+        ))
       ) : (
         <Text style={styles.muted}>No blast-radius changes were reported.</Text>
       )}
 
       <Text style={styles.sectionTitle}>Verification</Text>
-      <Text style={styles.muted}>
-        {result.verification === 'skipped'
-          ? 'Local and graph check details were not returned by the API for this query.'
-          : `Verification: ${result.verification}`}
-      </Text>
+      {result.verification.length > 0 ? result.verification.map((verification, index) => (
+        <View key={`${verification.summary}-${index}`} style={styles.verificationCard}>
+          <Text style={styles.muted}>Local check: {verification.localCheck.missed === 0 ? 'passed' : 'failed'} ({verification.localCheck.addressed} addressed, {verification.localCheck.missed} missed)</Text>
+          <Text style={styles.muted}>
+            Graph check: {verification.graphCheckSkipped
+              ? 'skipped'
+              : verification.graphCheck.missed === 0 && verification.graphCheck.staleNodesFound === 0
+                ? 'passed'
+                : 'completed with warnings'}
+          </Text>
+          <Text style={styles.muted}>{verification.resolutionReason}</Text>
+        </View>
+      )) : <Text style={styles.muted}>No breaking-change verification was needed.</Text>}
 
       <Text style={styles.elapsed}>Completed in {(result.elapsedMs / 1000).toFixed(1)}s</Text>
       <Button title="Run another query" onPress={onReset} />
@@ -318,5 +330,12 @@ const styles = StyleSheet.create({
     color: '#6b7280',
     marginVertical: 28,
     textAlign: 'center',
+  },
+  verificationCard: {
+    backgroundColor: '#f3f4f6',
+    borderRadius: 6,
+    gap: 4,
+    marginBottom: 8,
+    padding: 10,
   },
 });

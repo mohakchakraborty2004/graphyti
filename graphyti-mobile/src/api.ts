@@ -19,11 +19,39 @@ export type QueryResult = {
   query: string;
   filesWritten: string[];
   blastRadiusSize: number;
-  verification: string;
+  blastRadius: BlastRadiusResult[];
+  verification: VerificationResult[];
   graphIndexUpdated: boolean;
   elapsedMs: number;
   exitCode: number;
   branch?: string;
+};
+
+export type AffectedNode = {
+  id: string;
+  name: string;
+  filePath: string;
+  reason: string;
+};
+
+export type BlastRadiusResult = {
+  changedNode: { id: string; name: string; kind: string; filePath: string };
+  affectedRoutes: AffectedNode[];
+  affectedComponents: AffectedNode[];
+  affectedFiles: AffectedNode[];
+  advisoryFiles: AffectedNode[];
+  affectedFilePaths: string[];
+  filteredOut: Array<{ id: string; filePath: string }>;
+  staleNodes: Array<{ id: string; filePath: string }>;
+};
+
+export type VerificationResult = {
+  localCheck: { addressed: number; missed: number; report: unknown };
+  graphCheck: { addressed: number; missed: number; staleNodesFound: number; report: unknown; indexPending: boolean };
+  graphCheckSkipped: boolean;
+  overallPassed: boolean;
+  summary: string;
+  resolutionReason: string;
 };
 
 function apiUrl(path: string) {
