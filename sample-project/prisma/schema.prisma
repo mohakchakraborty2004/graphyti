@@ -33,6 +33,7 @@ model Post {
   comments  Comment[]
   likes     LikeDislike[]
   summary  String?
+  mobileNotes  String?
 }
 
 model Comment {
