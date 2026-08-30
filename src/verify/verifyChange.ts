@@ -5,6 +5,7 @@ import { extractTypeScriptFromSource } from "../extract/tsExtractor";
 import { findPrismaSchemas, extractPrismaSchema } from "../extract/prismaExtractor";
 import type { BlastRadiusResult, AffectedNode } from "../graph/blastRadius";
 import type { PrismaModel } from "../extract/types";
+import { findFieldReferences } from "./symbolRefs";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -86,165 +87,186 @@ function loadModels(
 }
 
 // ---------------------------------------------------------------------------
-// Per-node verification logic
+// Per-node verification
 // ---------------------------------------------------------------------------
 
-/**
- * For an ApiRoute node affected by a breaking change, verify that the generated
- * content no longer references the old field and (if provided) now references
- * the new field.
- *
- * Strategy: run extractTypeScriptFromSource on the generated content and check
- * the routeModelUsages field names.  If the old field is still present in any
- * usage → missed.  If the content wasn't regenerated at all → missed.
- */
-function verifyRoute(
-  node: AffectedNode,
-  oldFields: string[],
-  newFields: string[],
-  genMap: Map<string, string>,
-  models: PrismaModel[],
-  projectRoot: string
-): "addressed" | "missed" | "not-generated" {
-  const content = genMap.get(node.filePath);
-  if (content === undefined) {
-    // File wasn't regenerated — check on-disk content to see if it actually
-    // references the removed field. If not, no changes are needed.
-    const absPath = path.resolve(projectRoot, node.filePath);
-    if (!fs.existsSync(absPath)) return "not-generated";
-    const diskContent = fs.readFileSync(absPath, "utf-8");
-    for (const oldField of oldFields) {
-      const re = new RegExp(`\\b${escapeRegex(oldField)}\\b`);
-      if (re.test(diskContent)) return "not-generated";  // References removed field but wasn't updated
-    }
-    return "addressed";  // Doesn't reference removed field — no changes needed
-  }
-
-  const absPath = path.resolve(projectRoot, node.filePath);
-  const result = extractTypeScriptFromSource(projectRoot, absPath, content, models);
-
-  // Collect all field names referenced by any routeModelUsage in this file
-  const referencedFields = new Set<string>(
-    result.routeModelUsages.flatMap((u) => u.fieldNames)
-  );
-
-  // Old (removed/renamed) fields must no longer appear
-  for (const oldField of oldFields) {
-    if (referencedFields.has(oldField)) return "missed";
-  }
-
-  return "addressed";
+interface NodeVerdict {
+  outcome: "addressed" | "missed";
+  detail: string;
 }
 
 /**
- * For a Component node, verify via extractTypeScriptFromSource's componentFetches
- * that the old field is no longer rendered.
+ * Verify one blast-radius node against the content that is about to be written.
+ *
+ * The gate is `findFieldReferences` — a syntactic search for the old name in
+ * positions where a field name can appear. It is the same predicate the blast
+ * radius used to put this file in the radius, which is what keeps the two
+ * halves honest: a verifier judging by a different rule would either demand
+ * changes the radius never asked for, or clear files it flagged.
+ *
+ * It is also strictly stronger than what came before. The previous version
+ * asked the extractor which fields a route "used", so a file the extractor
+ * failed to parse produced an empty set and passed silently.
+ *
+ * The extractor pass is kept as a second opinion for routes and components. It
+ * can only reject a file the syntactic gate cleared, never clear one it
+ * rejected, so an extractor regression cannot weaken the guarantee.
  */
-function verifyComponent(
+function verifyNode(
   node: AffectedNode,
   oldFields: string[],
   genMap: Map<string, string>,
   models: PrismaModel[],
   projectRoot: string
-): "addressed" | "missed" | "not-generated" {
-  const content = genMap.get(node.filePath);
-  if (content === undefined) {
-    // File wasn't regenerated — check on-disk content
-    const absPath = path.resolve(projectRoot, node.filePath);
-    if (!fs.existsSync(absPath)) return "not-generated";
-    const diskContent = fs.readFileSync(absPath, "utf-8");
-    for (const oldField of oldFields) {
-      const re = new RegExp(`\\b${escapeRegex(oldField)}\\b`);
-      if (re.test(diskContent)) return "not-generated";
-    }
-    return "addressed";
-  }
-
+): NodeVerdict {
   const absPath = path.resolve(projectRoot, node.filePath);
-  const result = extractTypeScriptFromSource(projectRoot, absPath, content, models);
+  const generated = genMap.get(node.filePath);
+  const regenerated = generated !== undefined;
 
-  const referencedFields = new Set<string>(
-    result.componentFetches.flatMap((f) => f.fieldNames)
-  );
-
-  for (const oldField of oldFields) {
-    if (referencedFields.has(oldField)) return "missed";
-  }
-
-  return "addressed";
-}
-
-/**
- * For a plain File node, a lighter check: verify the old field name doesn't
- * appear as a bare identifier in the generated content.  This is intentionally
- * conservative (no AST for arbitrary .ts files) — a text search is good enough
- * for utility/lib files and avoids false negatives on imports/comments.
- */
-function verifyFile(
-  node: AffectedNode,
-  oldFields: string[],
-  genMap: Map<string, string>
-): "addressed" | "missed" | "not-generated" {
-  const content = genMap.get(node.filePath);
-  if (content === undefined) {
-    // File wasn't regenerated — check on-disk content
-    if (!fs.existsSync(node.filePath)) return "not-generated";
-    const diskContent = fs.readFileSync(node.filePath, "utf-8");
-    for (const oldField of oldFields) {
-      const re = new RegExp(`\\b${escapeRegex(oldField)}\\b`);
-      if (re.test(diskContent)) return "not-generated";
+  let content: string;
+  if (generated !== undefined) {
+    content = generated;
+  } else {
+    if (!fs.existsSync(absPath)) {
+      return {
+        outcome: "missed",
+        detail: "in the blast radius but missing from disk (stale graph — run 'graphyti init-graph')",
+      };
     }
-    return "addressed";
+    content = fs.readFileSync(absPath, "utf-8");
   }
 
-  // Word-boundary search: look for field name used as an identifier
-  for (const oldField of oldFields) {
-    const re = new RegExp(`\\b${escapeRegex(oldField)}\\b`);
-    if (re.test(content)) return "missed";
+  // The same predicate the blast radius used to decide this file belongs here.
+  // If the two ever diverge, verification demands changes the radius never
+  // asked for, or clears files the radius flagged.
+  //
+  // Positions are reported, not just field names: a minified file can hold
+  // several references on one line, and "still references title" gives neither
+  // the model nor the user anything to act on.
+  const lingering = oldFields.flatMap((f) =>
+    findFieldReferences(content, node.filePath, f).map((r) => `${f} at line ${r.line} (${r.kind})`)
+  );
+  if (lingering.length > 0) {
+    return {
+      outcome: "missed",
+      detail: regenerated
+        ? `still references ${lingering.join(", ")} after the edit`
+        : `references ${lingering.join(", ")} and was not updated`,
+    };
   }
-  return "addressed";
-}
 
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
+  if (node.id.startsWith("route:") || node.id.startsWith("component:")) {
+    try {
+      const result = extractTypeScriptFromSource(projectRoot, absPath, content, models);
+      const referenced = new Set<string>([
+        ...result.routeModelUsages.flatMap((u) => u.fieldNames),
+        ...result.componentFetches.flatMap((f) => f.fieldNames),
+      ]);
+      const stillBound = oldFields.filter((f) => referenced.has(f));
+      if (stillBound.length > 0) {
+        return {
+          outcome: "missed",
+          detail: `AST still binds ${stillBound.join(", ")} to the changed model`,
+        };
+      }
+    } catch {
+      // A parse failure is not evidence of a miss. The text gate above has
+      // already decided, and it does not depend on parsing.
+    }
+  }
 
-// ---------------------------------------------------------------------------
-// Extract old field names from blast-radius reasons
-// ---------------------------------------------------------------------------
-
-/**
- * Given a blast-radius node, derive which old field names (the ones being
- * renamed/removed) are the ones to check for lingering references.
- *
- * The reason strings produced by blastRadius.ts encode the field info in
- * node.name for ModelField nodes.  For model-level blast radius we fall back
- * to the breaking changes list passed in.
- */
-function oldFieldsForNode(
-  node: AffectedNode,
-  breakingFieldNames: string[]
-): string[] {
-  // breakingFieldNames is the authoritative list — always use it
-  return breakingFieldNames;
+  return {
+    outcome: "addressed",
+    detail: regenerated ? "updated" : "does not reference the changed field",
+  };
 }
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
+/** One breaking change, and the field names it is allowed to be checked for. */
+export interface VerifyTarget {
+  blastRadius: BlastRadiusResult;
+  /** The field names *this* change breaks — never another change's. */
+  oldFields: string[];
+}
+
 /**
- * Mechanically verify that every file listed in `blastRadius` was regenerated
- * and no longer references the old/removed/renamed fields described by
- * `breakingFieldNames`.
+ * Mechanically verify that every file in every blast radius was brought back
+ * into agreement with the schema.
  *
- * This is deterministic AST + text parsing — not an LLM call.
+ * Deterministic AST + text parsing — no LLM, no network.
  *
- * @param blastRadius       - Result from computeBlastRadius.
- * @param breakingFieldNames - The specific field names that were removed/renamed
- *                            (from the schema diff's breaking changes).
- * @param generatedFiles    - In-memory content from the current codeGen pass.
- * @param projectRoot       - Repo root (defaults to cwd).
+ * Each target is checked against its own field names. Flattening the names
+ * across targets, as the caller used to do, checks model A's files for model
+ * B's renamed field and reports a miss that no edit could ever fix.
+ */
+export function verifyStructuralChange(
+  targets: VerifyTarget[],
+  generatedFiles: GeneratedFile[],
+  projectRoot: string = process.cwd()
+): VerifyReport {
+  const genMap = buildGenMap(generatedFiles, projectRoot);
+  const models = loadModels(projectRoot, genMap);
+
+  // A file can sit in more than one blast radius. Keep one verdict per path,
+  // and let a miss win over an addressed so a real failure is never masked.
+  const verdicts = new Map<string, { entry: VerifyEntry; missed: boolean }>();
+
+  for (const { blastRadius, oldFields } of targets) {
+    if (oldFields.length === 0) continue;
+
+    const nodes: AffectedNode[] = [
+      ...blastRadius.affectedRoutes,
+      ...blastRadius.affectedComponents,
+      ...blastRadius.affectedFiles,
+    ];
+
+    for (const node of nodes) {
+      const verdict = verifyNode(node, oldFields, genMap, models, projectRoot);
+      const missed = verdict.outcome === "missed";
+      const existing = verdicts.get(node.filePath);
+      if (existing && (existing.missed || !missed)) continue;
+      verdicts.set(node.filePath, {
+        missed,
+        entry: {
+          filePath: node.filePath,
+          reason: missed ? `${node.reason} — ${verdict.detail}` : node.reason,
+        },
+      });
+    }
+  }
+
+  const addressed: VerifyEntry[] = [];
+  const missed: VerifyEntry[] = [];
+  for (const { entry, missed: isMissed } of verdicts.values()) {
+    (isMissed ? missed : addressed).push(entry);
+  }
+  addressed.sort((a, b) => a.filePath.localeCompare(b.filePath));
+  missed.sort((a, b) => a.filePath.localeCompare(b.filePath));
+
+  const retryPrompt =
+    missed.length === 0
+      ? ""
+      : [
+          "\n== VERIFICATION FAILED — these files were not brought in line ==",
+          "Every file below still contradicts the schema change. Fix all of them.",
+          "Produce minimal oldText/newText edits; do not touch anything else.\n",
+          ...missed.map((m) => `  - ${m.filePath}\n    ${m.reason}`),
+          "\nDo not skip any of these. Every file listed must be updated.",
+        ].join("\n");
+
+  return { addressed, missed, retryPrompt };
+}
+
+/**
+ * Single-target convenience wrapper.
+ *
+ * @param blastRadius        - Result from computeBlastRadius.
+ * @param breakingFieldNames - Field names removed/renamed by this one change.
+ * @param generatedFiles     - In-memory content from the current codeGen pass.
+ * @param projectRoot        - Repo root (defaults to cwd).
  */
 export function verifyBlastRadiusAddressed(
   blastRadius: BlastRadiusResult,
@@ -252,64 +274,9 @@ export function verifyBlastRadiusAddressed(
   generatedFiles: GeneratedFile[],
   projectRoot: string = process.cwd()
 ): VerifyReport {
-  if (breakingFieldNames.length === 0) {
-    // Nothing to verify — additive-only change
-    return { addressed: [], missed: [], retryPrompt: "" };
-  }
-
-  const genMap = buildGenMap(generatedFiles, projectRoot);
-  const models = loadModels(projectRoot, genMap);
-
-  const addressed: VerifyEntry[] = [];
-  const missed: VerifyEntry[] = [];
-
-  const allAffected: AffectedNode[] = [
-    ...blastRadius.affectedRoutes,
-    ...blastRadius.affectedComponents,
-    ...blastRadius.affectedFiles,
-  ];
-
-  for (const node of allAffected) {
-    const oldFields = oldFieldsForNode(node, breakingFieldNames);
-    let outcome: "addressed" | "missed" | "not-generated";
-
-    // Classify by node kind (encoded in the id prefix)
-    if (node.id.startsWith("route:")) {
-      outcome = verifyRoute(node, oldFields, [], genMap, models, projectRoot);
-    } else if (node.id.startsWith("component:")) {
-      outcome = verifyComponent(node, oldFields, genMap, models, projectRoot);
-    } else {
-      // file: or anything else — text search
-      outcome = verifyFile(node, oldFields, genMap);
-    }
-
-    const entry: VerifyEntry = { filePath: node.filePath, reason: node.reason };
-
-    if (outcome === "addressed") {
-      addressed.push(entry);
-    } else {
-      // "missed" and "not-generated" are both failures
-      missed.push({
-        ...entry,
-        reason:
-          outcome === "not-generated"
-            ? `${node.reason} — file was NOT regenerated`
-            : `${node.reason} — still references old field(s): ${oldFields.join(", ")}`,
-      });
-    }
-  }
-
-  // Build retry prompt if there are misses
-  const retryPrompt =
-    missed.length === 0
-      ? ""
-      : [
-          "\n== VERIFICATION FAILED — you missed updating these files ==",
-          "The following files in the blast radius were not correctly updated.",
-          "You MUST fix all of them in your next response:\n",
-          ...missed.map((m) => `  - ${m.filePath}\n    reason: ${m.reason}`),
-          "\nDo not skip any of these. Every file listed must be updated.",
-        ].join("\n");
-
-  return { addressed, missed, retryPrompt };
+  return verifyStructuralChange(
+    [{ blastRadius, oldFields: breakingFieldNames }],
+    generatedFiles,
+    projectRoot
+  );
 }

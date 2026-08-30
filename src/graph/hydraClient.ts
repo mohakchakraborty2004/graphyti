@@ -36,8 +36,29 @@ export function hydraErrorMessage(
   return parts.join(" ");
 }
 
-export async function waitForIndexed(ids: string[]): Promise<void> {
-  if (ids.length === 0) return;
+export interface WaitForIndexedOptions {
+  /**
+   * When false, a timeout returns the still-pending ids instead of throwing.
+   *
+   * HydraDB can leave an id in `queued` indefinitely for reasons that have
+   * nothing to do with the correctness of what we uploaded. Callers that hold
+   * state worth keeping (the local graph cache, a staged verification) must not
+   * lose it to a remote stall, so they opt out and degrade to a warning.
+   */
+  throwOnTimeout?: boolean;
+}
+
+/**
+ * Block until every id reports a ready indexing status.
+ *
+ * @returns the ids still pending when the wait gave up — empty on full success.
+ */
+export async function waitForIndexed(
+  ids: string[],
+  opts: WaitForIndexedOptions = {}
+): Promise<string[]> {
+  if (ids.length === 0) return [];
+  const throwOnTimeout = opts.throwOnTimeout ?? true;
   const { database, collection } = requireHydraConfig();
 
   const pending = new Set(ids);
@@ -45,9 +66,12 @@ export async function waitForIndexed(ids: string[]): Promise<void> {
 
   while (pending.size > 0) {
     if (Date.now() - started > MAX_WAIT_MS) {
-      throw new Error(
-        `Timed out after ${MAX_WAIT_MS / 1000}s waiting for HydraDB indexing. Still pending: ${[...pending].join(", ")}`
-      );
+      if (throwOnTimeout) {
+        throw new Error(
+          `Timed out after ${MAX_WAIT_MS / 1000}s waiting for HydraDB indexing. Still pending: ${[...pending].join(", ")}`
+        );
+      }
+      return [...pending];
     }
 
     let envelope;
@@ -101,7 +125,8 @@ export async function waitForIndexed(ids: string[]): Promise<void> {
       }
     }
 
-    if (pending.size === 0) return;
+    if (pending.size === 0) return [];
     await new Promise((r) => setTimeout(r, POLL_MS));
   }
+  return [];
 }

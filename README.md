@@ -36,10 +36,14 @@ two-layer structural validation approach.
 After code generation, Graphyti runs two independent verification passes:
 
 1. **Local deterministic check** (`src/verify/verifyChange.ts`) — re-parses
-   every file in the blast radius using AST extraction and text matching to
-   confirm that no file still references a removed or renamed field. This is
-   fully deterministic: no network calls, no HydraDB timing dependencies, no LLM
-   calls. If this check fails, the write is blocked immediately.
+   every file in the blast radius and confirms that none still references a
+   removed or renamed field, using the same syntactic predicate the blast radius
+   used to select those files (`src/verify/symbolRefs.ts`). Sharing the predicate
+   is what keeps the two halves honest: a verifier that judged files by a
+   different rule would either demand changes the radius never asked for, or
+   clear files it flagged. This is fully deterministic: no network calls, no
+   HydraDB timing dependencies, no LLM calls. If it fails, the write is blocked
+   immediately.
 
 2. **HydraDB graph round-trip check** (`src/graph/hydraVerify.ts`) — stages the
    proposed graph state into HydraDB, queries the relations for each consumer
@@ -49,19 +53,34 @@ After code generation, Graphyti runs two independent verification passes:
    which would leave the graph out of sync with disk even after the local files
    are correct.
 
-**Resolution rule**: local check is the primary gate. If it fails, the write is
-blocked regardless of the graph check. If local passes but the graph check finds
-stale nodes, the write is also blocked — that is a real hygiene bug. If local
-passes and the graph check only disagrees on soft/inferred relations that were
-never part of the explicit expected delta, a warning is logged but the write is
-not blocked — HydraDB's automatic entity/relation extraction from ingested
-content can surface extra inferred relations that aren't errors.
+**Resolution rule**: the local check is the only blocking gate. If it fails, the
+write is blocked and the graph check is skipped entirely — there is no reason to
+pay for a staging/ingestion/query cycle on a result already destined for the bin.
+
+Everything the graph check finds is a warning. That includes stale nodes, which
+an earlier design blocked on. Two reasons it should not:
+
+- **It is a hygiene problem, not a correctness one.** When the local check has
+  passed, the files and the schema on disk are provably consistent. What a stale
+  relation degrades is future retrieval quality, until the next `init-graph` —
+  which the warning tells you to run. Rolling back correct code over that is
+  disproportionate.
+- **Detection is inherently racy.** HydraDB re-derives relations asynchronously,
+  and `indexingStatus: completed` does not mean that has happened. A correct
+  rename shows the old *and* new relation side by side for as long as the
+  previous extraction batch remains current. Blocking on it failed correct runs
+  in practice, which is the opposite of what a gate is for.
+
+Stale findings are still filtered before being reported: a relation is only
+called stale if the batch carrying it was written *after* the change was staged,
+which distinguishes a genuinely re-emitted dead reference from one that simply
+has not been superseded yet.
 
 The CLI output shows both checks distinctly:
 
 ```
   Local structural check: PASSED (3/3 files verified)
-  Graph structural check: PASSED (3/3 relations confirmed, 0 stale nodes)
+  Graph structural check: PASSED (3 relations confirmed, 0 stale nodes)
 ```
 
 so it is visibly two independent layers, not one combined pass/fail.
@@ -82,15 +101,15 @@ HydraDB is given the edges rather than left to infer them from prose.
 
 | What | Where |
 | --- | --- |
-| `client.context.ingest` (batched upsert, `upsert: "true"`) | [`src/graph/ingest.ts:195`](src/graph/ingest.ts#L195) |
+| `client.context.ingest` (batched upsert, `upsert: "true"`) | [`src/graph/ingest.ts:196`](src/graph/ingest.ts#L196) |
 | Forceful relations — `relations: { ids: [...] }` on every node | [`src/graph/ingest.ts:167`](src/graph/ingest.ts#L167) |
-| `nodeToAppKnowledgeItem()` — node → HydraDB item, incl. `tenant_metadata` (`node_kind`, `file_path`) | [`src/graph/ingest.ts:149`](src/graph/ingest.ts#L149) |
-| `ingestGraph()` — full-graph entry point, 200-item batches | [`src/graph/ingest.ts:249`](src/graph/ingest.ts#L249) |
+| `nodeToAppKnowledgeItem()` — node → HydraDB item, incl. `tenant_metadata` (`node_kind`, `file_path`) | [`src/graph/ingest.ts:150`](src/graph/ingest.ts#L150) |
+| `ingestGraph()` — full-graph entry point, 200-item batches | [`src/graph/ingest.ts:250`](src/graph/ingest.ts#L250) |
 | Per-item failure handling (`errorCode` / `request_id` surfaced, run aborts) | [`src/graph/ingest.ts:230`](src/graph/ingest.ts#L230) |
-| `client.context.delete` — drop nodes that no longer exist | [`src/graph/ingest.ts:269`](src/graph/ingest.ts#L269) |
-| `client.context.status` polling until `graph_creation` / `completed` | [`src/graph/hydraClient.ts:55`](src/graph/hydraClient.ts#L55) |
+| `client.context.delete` — drop nodes that no longer exist | [`src/graph/ingest.ts:304`](src/graph/ingest.ts#L304) |
+| `client.context.status` polling until `graph_creation` / `completed` | [`src/graph/hydraClient.ts:79`](src/graph/hydraClient.ts#L79) |
 
-Invoked by `graphyti init-graph` → [`src/cli/init-graph.ts:8`](src/cli/init-graph.ts#L8).
+Invoked by `graphyti init-graph` → [`src/cli/init-graph.ts:6`](src/cli/init-graph.ts#L6).
 
 ### 2. Incremental updates — `src/graph/incremental.ts`
 
@@ -99,10 +118,10 @@ local graph map, so the graph stays current without a full re-ingest.
 
 | What | Where |
 | --- | --- |
-| `reingestFile()` — re-extract one file, diff, upsert + delete | [`src/graph/incremental.ts:35`](src/graph/incremental.ts#L35) |
-| Upsert/delete sets computed from the previous graph map | [`src/graph/incremental.ts:52`](src/graph/incremental.ts#L52) |
+| `reingestFile()` — re-extract one file, diff, upsert + delete | [`src/graph/incremental.ts:36`](src/graph/incremental.ts#L36) |
+| Upsert/delete sets computed from the previous graph map | [`src/graph/incremental.ts:53`](src/graph/incremental.ts#L53) |
 | `deleteKnowledgeIds` for nodes the file no longer owns | [`src/graph/incremental.ts:64`](src/graph/incremental.ts#L64) |
-| `client.context.ingest` — changed nodes only | [`src/graph/incremental.ts:78`](src/graph/incremental.ts#L78) |
+| `client.context.ingest` — changed nodes only | [`src/graph/incremental.ts:79`](src/graph/incremental.ts#L79) |
 | `waitForIndexed` before the run reports success | [`src/graph/incremental.ts:115`](src/graph/incremental.ts#L115) |
 
 Called per written file from [`src/index.ts:204`](src/index.ts#L204).
@@ -124,18 +143,34 @@ Consumed at [`src/index.ts:73`](src/index.ts#L73).
 
 ### 4. Blast-radius cross-check — `src/graph/blastRadius.ts`
 
-Blast radius walks the local graph map for speed, then cross-checks its
-hop-1 neighbours against HydraDB's own view of the same node's relations and
-warns on any disagreement (non-blocking — a stale index degrades to a warning
-rather than a wrong answer).
+The radius is seeded from the **changed field**, not from its model, and follows
+edges in the direction that carries a dependency: routes that select the field,
+components that render it, components that fetch an affected route, files that
+import an affected file. Seeding from the model instead reaches every dependent
+of every other field on that model, and through relation fields the dependents
+of neighbouring models too — renaming `User.phone` would report the files behind
+`/api/posts` as affected.
+
+Every candidate then has to earn its place: the file must **syntactically
+reference the field** (`post.title`, `{ title?: string }`, `select: { title }`),
+not merely contain the word. That gate runs in both directions — it drops graph
+neighbours that never touch the field, and it picks up files the extractor could
+not link, which happens whenever a field name cannot be pinned to exactly one
+queried model. Files that merely mention the name (a page's
+`metadata = { title }`, a parameter called `title`) are listed as advisory and
+never enforced.
+
+The local map is walked for speed, then cross-checked against HydraDB's own view
+of the node's relations, warning on any genuinely stale remote node
+(non-blocking — a stale index degrades to a warning rather than a wrong answer).
 
 | What | Where |
 | --- | --- |
-| **`client.context.relations`** — HydraDB's neighbours for the changed node | [`src/graph/blastRadius.ts:142`](src/graph/blastRadius.ts#L142) |
-| `checkHydraConsistency()` — the cross-check itself | [`src/graph/blastRadius.ts:130`](src/graph/blastRadius.ts#L130) |
-| Neighbour ids read out of the returned relation triplets | [`src/graph/blastRadius.ts:155`](src/graph/blastRadius.ts#L155) |
-| local-only / HydraDB-only diff → agree ✅ or warn ⚠️ | [`src/graph/blastRadius.ts:168`](src/graph/blastRadius.ts#L168) |
-| `computeBlastRadius()` — 3-hop BFS + the cross-check | [`src/graph/blastRadius.ts:211`](src/graph/blastRadius.ts#L211) |
+| **`client.context.relations`** — HydraDB's neighbours for the changed node | [`src/graph/blastRadius.ts:248`](src/graph/blastRadius.ts#L248) |
+| `checkHydraConsistency()` — the cross-check itself | [`src/graph/blastRadius.ts:236`](src/graph/blastRadius.ts#L236) |
+| Endpoint names read out of the returned relation triplets | [`src/graph/blastRadius.ts:244`](src/graph/blastRadius.ts#L244) |
+| remote ids absent from the local graph → agree ✅ or warn ⚠️ | [`src/graph/blastRadius.ts:251`](src/graph/blastRadius.ts#L251) |
+| `computeBlastRadius()` — directed walk + reference gate + the cross-check | [`src/graph/blastRadius.ts:352`](src/graph/blastRadius.ts#L352) |
 
 Driven by the schema diff in [`src/generate/preWriteCheck.ts:295`](src/generate/preWriteCheck.ts#L295), and
 consumed by the unified structural validator at [`src/verify/unifiedValidation.ts`](src/verify/unifiedValidation.ts)

@@ -9,6 +9,44 @@ import {
 import {
   extractPrismaSchemaFromSource,
 } from "../extract/prismaExtractor";
+import { isPrismaSchemaPath, toPosix } from "../utils/paths";
+
+// ---------------------------------------------------------------------------
+// Timeout helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Race a promise against a deadline, always clearing the timer.
+ *
+ * The hand-rolled `Promise.race` these calls used left a live `setTimeout`
+ * behind on every success, which keeps the event loop alive for the full
+ * timeout after the work is done.
+ */
+export async function withTimeout<T>(
+  work: Promise<T>,
+  ms: number,
+  label: string
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new TimeoutError(`${label} timed out after ${Math.round(ms / 1000)}s`)),
+      ms
+    );
+  });
+  try {
+    return await Promise.race([work, deadline]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+export class TimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TimeoutError";
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Zod schemas — validate every structured LLM output before use
@@ -159,6 +197,47 @@ function normalizeEditPlan(raw: unknown): unknown {
   });
 }
 
+/**
+ * Structural rules the Zod shapes cannot express.
+ *
+ * These are the ways a syntactically valid plan can still be wrong in a way
+ * that silently disarms the pipeline, so they are rejected loudly and fed back
+ * to the model on the retry rather than executed.
+ */
+function checkPlanSemantics(plan: EditPlan): string | null {
+  const problems: string[] = [];
+
+  for (const op of plan) {
+    const filePath =
+      op.type === "file" || op.type === "create_file" ? op.filePath : null;
+    if (filePath === null) continue;
+
+    const normalized = toPosix(filePath);
+
+    // A Prisma schema reached through a text edit skips applySchemaEdit, the
+    // blast radius, the migrate/generate injection and structural verification
+    // — every guarantee this tool exists to provide. It is always a bug, and it
+    // then fails anyway on a stale oldText match.
+    if (isPrismaSchemaPath(normalized)) {
+      problems.push(
+        `${op.type} operation targets ${normalized}: schema.prisma must be changed with a {"type":"schema"} operation (add_field / remove_field / rename_field / change_type / create_model / remove_model), never a text edit`
+      );
+      continue;
+    }
+
+    if (normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized)) {
+      problems.push(`${op.type} operation uses an absolute path (${normalized}); use a path relative to the project root`);
+      continue;
+    }
+
+    if (normalized.split("/").includes("..")) {
+      problems.push(`${op.type} operation escapes the project root (${normalized})`);
+    }
+  }
+
+  return problems.length > 0 ? problems.join("; ") : null;
+}
+
 export function validateEditPlan(raw: unknown): {
   ok: true;
   plan: EditPlan;
@@ -167,15 +246,19 @@ export function validateEditPlan(raw: unknown): {
   reason: string;
 } {
   const result = EditPlanSchema.safeParse(normalizeEditPlan(raw));
-  if (result.success) {
-    return { ok: true, plan: result.data };
+  if (!result.success) {
+    return {
+      ok: false,
+      reason: result.error.issues
+        .map((i) => `${i.path.join(".")}: ${i.message}`)
+        .join("; "),
+    };
   }
-  return {
-    ok: false,
-    reason: result.error.issues
-      .map((i) => `${i.path.join(".")}: ${i.message}`)
-      .join("; "),
-  };
+
+  const semantic = checkPlanSemantics(result.data);
+  if (semantic) return { ok: false, reason: semantic };
+
+  return { ok: true, plan: result.data };
 }
 
 // ---------------------------------------------------------------------------
@@ -289,42 +372,78 @@ RULES:
 - Keep descriptions short (under 15 words). Use imperative mood (e.g. "Add login route", "Rename field").
 - Order steps logically — prerequisites first.`;
 
+/**
+ * Classification is the cheapest call in the pipeline but was given the
+ * tightest budget — 15s for a prompt carrying the entire retrieved context,
+ * while intent extraction got 30s for a larger one. On a queued or free-tier
+ * model that reliably expired, and the timeout escaped `classifyQueryWithRetry`
+ * (which only ever retried *validation* failures), killing the whole run before
+ * a single file was touched.
+ */
+const CLASSIFICATION_TIMEOUT_MS = 60_000;
+
 export async function classifyQuery(
   query: string,
   context: string
 ): Promise<{ classification: Classification; raw: unknown }> {
   const contents = `${CLASSIFICATION_PROMPT}\n\nUser request: ${query}\n\nProject context:\n${context}\n\nReturn ONLY a JSON object. No prose, no explanation.`;
 
-  const genPromise = generateCompletion(contents, { responseFormat: "json" });
-
-  const timeoutPromise = new Promise<never>((_, reject) =>
-    setTimeout(() => reject(new Error("Classification timed out after 15s")), 15_000)
+  const text = await withTimeout(
+    generateCompletion(contents, { responseFormat: "json" }),
+    CLASSIFICATION_TIMEOUT_MS,
+    "Classification"
   );
-
-  const text = await Promise.race([genPromise, timeoutPromise]);
   const raw = JSON.parse(text);
   return { classification: raw as Classification, raw };
 }
 
+/** A single-step plan — what any request reduces to when classification fails. */
+export function singleStepClassification(query: string): Classification {
+  return {
+    decomposable: false,
+    steps: [{ description: query, kind: "structural_edit" }],
+  };
+}
+
+/**
+ * Classify with one retry, covering timeouts and transport errors as well as
+ * validation failures.
+ *
+ * Never throws: classification is an optimisation, not a correctness gate. If
+ * it cannot be obtained the request is treated as a single step, which is what
+ * every request did before this stage existed.
+ */
 export async function classifyQueryWithRetry(
   query: string,
   context: string
-): Promise<Classification> {
-  const first = await classifyQuery(query, context);
-  const check = validateClassification(first.classification);
-  if (check.ok) return check.classification;
+): Promise<{ classification: Classification; degraded: string | null }> {
+  let lastReason: string;
 
-  const retry = await classifyQuery(
-    `${query}\n\nPREVIOUS ATTEMPT FAILED VALIDATION: ${check.reason}\nFix the output and try again.`,
-    context
-  );
-  const retryCheck = validateClassification(retry.classification);
-  if (!retryCheck.ok) {
-    throw new Error(
-      `Classification failed validation after retry: ${retryCheck.reason}`
-    );
+  try {
+    const first = await classifyQuery(query, context);
+    const check = validateClassification(first.classification);
+    if (check.ok) return { classification: check.classification, degraded: null };
+    lastReason = check.reason;
+  } catch (err) {
+    lastReason = err instanceof Error ? err.message : String(err);
   }
-  return retryCheck.classification;
+
+  try {
+    const retry = await classifyQuery(
+      `${query}\n\nPREVIOUS ATTEMPT FAILED: ${lastReason}\nFix the output and try again.`,
+      context
+    );
+    const retryCheck = validateClassification(retry.classification);
+    if (retryCheck.ok) return { classification: retryCheck.classification, degraded: null };
+    lastReason = retryCheck.reason;
+  } catch (err) {
+    lastReason = err instanceof Error ? err.message : String(err);
+  }
+
+  return {
+    classification: singleStepClassification(query),
+    degraded: lastReason,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +486,8 @@ For commands:
 }
 
 RULES:
+- ANY change to a Prisma model — adding, removing, renaming or retyping a field, adding or dropping a model — MUST use the "schema" shape above. NEVER emit a "file" or "create_file" operation whose filePath is schema.prisma. A text edit on schema.prisma will be rejected.
+- filePath is always relative to the project root, e.g. "components/PostCard.tsx". Never absolute, never starting with the project folder's own name, never containing "..".
 - Return an ARRAY of operations. Each operation addresses exactly one thing the user asked for.
 - Make the MINIMAL change necessary. Do NOT propose edits outside what the operation describes.
 - If the request is ambiguous, choose the NARROWEST reasonable scope rather than reinterpreting the whole file.
@@ -398,20 +519,19 @@ export async function extractIntent(
     `\nReturn ONLY a JSON array of operations. No prose, no explanation.`,
   ].join("\n");
 
-  const genPromise = generateCompletion(
-    `${INTENT_EXTRACTION_PROMPT}\n\n${userContent}`,
-    { responseFormat: "json" }
+  const text = await withTimeout(
+    generateCompletion(`${INTENT_EXTRACTION_PROMPT}\n\n${userContent}`, {
+      responseFormat: "json",
+    }),
+    INTENT_TIMEOUT_MS,
+    "Intent extraction"
   );
-
-  const timeoutPromise = new Promise<never>((_, reject) =>
-    setTimeout(() => reject(new Error("Intent extraction timed out after 30s")), 30_000)
-  );
-
-  const text = await Promise.race([genPromise, timeoutPromise]);
 
   const raw = JSON.parse(text);
   return { plan: raw as EditPlan, raw };
 }
+
+const INTENT_TIMEOUT_MS = 60_000;
 
 /**
  * High-level intent extraction with one retry on validation failure.
@@ -427,7 +547,7 @@ export async function extractIntentWithRetry(
 
   // Retry once with the validation error fed back
   const retry = await extractIntent(
-    `${query}\n\nPREVIOUS ATTEMPT FAILED VALIDATION: ${check.reason}\nFix the schema and try again.`,
+    `${query}\n\nPREVIOUS ATTEMPT WAS REJECTED: ${check.reason}\nFix the output and try again. Return ONLY a JSON array.`,
     context,
     schemaSource
   );
@@ -519,6 +639,39 @@ export function applyScopedEdits(
 // Apply SchemaEdit deterministically (no LLM, no full-file regeneration)
 // ---------------------------------------------------------------------------
 
+export interface ApplySchemaEditOptions {
+  /**
+   * Whether the result is committed to disk. Default true.
+   *
+   * `npx prisma format` only works on a real file, so the mutated source is
+   * always written, formatted, and read back — but with `write: false` the
+   * original bytes are restored afterwards. Verification needs the *proposed*
+   * schema before the write phase runs; without this it wrote the change to
+   * disk early and the write phase then applied the same edit a second time,
+   * which duplicates an `add_field` line.
+   */
+  write?: boolean;
+}
+
+function finalizeSchema(
+  absSchemaPath: string,
+  mutated: string,
+  projectRoot: string,
+  write: boolean
+): string {
+  const original = fs.existsSync(absSchemaPath)
+    ? fs.readFileSync(absSchemaPath, "utf-8")
+    : null;
+  fs.writeFileSync(absSchemaPath, mutated, "utf-8");
+  try {
+    return formatPrismaSchema(absSchemaPath, projectRoot);
+  } finally {
+    if (!write && original !== null) {
+      fs.writeFileSync(absSchemaPath, original, "utf-8");
+    }
+  }
+}
+
 /**
  * Apply a single SchemaEdit operation to the existing schema.prisma source.
  *
@@ -530,8 +683,10 @@ export function applySchemaEdit(
   existingSource: string,
   edit: SchemaEdit,
   schemaPath: string,
-  projectRoot: string
+  projectRoot: string,
+  options: ApplySchemaEditOptions = {}
 ): string {
+  const write = options.write ?? true;
   // ── create_model: append a new model block before the final newline ──
   if (edit.op === "create_model") {
     const body = edit.modelBody ?? "";
@@ -540,8 +695,7 @@ export function applySchemaEdit(
     const absSchemaPath = path.isAbsolute(schemaPath)
       ? schemaPath
       : path.resolve(projectRoot, schemaPath);
-    fs.writeFileSync(absSchemaPath, mutated, "utf-8");
-    return formatPrismaSchema(absSchemaPath, projectRoot);
+    return finalizeSchema(absSchemaPath, mutated, projectRoot, write);
   }
 
   // ── remove_model: drop the entire model block ──
@@ -570,8 +724,7 @@ export function applySchemaEdit(
     const absSchemaPath = path.isAbsolute(schemaPath)
       ? schemaPath
       : path.resolve(projectRoot, schemaPath);
-    fs.writeFileSync(absSchemaPath, mutated, "utf-8");
-    return formatPrismaSchema(absSchemaPath, projectRoot);
+    return finalizeSchema(absSchemaPath, mutated, projectRoot, write);
   }
 
   const lines = existingSource.split("\n");
@@ -668,14 +821,10 @@ export function applySchemaEdit(
 
   const mutated = result.join("\n");
 
-  // Write temporarily, format with prisma, read back
   const absSchemaPath = path.isAbsolute(schemaPath)
     ? schemaPath
     : path.resolve(projectRoot, schemaPath);
-  fs.writeFileSync(absSchemaPath, mutated, "utf-8");
-  const formatted = formatPrismaSchema(absSchemaPath, projectRoot);
-
-  return formatted;
+  return finalizeSchema(absSchemaPath, mutated, projectRoot, write);
 }
 
 function escapeRegex(s: string): string {
@@ -793,13 +942,11 @@ ${JSON.stringify(plan, null, 2)}
 
 Remember: for file edits, provide EXACT oldText (verbatim from current file) and newText (minimal replacement). For schema and command entries, pass them through as-is.`;
 
-  const genPromise = generateCompletion(prompt, { responseFormat: "json" });
-
-  const timeoutPromise = new Promise<never>((_, reject) =>
-    setTimeout(() => reject(new Error(`LLM generation timed out after ${Math.round(timeoutMs / 1000)}s`)), timeoutMs)
+  const text = await withTimeout(
+    generateCompletion(prompt, { responseFormat: "json" }),
+    timeoutMs,
+    "LLM generation"
   );
-
-  const text = await Promise.race([genPromise, timeoutPromise]);
 
   return JSON.parse(text) as EditPlan;
 }

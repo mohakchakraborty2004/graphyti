@@ -1,8 +1,12 @@
+import * as fs from "fs";
 import * as path from "path";
 import { HydraDBError } from "@hydradb/sdk";
 import { loadGraphMap, type GraphMap, type GraphMapEntry } from "./ingest";
+import { listSourceFiles } from "../extract/tsExtractor";
 import { client } from "./hydraClient";
 import { requireHydraConfig } from "../config";
+import { referencesIdentifier, toPosix } from "../utils/paths";
+import { referencesField } from "../verify/symbolRefs";
 import { success, warn, info, sym, accent, bold, visLen, pad } from "../cli/theme";
 
 // ---------------------------------------------------------------------------
@@ -18,118 +22,220 @@ export interface AffectedNode {
 
 export interface BlastRadiusResult {
   changedNode: { id: string; name: string; kind: string; filePath: string };
+  /** Graph-linked AND textually confirmed. These are the enforced set. */
   affectedRoutes: AffectedNode[];
   affectedComponents: AffectedNode[];
   affectedFiles: AffectedNode[];
+  /**
+   * Files that mention the changed symbol but are not linked to it in the
+   * graph. Surfaced to the user and to the model, never enforced by the
+   * verifier — a bare word match is not evidence of a data-flow dependency,
+   * and blocking on one would fail a run over an unrelated `title` in a
+   * page's metadata.
+   */
+  advisoryFiles: AffectedNode[];
+  /** Every distinct project-relative file path in the enforced set. */
+  affectedFilePaths: string[];
+  /** Graph-linked candidates dropped because their file never names the symbol. */
+  filteredOut: Array<{ id: string; filePath: string }>;
+  /** Candidates whose file is gone from disk — the graph cache is stale. */
+  staleNodes: Array<{ id: string; filePath: string }>;
+}
+
+/** What is changing. `field` absent means the whole model is going away. */
+export interface BlastRadiusTarget {
+  model: string;
+  field?: string;
 }
 
 // ---------------------------------------------------------------------------
-// Reason-string helpers
+// Edge kinds, recovered from node-id prefixes
+//
+// The local graph cache stores edges as a flat `string[]` of target ids, which
+// drops the edge kind the extractor knew. It is recoverable without a cache
+// format change because the (fromPrefix, toPrefix) pair is unique across all
+// seven kinds the extractor emits — see src/extract/index.ts.
 // ---------------------------------------------------------------------------
 
-function buildReason(
-  originId: string,
-  originEntry: GraphMapEntry,
-  neighborId: string,
-  neighborEntry: GraphMapEntry
-): string {
-  const oKind = originEntry.kind;
-  const nKind = neighborEntry.kind;
+export type EdgeKind =
+  | "MODEL_HAS_FIELD"
+  | "FIELD_REFERENCES_MODEL"
+  | "FILE_IMPORTS"
+  | "ROUTE_QUERIES_MODEL"
+  | "ROUTE_USES_FIELD"
+  | "COMPONENT_FETCHES_ROUTE"
+  | "COMPONENT_RENDERS_FIELD"
+  | "UNKNOWN";
 
-  if (oKind === "PrismaModel" && nKind === "ModelField") {
-    return `${neighborEntry.name} is a field on model ${originEntry.name}`;
-  }
-  if (oKind === "ModelField" && nKind === "PrismaModel") {
-    return `${originEntry.name} has a relation to model ${neighborEntry.name}`;
-  }
-  if (oKind === "ApiRoute" && nKind === "PrismaModel") {
-    return `${originEntry.name} queries model ${neighborEntry.name}`;
-  }
-  if (oKind === "ApiRoute" && nKind === "ModelField") {
-    return `route ${originEntry.name} uses field ${neighborEntry.name}`;
-  }
-  if (oKind === "Component" && nKind === "ApiRoute") {
-    return `${originEntry.name} fetches data via ${neighborEntry.name}`;
-  }
-  if (oKind === "Component" && nKind === "ModelField") {
-    return `${originEntry.name} renders field ${neighborEntry.name}`;
-  }
-  if (nKind === "ApiRoute") {
-    return `${neighborEntry.name} uses ${originEntry.name}`;
-  }
-  if (nKind === "Component") {
-    return `${neighborEntry.name} depends on ${originEntry.name}`;
-  }
-  if (nKind === "File") {
-    return `${neighborEntry.name} imports from ${originEntry.name}`;
-  }
-  return `${neighborEntry.name} is connected to ${originEntry.name}`;
+function prefixOf(id: string): string {
+  const i = id.indexOf(":");
+  return i === -1 ? "" : id.slice(0, i);
 }
 
-function buildChainReason(pathIds: string[], map: GraphMap): string {
-  const names = pathIds
-    .map((id) => map[id]?.name ?? id)
-    .filter(Boolean);
-  if (names.length <= 1) return `directly affected`;
-  if (names.length === 2) return buildReason(pathIds[0], map[pathIds[0]], pathIds[1], map[pathIds[1]]);
-  return names.join(" → ");
+function edgeKind(from: string, to: string): EdgeKind {
+  const f = prefixOf(from);
+  const t = prefixOf(to);
+  if (f === "model" && t === "field") return "MODEL_HAS_FIELD";
+  if (f === "field" && t === "model") return "FIELD_REFERENCES_MODEL";
+  if (f === "file" && t === "file") return "FILE_IMPORTS";
+  if (f === "route" && t === "model") return "ROUTE_QUERIES_MODEL";
+  if (f === "route" && t === "field") return "ROUTE_USES_FIELD";
+  if (f === "component" && t === "route") return "COMPONENT_FETCHES_ROUTE";
+  if (f === "component" && t === "field") return "COMPONENT_RENDERS_FIELD";
+  return "UNKNOWN";
 }
 
-// ---------------------------------------------------------------------------
-// BFS over the local graph-map
-// ---------------------------------------------------------------------------
+/** Reverse adjacency, bucketed by edge kind: who points AT this node, and how. */
+type ReverseLookup = (kind: EdgeKind, target: string) => string[];
 
-const MAX_HOPS = 3;
-
-function bfsReachable(
-  startId: string,
-  map: GraphMap
-): Map<string, string[]> {
-  const reverse = new Map<string, string[]>();
-  for (const [id, entry] of Object.entries(map)) {
-    for (const target of entry.edges) {
-      if (!reverse.has(target)) reverse.set(target, []);
-      reverse.get(target)!.push(id);
+function buildReverseIndex(map: GraphMap): ReverseLookup {
+  const index = new Map<string, string[]>();
+  for (const [from, entry] of Object.entries(map)) {
+    for (const to of entry.edges ?? []) {
+      const key = `${edgeKind(from, to)}|${to}`;
+      const list = index.get(key);
+      if (list) list.push(from);
+      else index.set(key, [from]);
     }
   }
-
-  const visited = new Map<string, string[]>();
-  visited.set(startId, [startId]);
-
-  const queue: Array<{ id: string; path: string[]; hops: number }> = [
-    { id: startId, path: [startId], hops: 0 },
-  ];
-
-  while (queue.length > 0) {
-    const { id, path, hops } = queue.shift()!;
-    if (hops >= MAX_HOPS) continue;
-
-    const entry = map[id];
-    if (!entry) continue;
-
-    const forward = entry.edges ?? [];
-    const backward = reverse.get(id) ?? [];
-
-    for (const neighborId of [...forward, ...backward]) {
-      if (visited.has(neighborId)) continue;
-      if (neighborId === startId) continue;
-      const newPath = [...path, neighborId];
-      visited.set(neighborId, newPath);
-      queue.push({ id: neighborId, path: newPath, hops: hops + 1 });
-    }
-  }
-
-  visited.delete(startId);
-  return visited;
+  return (kind, target) => index.get(`${kind}|${target}`) ?? [];
 }
 
 // ---------------------------------------------------------------------------
-// HydraDB consistency check (non-blocking, warn-only)
+// Candidate collection — semantic, directed, and bounded by structure
+//
+// The previous implementation ran an undirected 3-hop BFS from the model node.
+// That escaped through unrelated relation fields: renaming `User.phone` reached
+// `/api/posts` via `field:Post.author → model:User`, and from there reached
+// every component fetching that route. Following edges in the direction that
+// actually carries a dependency removes that entire class of false positive.
 // ---------------------------------------------------------------------------
 
+/** Fixpoint guard — the graph is a DAG in practice, but never trust that. */
+const MAX_PROPAGATION_ROUNDS = 12;
+
+function collectCandidates(
+  target: BlastRadiusTarget,
+  map: GraphMap,
+  rev: ReverseLookup
+): Map<string, string> {
+  const candidates = new Map<string, string>();
+  const add = (id: string, reason: string): boolean => {
+    if (candidates.has(id) || !map[id]) return false;
+    candidates.set(id, reason);
+    return true;
+  };
+
+  const modelId = `model:${target.model}`;
+  const fieldIds = target.field
+    ? [`field:${target.model}.${target.field}`]
+    : Object.keys(map).filter((id) => id.startsWith(`field:${target.model}.`));
+
+  // 1. Nodes with an explicit edge to the changed field.
+  for (const fieldId of fieldIds) {
+    const label = map[fieldId]?.name ?? fieldId.replace(/^field:/, "");
+    for (const id of rev("ROUTE_USES_FIELD", fieldId)) add(id, `selects ${label}`);
+    for (const id of rev("COMPONENT_RENDERS_FIELD", fieldId)) add(id, `renders ${label}`);
+  }
+
+  // 2. Routes that query the model without the extractor pinning a field.
+  //    A `findMany()` with no `select` returns every column, so these are real
+  //    candidates — the text gate below decides whether each one is affected.
+  for (const id of rev("ROUTE_QUERIES_MODEL", modelId)) {
+    add(id, `queries model ${target.model}`);
+  }
+
+  // 3+4. Propagate outward: components fetching an affected route, and files
+  //      importing an affected file. Both directions carry a real dependency.
+  let frontier = [...candidates.keys()];
+  for (let round = 0; round < MAX_PROPAGATION_ROUNDS && frontier.length > 0; round++) {
+    const next: string[] = [];
+    for (const id of frontier) {
+      const entry = map[id];
+      if (!entry) continue;
+
+      if (prefixOf(id) === "route") {
+        for (const consumer of rev("COMPONENT_FETCHES_ROUTE", id)) {
+          if (add(consumer, `fetches ${entry.name}`)) next.push(consumer);
+        }
+      }
+
+      if (entry.filePath) {
+        const fileNode = `file:${entry.filePath}`;
+        for (const importer of rev("FILE_IMPORTS", fileNode)) {
+          if (add(importer, `imports ${entry.filePath}`)) next.push(importer);
+        }
+      }
+    }
+    frontier = next;
+  }
+
+  return candidates;
+}
+
+// ---------------------------------------------------------------------------
+// Text gate — does this file actually name the symbol that is changing?
+// ---------------------------------------------------------------------------
+
+/**
+ * Identifiers whose presence means a file is affected by this change.
+ *
+ * For a field change that is the field name. For a whole-model change it is the
+ * model name plus its camelCase Prisma-client alias, so `prisma.user.findMany`
+ * is matched as well as `User`.
+ */
+function symbolsFor(target: BlastRadiusTarget): string[] {
+  if (target.field) return [target.field];
+  const alias = target.model.charAt(0).toLowerCase() + target.model.slice(1);
+  return alias === target.model ? [target.model] : [target.model, alias];
+}
+
+function readOrNull(absPath: string): string | null {
+  try {
+    return fs.readFileSync(absPath, "utf-8");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A syntactic reference — `post.title`, `{ title?: string }`, `select: { title }`.
+ *
+ * This is the enforced signal. It is precise enough to keep a page's
+ * `metadata = { title: "…" }` out of the radius, and complete enough to catch a
+ * component the extractor failed to link.
+ */
+function fileReferencesSymbol(absPath: string, relPath: string, symbols: string[]): boolean {
+  const content = readOrNull(absPath);
+  if (content === null) return false;
+  return symbols.some((s) => referencesField(content, relPath, s));
+}
+
+/** A bare word match — the advisory signal, never enforced. */
+function fileMentionsSymbol(absPath: string, symbols: string[]): boolean {
+  const content = readOrNull(absPath);
+  if (content === null) return false;
+  return symbols.some((s) => referencesIdentifier(content, s));
+}
+
+/** route beats component beats file when several nodes share one path. */
+const SPECIFICITY: Record<string, number> = { route: 3, component: 2, file: 1 };
+
+// ---------------------------------------------------------------------------
+// HydraDB consistency check (non-blocking, advisory)
+// ---------------------------------------------------------------------------
+
+/**
+ * HydraDB returns relation endpoints as content-hash `entityId`s plus a
+ * lowercased display `name`/`identifier`. The hashes are meaningless to us, so
+ * comparing them against graphyti node ids — as this check used to — could
+ * never match and warned on every single run. Compare the names instead, and
+ * only report endpoints that look like graphyti ids yet are absent from the
+ * local graph: those are genuinely stale remote nodes, which is actionable.
+ */
 async function checkHydraConsistency(
   changedNodeId: string,
-  localNeighborIds: Set<string>
+  map: GraphMap
 ): Promise<void> {
   try {
     const { database, collection } = requireHydraConfig();
@@ -150,43 +256,30 @@ async function checkHydraConsistency(
 
     if (!envelope.data?.relations) return;
 
-    const hydraIds = new Set<string>();
+    const remoteNames = new Set<string>();
     for (const triplet of envelope.data.relations) {
-      if (triplet.source?.entityId) hydraIds.add(triplet.source.entityId);
-      if (triplet.target?.entityId) hydraIds.add(triplet.target.entityId);
+      for (const side of [triplet.source, triplet.target]) {
+        if (!side) continue;
+        if (side.name) remoteNames.add(side.name.trim().toLowerCase());
+        if (side.identifier) remoteNames.add(side.identifier.trim().toLowerCase());
+      }
     }
-    hydraIds.delete(changedNodeId);
+    remoteNames.delete(changedNodeId.toLowerCase());
 
-    const localDirect = new Set(
-      (Object.entries(Object.fromEntries([[changedNodeId, { edges: [] as string[] }]]))[0]?.[1]?.edges ?? [])
+    const localIdsLower = new Set(Object.keys(map).map((id) => id.toLowerCase()));
+    const ghosts = [...remoteNames].filter(
+      (name) => KNOWN_PREFIXES.has(prefixOf(name)) && !localIdsLower.has(name)
     );
 
-    const onlyLocal: string[] = [];
-    const onlyHydra: string[] = [];
-
-    for (const id of localNeighborIds) {
-      if (!hydraIds.has(id)) onlyLocal.push(id);
-    }
-    for (const id of hydraIds) {
-      if (!localNeighborIds.has(id)) onlyHydra.push(id);
-    }
-
-    if (onlyLocal.length === 0 && onlyHydra.length === 0) {
+    if (ghosts.length === 0) {
       console.log(
-        `  ${sym.ok} ${info("[HydraDB]")} local graph and HydraDB agree on neighbors of ${changedNodeId}`
+        `  ${sym.ok} ${info("[HydraDB]")} no stale remote nodes around ${changedNodeId}`
       );
     } else {
-      if (onlyLocal.length > 0) {
-        console.warn(
-          `  ${warn("!")} ${info("[HydraDB]")} local graph has neighbors not in HydraDB for ${changedNodeId}: ${onlyLocal.join(", ")}`
-        );
-        console.warn(`      (run 'dbagent init-graph' to sync)`);
-      }
-      if (onlyHydra.length > 0) {
-        console.warn(
-          `  ${warn("!")} ${info("[HydraDB]")} HydraDB has neighbors not in local graph for ${changedNodeId}: ${onlyHydra.join(", ")}`
-        );
-      }
+      console.warn(
+        `  ${warn("!")} ${info("[HydraDB]")} ${ghosts.length} stale remote node(s) near ${changedNodeId}: ${ghosts.slice(0, 6).join(", ")}${ghosts.length > 6 ? ", …" : ""}`
+      );
+      console.warn(`      (run 'graphyti init-graph' to prune them)`);
     }
   } catch (err) {
     if (err instanceof HydraDBError) {
@@ -199,83 +292,232 @@ async function checkHydraConsistency(
         `  ${warn("!")} ${info("[HydraDB]")} check skipped — error_code=${code} request_id=${reqId}: ${err.message}`
       );
     } else {
-      console.warn(`  ${warn("!")} ${info("[HydraDB]")} check skipped — unexpected error:`, err);
+      console.warn(
+        `  ${warn("!")} ${info("[HydraDB]")} check skipped — ${err instanceof Error ? err.message : String(err)}`
+      );
     }
   }
 }
+
+const KNOWN_PREFIXES = new Set(["model", "field", "route", "component", "file"]);
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-export async function computeBlastRadius(
-  changedNodeId: string,
-  projectRoot: string = process.cwd()
-): Promise<BlastRadiusResult> {
-  const map = loadGraphMap(projectRoot);
+function parseTarget(target: string | BlastRadiusTarget): BlastRadiusTarget | null {
+  if (typeof target !== "string") return target;
+  if (target.startsWith("model:")) return { model: target.slice("model:".length) };
+  if (target.startsWith("field:")) {
+    const rest = target.slice("field:".length);
+    const dot = rest.indexOf(".");
+    if (dot === -1) return { model: rest };
+    return { model: rest.slice(0, dot), field: rest.slice(dot + 1) };
+  }
+  return null;
+}
 
-  const changedEntry = map[changedNodeId];
-  if (!changedEntry) {
-    return {
-      changedNode: { id: changedNodeId, name: changedNodeId, kind: "unknown", filePath: "" },
-      affectedRoutes: [],
-      affectedComponents: [],
-      affectedFiles: [],
-    };
+/** A radius with nothing in it — for a target the graph has never seen. */
+export function emptyBlastRadius(target: BlastRadiusTarget): BlastRadiusResult {
+  return emptyResult(
+    nodeIdFor(target),
+    target.field ? `${target.model}.${target.field}` : target.model
+  );
+}
+
+function emptyResult(id: string, name: string): BlastRadiusResult {
+  return {
+    changedNode: { id, name, kind: "unknown", filePath: "" },
+    affectedRoutes: [],
+    affectedComponents: [],
+    affectedFiles: [],
+    advisoryFiles: [],
+    affectedFilePaths: [],
+    filteredOut: [],
+    staleNodes: [],
+  };
+}
+
+/**
+ * Enumerate everything a breaking schema change can break.
+ *
+ * Accepts either a `{ model, field }` target or a node id string
+ * (`model:User`, `field:User.phone`) for older call sites.
+ */
+export interface ComputeBlastRadiusOptions {
+  /** Run the advisory HydraDB consistency check. Off in tests — it needs a network. */
+  checkRemote?: boolean;
+}
+
+export async function computeBlastRadius(
+  target: string | BlastRadiusTarget,
+  projectRoot: string = process.cwd(),
+  options: ComputeBlastRadiusOptions = {}
+): Promise<BlastRadiusResult> {
+  const checkRemote = options.checkRemote ?? true;
+  const parsed = parseTarget(target);
+  const rawId = typeof target === "string" ? target : nodeIdFor(target);
+  if (!parsed) return emptyResult(rawId, rawId);
+
+  const absRoot = path.resolve(projectRoot);
+  const map = loadGraphMap(absRoot);
+
+  const changedId = nodeIdFor(parsed);
+  const modelId = `model:${parsed.model}`;
+  const changedEntry: GraphMapEntry | undefined = map[changedId] ?? map[modelId];
+
+  if (!changedEntry) return emptyResult(changedId, parsed.field ?? parsed.model);
+
+  const consistencyCheck = checkRemote
+    ? checkHydraConsistency(modelId, map)
+    : Promise.resolve();
+
+  const rev = buildReverseIndex(map);
+  const candidates = collectCandidates(parsed, map, rev);
+  const symbols = symbolsFor(parsed);
+
+  // ── Reference gate ───────────────────────────────────────────────────────
+  const filteredOut: BlastRadiusResult["filteredOut"] = [];
+  const staleNodes: BlastRadiusResult["staleNodes"] = [];
+  const kept: AffectedNode[] = [];
+
+  for (const [id, reason] of candidates) {
+    const entry = map[id];
+    if (!entry?.filePath) continue;
+    const abs = path.resolve(absRoot, entry.filePath);
+    if (!fs.existsSync(abs)) {
+      staleNodes.push({ id, filePath: entry.filePath });
+      continue;
+    }
+    if (!fileReferencesSymbol(abs, entry.filePath, symbols)) {
+      filteredOut.push({ id, filePath: entry.filePath });
+      continue;
+    }
+    kept.push({ id, name: entry.name, filePath: entry.filePath, reason });
   }
 
-  const reachable = bfsReachable(changedNodeId, map);
-  const directNeighborIds = new Set(changedEntry.edges);
+  // ── Recall pass ──────────────────────────────────────────────────────────
+  //
+  // Files that syntactically reference the field but carry no edge to it. The
+  // extractor drops an edge whenever it cannot pin a field to exactly one model
+  // — a component reading `post.title` from a route that queries `User` gets no
+  // COMPONENT_RENDERS_FIELD edge at all. Those files break just as hard, so a
+  // graph-only radius is not a safe radius.
+  for (const abs of safeListSourceFiles(absRoot)) {
+    const rel = toPosix(path.relative(absRoot, abs));
+    if (rel === changedEntry.filePath) continue;
+    if (kept.some((n) => n.filePath === rel)) continue;
+    if (!fileReferencesSymbol(abs, rel, symbols)) continue;
 
-  const consistencyCheck = checkHydraConsistency(changedNodeId, directNeighborIds);
+    const nodeId = map[`component:${rel}`]
+      ? `component:${rel}`
+      : map[`file:${rel}`]
+        ? `file:${rel}`
+        : `file:${rel}`;
+    kept.push({
+      id: nodeId,
+      name: map[nodeId]?.name ?? rel,
+      filePath: rel,
+      reason: `references ${symbols[0]} (no graph edge — extractor could not disambiguate)`,
+    });
+  }
+
+  // ── One node per file path, most specific wins ───────────────────────────
+  const byPath = new Map<string, AffectedNode>();
+  for (const node of kept) {
+    const existing = byPath.get(node.filePath);
+    if (
+      !existing ||
+      (SPECIFICITY[prefixOf(node.id)] ?? 0) > (SPECIFICITY[prefixOf(existing.id)] ?? 0)
+    ) {
+      byPath.set(node.filePath, node);
+    }
+  }
 
   const affectedRoutes: AffectedNode[] = [];
   const affectedComponents: AffectedNode[] = [];
   const affectedFiles: AffectedNode[] = [];
-
-  for (const [nodeId, pathIds] of reachable.entries()) {
-    const entry = map[nodeId];
-    if (!entry) continue;
-
-    const reason = buildChainReason(pathIds, map);
-
-    const affected: AffectedNode = {
-      id: nodeId,
-      name: entry.name,
-      filePath: entry.filePath,
-      reason,
-    };
-
-    switch (entry.kind) {
-      case "ApiRoute":
-        affectedRoutes.push(affected);
-        break;
-      case "Component":
-        affectedComponents.push(affected);
-        break;
-      case "File":
-        affectedFiles.push(affected);
-        break;
-    }
+  for (const node of byPath.values()) {
+    if (prefixOf(node.id) === "route") affectedRoutes.push(node);
+    else if (prefixOf(node.id) === "component") affectedComponents.push(node);
+    else affectedFiles.push(node);
   }
+
+  // ── Advisory sweep ───────────────────────────────────────────────────────
+  const advisoryFiles = sweepForSymbols(absRoot, symbols, byPath, changedEntry.filePath);
+
+  const sortByPath = (a: AffectedNode, b: AffectedNode) =>
+    a.filePath.localeCompare(b.filePath);
+  affectedRoutes.sort(sortByPath);
+  affectedComponents.sort(sortByPath);
+  affectedFiles.sort(sortByPath);
+  advisoryFiles.sort(sortByPath);
 
   await consistencyCheck;
 
   return {
     changedNode: {
-      id: changedNodeId,
-      name: changedEntry.name,
-      kind: changedEntry.kind,
+      id: changedId,
+      name: parsed.field ? `${parsed.model}.${parsed.field}` : parsed.model,
+      kind: parsed.field ? "ModelField" : "PrismaModel",
       filePath: changedEntry.filePath,
     },
     affectedRoutes,
     affectedComponents,
     affectedFiles,
+    advisoryFiles,
+    affectedFilePaths: [...byPath.keys()].sort(),
+    filteredOut,
+    staleNodes,
   };
 }
 
+export function nodeIdFor(target: BlastRadiusTarget): string {
+  return target.field
+    ? `field:${target.model}.${target.field}`
+    : `model:${target.model}`;
+}
+
+function safeListSourceFiles(absRoot: string): string[] {
+  try {
+    return listSourceFiles(absRoot);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Files that merely mention the name somewhere — a parameter called `title`, a
+ * page's `metadata = { title }`.
+ *
+ * Shown to the user and to the model so a genuine miss is still visible, but
+ * never enforced: a bare word match is not evidence of a data-flow dependency,
+ * and blocking on one fails correct runs.
+ */
+function sweepForSymbols(
+  absRoot: string,
+  symbols: string[],
+  covered: Map<string, AffectedNode>,
+  changedFilePath: string
+): AffectedNode[] {
+  const out: AffectedNode[] = [];
+
+  for (const abs of safeListSourceFiles(absRoot)) {
+    const rel = toPosix(path.relative(absRoot, abs));
+    if (covered.has(rel) || rel === changedFilePath) continue;
+    if (!fileMentionsSymbol(abs, symbols)) continue;
+    out.push({
+      id: `file:${rel}`,
+      name: rel,
+      filePath: rel,
+      reason: `mentions ${symbols[0]}, but never as a field reference`,
+    });
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
-// CLI tree formatter — clean indented tree view
+// CLI tree formatter
 // ---------------------------------------------------------------------------
 
 function formatNodeGroup(
@@ -294,71 +536,84 @@ function formatNodeGroup(
   return lines;
 }
 
-/**
- * Format blast-radius as a compact, scannable tree view.
- *
- * Output style:
- *   Model: Post (PrismaModel)
- *   prisma/schema.prisma
- *
- *   Routes
- *     › /api/posts     src/app/api/posts/route.ts
- *       queries model Post
- *   Components
- *     › PostCard.tsx    components/PostCard.tsx
- *       renders field Post.title
- */
+/** Distinct files in the enforced set — the number the user is asked to approve. */
+export function blastRadiusSize(result: BlastRadiusResult): number {
+  return result.affectedFilePaths.length;
+}
+
 export function formatBlastRadius(result: BlastRadiusResult): string {
   const lines: string[] = [];
 
   lines.push(
-    `  ${info("Model:")} ${accent(result.changedNode.name)} ${info(`(${result.changedNode.kind})`)}`
+    `  ${info("Changing:")} ${accent(result.changedNode.name)} ${info(`(${result.changedNode.kind})`)}`
   );
   lines.push(`  ${info(result.changedNode.filePath)}`);
 
-  const total =
-    result.affectedRoutes.length +
-    result.affectedComponents.length +
-    result.affectedFiles.length;
+  const total = blastRadiusSize(result);
 
   if (total === 0) {
-    lines.push(`  ${info("No downstream dependents found in the graph.")}`);
-    return lines.join("\n");
+    lines.push(`  ${success("No downstream file references this — nothing else to update.")}`);
+  } else {
+    const allNodes = [
+      ...result.affectedRoutes,
+      ...result.affectedComponents,
+      ...result.affectedFiles,
+    ];
+    const colWidth = Math.min(28, Math.max(12, ...allNodes.map((n) => visLen(n.name))));
+    lines.push(`  ${bold(`${total} file${total === 1 ? "" : "s"} must change:`)}`);
+    lines.push(...formatNodeGroup("Routes", result.affectedRoutes, colWidth));
+    lines.push(...formatNodeGroup("Components", result.affectedComponents, colWidth));
+    lines.push(...formatNodeGroup("Files", result.affectedFiles, colWidth));
   }
 
-  // Calculate column width for aligned name column
-  const allNodes = [...result.affectedRoutes, ...result.affectedComponents, ...result.affectedFiles];
-  const colWidth = Math.min(28, Math.max(12, ...allNodes.map((n) => visLen(n.name))));
-
-  lines.push(...formatNodeGroup("Routes", result.affectedRoutes, colWidth));
-  lines.push(...formatNodeGroup("Components", result.affectedComponents, colWidth));
-  lines.push(...formatNodeGroup("Files", result.affectedFiles, colWidth));
+  if (result.filteredOut.length > 0) {
+    lines.push(
+      `  ${info(`${result.filteredOut.length} graph neighbour(s) skipped — they never name ${result.changedNode.name}`)}`
+    );
+  }
+  if (result.staleNodes.length > 0) {
+    lines.push(
+      `  ${warn("!")} ${result.staleNodes.length} graph node(s) point at files that no longer exist — run 'graphyti init-graph'`
+    );
+  }
+  if (result.advisoryFiles.length > 0) {
+    lines.push(`  ${warn("Also mentions this name (not graph-linked, not enforced):")}`);
+    for (const n of result.advisoryFiles) {
+      lines.push(`    ${sym.bullet} ${info(n.filePath)}`);
+    }
+  }
 
   return lines.join("\n");
 }
 
 export function blastRadiusPromptSection(result: BlastRadiusResult): string {
-  const total =
-    result.affectedRoutes.length +
-    result.affectedComponents.length +
-    result.affectedFiles.length;
-  if (total === 0) return "";
-
-  const lines: string[] = [
-    `\n== BLAST RADIUS — you MUST also update these files ==`,
-    `Changing ${result.changedNode.name} affects ${total} downstream file(s).`,
-    `Do NOT leave any of these inconsistent after your changes:\n`,
-  ];
-
-  for (const n of [
+  const enforced = [
     ...result.affectedRoutes,
     ...result.affectedComponents,
     ...result.affectedFiles,
-  ]) {
-    lines.push(`  - ${n.filePath}  (${n.name})`);
-    lines.push(`    reason: ${n.reason}`);
+  ];
+  if (enforced.length === 0 && result.advisoryFiles.length === 0) return "";
+
+  const lines: string[] = [
+    `\n== BLAST RADIUS for ${result.changedNode.name} ==`,
+  ];
+
+  if (enforced.length > 0) {
+    lines.push(
+      `These ${enforced.length} file(s) reference it today and MUST be updated in the same change:\n`
+    );
+    for (const n of enforced) {
+      lines.push(`  - ${n.filePath}  (${n.reason})`);
+    }
   }
 
-  lines.push(`\nEnsure all listed files are updated to stay consistent with the schema change.`);
+  if (result.advisoryFiles.length > 0) {
+    lines.push(`\nThese files also mention the name; update them only if genuinely related:\n`);
+    for (const n of result.advisoryFiles) {
+      lines.push(`  - ${n.filePath}`);
+    }
+  }
+
+  lines.push(`\nLeaving any required file inconsistent will fail structural verification.`);
   return lines.join("\n");
 }

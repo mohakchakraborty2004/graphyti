@@ -96,6 +96,12 @@ interface RunOptions {
   status?: number | null;
   /** Error the stubbed spawnSync reports (e.g. ENOENT). */
   error?: Error;
+  /**
+   * Project root the write is scoped to. Required for any file action: paths
+   * outside the root are refused, so a fixture in os.tmpdir() must declare that
+   * directory as its root.
+   */
+  projectRoot?: string;
 }
 
 interface RunOutcome {
@@ -130,6 +136,7 @@ async function run(actions: any[], options: RunOptions = {}): Promise<RunOutcome
     const result = await handleAgentOutput(actions, {
       dryRun: options.dryRun,
       yes: options.yes,
+      projectRoot: options.projectRoot,
     });
     return {
       executed: result.executedCommands,
@@ -301,7 +308,7 @@ async function main(): Promise<void> {
     const r = await run(cmd("npm install zod"), { answer: "" });
     check(
       "bare Enter is treated as no",
-      r.spawns.length === 0 && /skipped by user/.test(r.out),
+      r.spawns.length === 0 && /skipped by user/i.test(r.out),
       `out=${r.out}`
     );
   }
@@ -409,7 +416,7 @@ async function main(): Promise<void> {
     const r = await run(cmd("npm install zod"), { yes: true, status: 1 });
     check(
       "non-zero exit is not recorded as executed",
-      r.spawns.length === 1 && r.executed.length === 0 && /exited with code 1/.test(r.out),
+      r.spawns.length === 1 && r.executed.length === 0 && /exited with code 1/i.test(r.out),
       `executed=${JSON.stringify(r.executed)} out=${r.out}`
     );
   }
@@ -419,7 +426,7 @@ async function main(): Promise<void> {
     const r = await run(cmd("npm install zod"), { yes: true, status: null, error: err });
     check(
       "spawn error is not recorded as executed",
-      r.executed.length === 0 && /Failed to run command/.test(r.out),
+      r.executed.length === 0 && /failed to run/i.test(r.out),
       `executed=${JSON.stringify(r.executed)} out=${r.out}`
     );
   }
@@ -452,17 +459,21 @@ async function main(): Promise<void> {
   }
 
   {
-    // A file action alongside a command, written to a throwaway directory. The
-    // file does not exist, so this takes writeFileSafe's create branch and
-    // never reaches the LLM merge path.
+    // A file action alongside a command, written to a throwaway project root.
+    // The file does not exist, so an edit with an empty oldText takes the
+    // create branch.
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "graphyti-pipeline-"));
     try {
       const r = await run(
         [
-          { type: "file", directory: tmp, fileName: "note.txt", content: "line one\\nline two" },
+          {
+            type: "file",
+            filePath: "note.txt",
+            edits: [{ filePath: "note.txt", oldText: "", newText: "line one\nline two" }],
+          },
           { type: "command", command: "npx prisma generate" },
         ],
-        { yes: true }
+        { yes: true, projectRoot: tmp }
       );
       const target = path.join(tmp, "note.txt");
       check(
@@ -471,7 +482,7 @@ async function main(): Promise<void> {
         `written=${JSON.stringify(r.written)} executed=${JSON.stringify(r.executed)}`
       );
       check(
-        "escaped newlines are unescaped on write",
+        "content is written verbatim",
         fs.readFileSync(target, "utf-8") === "line one\nline two",
         JSON.stringify(fs.readFileSync(target, "utf-8"))
       );
@@ -483,12 +494,72 @@ async function main(): Promise<void> {
   {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "graphyti-pipeline-"));
     try {
-      const r = await run([{ type: "file", directory: tmp, fileName: "note.txt", content: "hello" }], {
-        dryRun: true,
-      });
+      const r = await run(
+        [{ type: "file", filePath: "note.txt", edits: [{ filePath: "note.txt", oldText: "", newText: "hello" }] }],
+        { dryRun: true, projectRoot: tmp }
+      );
       check(
         "dry-run writes no file and reports no path",
         r.written.length === 0 && !fs.existsSync(path.join(tmp, "note.txt")),
+        `written=${JSON.stringify(r.written)}`
+      );
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+
+  {
+    // A schema edit that cannot be applied must abort the whole plan. Writing
+    // the call sites and then failing on the schema leaves the tree renamed
+    // against an unrenamed schema — the structural inconsistency this tool
+    // exists to prevent, inverted.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "graphyti-pipeline-"));
+    try {
+      fs.writeFileSync(path.join(tmp, "note.txt"), "before", "utf-8");
+      const r = await run(
+        [
+          {
+            type: "file",
+            filePath: "note.txt",
+            edits: [{ filePath: "note.txt", oldText: "before", newText: "after" }],
+          },
+          // No prisma/schema.prisma in this fixture, so the schema edit fails.
+          { type: "schema", model: "Post", op: "rename_field", fieldName: "title", newFieldName: "heading" },
+          { type: "command", command: "npx prisma generate" },
+        ],
+        { yes: true, projectRoot: tmp }
+      );
+      check(
+        "a failed schema edit writes nothing and runs nothing",
+        r.written.length === 0 &&
+          r.executed.length === 0 &&
+          r.spawns.length === 0 &&
+          fs.readFileSync(path.join(tmp, "note.txt"), "utf-8") === "before",
+        `written=${JSON.stringify(r.written)} executed=${JSON.stringify(r.executed)} note=${JSON.stringify(fs.readFileSync(path.join(tmp, "note.txt"), "utf-8"))}`
+      );
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+
+  {
+    // A path that escapes the project root must never be written, however the
+    // model spelled it.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "graphyti-pipeline-"));
+    try {
+      const r = await run(
+        [
+          {
+            type: "file",
+            filePath: "../escaped.txt",
+            edits: [{ filePath: "../escaped.txt", oldText: "", newText: "nope" }],
+          },
+        ],
+        { yes: true, projectRoot: tmp }
+      );
+      check(
+        "a path escaping the project root is refused",
+        r.written.length === 0 && !fs.existsSync(path.join(tmp, "..", "escaped.txt")),
         `written=${JSON.stringify(r.written)}`
       );
     } finally {

@@ -251,16 +251,50 @@ export async function ingestGraph(nodes: GraphNode[], edges: GraphEdge[], projec
   const { database, collection } = requireHydraConfig();
   const adj = adjacencyFromEdges(edges);
   const items = nodes.map((node) => nodeToAppKnowledgeItem(node, adj.get(node.id) ?? [], nodes));
-  console.log(`  ${info("›")} Ingesting ${items.length} nodes into ${database}/${collection ?? "(default)"}`);
-  const ids = await ingestItems(items);
-  console.log(`  ${info("›")} Waiting for indexing of ${ids.length} ids`);
-  await waitForIndexed(ids);
+
+  // Build the authoritative map from this extraction up front — it is derived
+  // purely from disk and does not depend on anything HydraDB does next.
   const map: GraphMap = {};
   for (const node of nodes) {
     map[node.id] = toGraphMapEntry(node, adj.get(node.id) ?? [], nodes);
   }
+
+  // Anything the previous cache knew about that this extraction did not produce
+  // is a node for a file that no longer exists. Upserting alone would leave it
+  // in HydraDB forever, which is how ghost nodes accumulate in the blast radius.
+  const previous = loadGraphMap(projectRoot);
+  const staleIds = Object.keys(previous).filter((id) => !(id in map));
+
+  console.log(`  ${info("›")} Ingesting ${items.length} nodes into ${database}/${collection ?? "(default)"}`);
+  const ids = await ingestItems(items);
+
+  if (staleIds.length > 0) {
+    console.log(`  ${info("›")} Pruning ${staleIds.length} node(s) whose files no longer exist`);
+    try {
+      await deleteKnowledgeIds(staleIds);
+    } catch (err) {
+      console.warn(
+        `  ${warn("!")} Could not prune stale nodes: ${err instanceof Error ? err.message : err}`
+      );
+    }
+  }
+
+  // Write the local cache BEFORE waiting on remote indexing. A stalled id in
+  // HydraDB's queue must not cost us a correct, freshly extracted graph — that
+  // failure mode leaves the cache frozen and every later blast radius stale.
   saveGraphMap(projectRoot, map);
   console.log(`  ${sym.ok} Wrote local cache ${graphMapPath(projectRoot)}`);
+
+  console.log(`  ${info("›")} Waiting for indexing of ${ids.length} ids`);
+  const stillPending = await waitForIndexed(ids, { throwOnTimeout: false });
+  if (stillPending.length > 0) {
+    console.warn(
+      `  ${warn("!")} ${stillPending.length} node(s) still indexing after 60s: ${stillPending.slice(0, 5).join(", ")}${stillPending.length > 5 ? ", …" : ""}`
+    );
+    console.warn(
+      `      The local graph cache is written and correct; HydraDB retrieval for those nodes may lag.`
+    );
+  }
 }
 
 export async function deleteKnowledgeIds(ids: string[]): Promise<void> {

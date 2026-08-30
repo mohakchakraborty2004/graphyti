@@ -389,7 +389,7 @@ export function App({
           dispatch({ type: "activity", activity: "Re-initializing code graph" });
 
           const projectRoot = process.cwd();
-          import("../../cli/init-graph")
+          import("../cli/init-graph")
             .then(({ runInitGraph }) => runInitGraph(projectRoot))
             .then(() => {
               dispatch({

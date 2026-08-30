@@ -1,4 +1,15 @@
+import { requireOpenRouterApiKey } from "../config";
+
 const DEFAULT_MODEL = "google/gemini-3.5-flash-lite";
+
+/**
+ * Output budget for every call.
+ *
+ * 1024 was not enough for a create_file whose whole content is returned in
+ * one JSON string: the response was truncated mid-token, JSON.parse failed,
+ * and the retry produced another truncated file.
+ */
+const MAX_OUTPUT_TOKENS = 8192;
 
 function getModel(): string {
   return process.env.OPENROUTER_MODEL || DEFAULT_MODEL;
@@ -27,13 +38,11 @@ async function callChat(
   chatRequest: Record<string, unknown>
 ): Promise<unknown> {
   const { OpenRouter } = await import("@openrouter/sdk");
-  const apiKey = process.env.OPENROUTER_API_KEY;
-  if (!apiKey) {
-    throw new Error(
-      "OPENROUTER_API_KEY is not set. Add it to your .env file and re-run."
-    );
-  }
-  const client = new OpenRouter({ apiKey });
+  // Via config, not process.env: config.ts is what loads .env from the package
+  // root, and graphyti runs as a global CLI inside somebody else's project.
+  // Reading the variable directly only worked when some other module happened
+  // to import config first.
+  const client = new OpenRouter({ apiKey: requireOpenRouterApiKey() });
   // SDK resolves directly to ChatResult on success, throws on error.
   return client.chat.send({ chatRequest } as never);
 }
@@ -56,7 +65,7 @@ export async function generateCompletion(
   const chatRequest: Record<string, unknown> = {
     model,
     messages: [{ role: "user", content: prompt }],
-    maxTokens: 1024,
+    maxTokens: MAX_OUTPUT_TOKENS,
     stream: false,
   };
 
@@ -95,7 +104,7 @@ async function generateJsonViaPrompt(
     result = await callChat({
       model,
       messages: [{ role: "user", content: jsonPrompt }],
-      maxTokens: 1024,
+      maxTokens: MAX_OUTPUT_TOKENS,
       stream: false,
     });
   } catch (err: unknown) {
