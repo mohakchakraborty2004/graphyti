@@ -800,7 +800,16 @@ async function previewDiffs(
         const original = before.get(schema) ?? null;
         if (original === null) continue;
 
-        const projected = applySchemaEdit(original, action as never, schema, projectRoot);
+        // Preview must never write the schema. `applySchemaEdit` formats via a
+        // temporary file internally, so its explicit write:false contract is
+        // required here just as it is in `proposeSchema` above.
+        const projected = applySchemaEdit(
+          original,
+          action as never,
+          schema,
+          projectRoot,
+          { write: false }
+        );
         const patch = unifiedDiff(original, projected);
         if (patch) out.push({ relativePath: path.relative(projectRoot, schema), patch });
       }
