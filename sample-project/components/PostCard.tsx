@@ -11,7 +11,7 @@ interface PostCardProps {
     priority?: number;
     author?: {
       name?: string | null;
-      email: string;
+      contactEmail: string;
     } | null;
   };
 }
@@ -36,7 +36,7 @@ export default function PostCard({ post }: PostCardProps) {
       </div>
       <p className="text-zinc-600 dark:text-zinc-300 text-sm mb-4">{post.content || "No content"}</p>
       <div className="flex justify-between items-center text-xs text-zinc-500 dark:text-zinc-400">
-        <span>By {post.author?.name || post.author?.email || "Anonymous"}</span>
+        <span>By {post.author?.name || post.author?.contactEmail || "Anonymous"}</span>
         <span>{post.published ? "Published" : "Draft"}</span>
       </div>
     </div>

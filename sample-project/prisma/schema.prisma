@@ -9,7 +9,7 @@ generator client {
 
 model User {
   id       Int     @id @default(autoincrement())
-  email    String  @unique
+  contactEmail    String  @unique
   name     String?
   posts    Post[]
   password String
