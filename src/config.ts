@@ -28,7 +28,10 @@ const __dirname = path.dirname(__filename);
  */
 export const ENV_PATH = path.join(__dirname, "..", ".env");
 
-dotenv.config({ path: ENV_PATH });
+// dotenv v17 prints a promotional "injected env" line by default. The TUI
+// owns the terminal surface, so dependency chatter must never appear above the
+// prompt or look like an agent error.
+dotenv.config({ path: ENV_PATH, quiet: true });
 
 /** A `.env` line like `FOO=` yields "" — that is absent, not configured. */
 function normalize(value: string | undefined): string | undefined {

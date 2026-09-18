@@ -4,7 +4,7 @@ import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
 import { App } from "./App";
-import { requireOpenRouterModel } from "../config";
+import { getConfiguredModel } from "../generate/llmClient";
 
 interface TuiOptions {
   dryRun: boolean;
@@ -71,7 +71,7 @@ export async function launchTui(options: TuiOptions) {
       autoConfirm={options.autoConfirm}
       legacyContext={options.legacyContext}
       version={readVersion()}
-      model={requireOpenRouterModel()}
+      model={getConfiguredModel()}
     />,
     {
       // Ctrl+C is handled in-app so it can cancel a run instead of killing the

@@ -62,6 +62,7 @@ function blast(
     ],
     filteredOut: [],
     staleNodes: [],
+    graphMissing: false,
   };
 }
 

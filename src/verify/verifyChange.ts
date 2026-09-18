@@ -1,11 +1,12 @@
 import * as path from "path";
 import * as fs from "fs";
+import { referencesIdentifier } from "../utils/paths";
 import { extractPrismaSchemaFromSource } from "../extract/prismaExtractor";
 import { extractTypeScriptFromSource } from "../extract/tsExtractor";
 import { findPrismaSchemas, extractPrismaSchema } from "../extract/prismaExtractor";
 import type { BlastRadiusResult, AffectedNode } from "../graph/blastRadius";
 import type { PrismaModel } from "../extract/types";
-import { findFieldReferences, findIdentifierReferences } from "./symbolRefs";
+import { findFieldReferences } from "./symbolRefs";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -115,7 +116,7 @@ interface NodeVerdict {
 function verifyNode(
   node: AffectedNode,
   oldFields: string[],
-  referenceMode: "field" | "model",
+  removedModel: string | undefined,
   genMap: Map<string, string>,
   models: PrismaModel[],
   projectRoot: string
@@ -144,17 +145,24 @@ function verifyNode(
   // Positions are reported, not just field names: a minified file can hold
   // several references on one line, and "still references title" gives neither
   // the model nor the user anything to act on.
-  const lingering = referenceMode === "model"
-    ? findIdentifierReferences(content, oldFields).map((r) => `removed model at line ${r.line} (${r.kind})`)
-    : oldFields.flatMap((f) =>
-        findFieldReferences(content, node.filePath, f).map((r) => `${f} at line ${r.line} (${r.kind})`)
-      );
+  const lingering = oldFields.flatMap((f) =>
+    findFieldReferences(content, node.filePath, f).map((r) => `${f} at line ${r.line} (${r.kind})`)
+  );
   if (lingering.length > 0) {
     return {
       outcome: "missed",
       detail: regenerated
         ? `still references ${lingering.join(", ")} after the edit`
         : `references ${lingering.join(", ")} and was not updated`,
+    };
+  }
+
+  if (removedModel && referencesIdentifier(content, removedModel)) {
+    return {
+      outcome: "missed",
+      detail: regenerated
+        ? `still references removed model ${removedModel} after the edit`
+        : `references removed model ${removedModel} and was not updated`,
     };
   }
 
@@ -193,7 +201,8 @@ export interface VerifyTarget {
   blastRadius: BlastRadiusResult;
   /** The field names *this* change breaks — never another change's. */
   oldFields: string[];
-  referenceMode?: "field" | "model";
+  /** A removed model is verified as an identifier rather than a field. */
+  removedModel?: string;
 }
 
 /**
@@ -218,8 +227,8 @@ export function verifyStructuralChange(
   // and let a miss win over an addressed so a real failure is never masked.
   const verdicts = new Map<string, { entry: VerifyEntry; missed: boolean }>();
 
-  for (const { blastRadius, oldFields, referenceMode = "field" } of targets) {
-    if (oldFields.length === 0) continue;
+  for (const { blastRadius, oldFields, removedModel } of targets) {
+    if (oldFields.length === 0 && !removedModel) continue;
 
     const nodes: AffectedNode[] = [
       ...blastRadius.affectedRoutes,
@@ -228,7 +237,7 @@ export function verifyStructuralChange(
     ];
 
     for (const node of nodes) {
-      const verdict = verifyNode(node, oldFields, referenceMode, genMap, models, projectRoot);
+      const verdict = verifyNode(node, oldFields, removedModel, genMap, models, projectRoot);
       const missed = verdict.outcome === "missed";
       const existing = verdicts.get(node.filePath);
       if (existing && (existing.missed || !missed)) continue;

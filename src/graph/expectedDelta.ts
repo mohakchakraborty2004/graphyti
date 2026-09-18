@@ -37,17 +37,10 @@ export interface ExpectedRemoveDelta extends ExpectedDeltaBase {
 }
 
 /** A whole Prisma model was removed, along with its relation fields. */
-export interface ExpectedRemoveModelDelta extends ExpectedDeltaBase {
-  changeType: "remove_model";
-  targetNodeId: string;
-  expectedRemovedRefs: string[];
-}
-
 export type ExpectedDelta =
   | ExpectedRenameDelta
   | ExpectedAddDelta
-  | ExpectedRemoveDelta
-  | ExpectedRemoveModelDelta;
+  | ExpectedRemoveDelta;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -103,18 +96,6 @@ export function computeExpectedDelta(
   }
 }
 
-function computeRemoveModelDelta(
-  edit: SchemaEdit,
-  blastRadius: BlastRadiusResult
-): ExpectedRemoveModelDelta {
-  return {
-    changeType: "remove_model",
-    targetModel: edit.model,
-    targetNodeId: `model:${edit.model}`,
-    expectedRemovedRefs: enforcedNodes(blastRadius).map((n) => n.id),
-  };
-}
-
 function computeRenameDelta(
   edit: SchemaEdit,
   blastRadius: BlastRadiusResult,
@@ -168,6 +149,19 @@ function computeRemoveDelta(
     targetModel: modelName,
     targetNodeId,
     expectedRemovedRefs,
+  };
+}
+
+/** Removing a model invalidates every consumer of the model node itself. */
+function computeRemoveModelDelta(
+  edit: SchemaEdit,
+  blastRadius: BlastRadiusResult
+): ExpectedRemoveDelta {
+  return {
+    changeType: "remove",
+    targetModel: edit.model,
+    targetNodeId: `model:${edit.model}`,
+    expectedRemovedRefs: enforcedNodes(blastRadius).map((n) => n.id),
   };
 }
 

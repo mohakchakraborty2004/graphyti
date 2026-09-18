@@ -1,4 +1,6 @@
-import { requireOpenRouterApiKey, requireOpenRouterModel } from "../config";
+import { requireOpenRouterApiKey } from "../config";
+
+const DEFAULT_MODEL = "google/gemini-3.5-flash-lite";
 
 /**
  * Output budget for every call.
@@ -9,8 +11,8 @@ import { requireOpenRouterApiKey, requireOpenRouterModel } from "../config";
  */
 const MAX_OUTPUT_TOKENS = 8192;
 
-function getModel(): string {
-  return requireOpenRouterModel();
+export function getConfiguredModel(): string {
+  return process.env.OPENROUTER_MODEL || DEFAULT_MODEL;
 }
 
 function extractText(result: unknown): string {
@@ -33,7 +35,8 @@ function extractText(result: unknown): string {
 }
 
 async function callChat(
-  chatRequest: Record<string, unknown>
+  chatRequest: Record<string, unknown>,
+  timeoutMs?: number
 ): Promise<unknown> {
   const { OpenRouter } = await import("@openrouter/sdk");
   // Via config, not process.env: config.ts is what loads .env from the package
@@ -42,7 +45,10 @@ async function callChat(
   // to import config first.
   const client = new OpenRouter({ apiKey: requireOpenRouterApiKey() });
   // SDK resolves directly to ChatResult on success, throws on error.
-  return client.chat.send({ chatRequest } as never);
+  // Use the SDK timeout rather than only racing the returned promise. That
+  // aborts the underlying HTTP request, so a fallback/retry never leaves an
+  // orphaned free-tier request running in the background.
+  return client.chat.send({ chatRequest } as never, timeoutMs ? { timeoutMs } : undefined);
 }
 
 /**
@@ -55,15 +61,23 @@ async function callChat(
  */
 export async function generateCompletion(
   prompt: string,
-  opts?: { model?: string; responseFormat?: "text" | "json" }
+  opts?: {
+    model?: string;
+    responseFormat?: "text" | "json";
+    /** Small structured calls must not reserve the full code-generation budget. */
+    maxTokens?: number;
+    /** Aborts the actual HTTP request when the provider does not respond in time. */
+    timeoutMs?: number;
+  }
 ): Promise<string> {
-  const model = opts?.model ?? getModel();
+  const model = opts?.model ?? getConfiguredModel();
   const format = opts?.responseFormat ?? "text";
+  const maxTokens = opts?.maxTokens ?? MAX_OUTPUT_TOKENS;
 
   const chatRequest: Record<string, unknown> = {
     model,
     messages: [{ role: "user", content: prompt }],
-    maxTokens: MAX_OUTPUT_TOKENS,
+    maxTokens,
     stream: false,
   };
 
@@ -73,7 +87,7 @@ export async function generateCompletion(
 
   let result: unknown;
   try {
-    result = await callChat(chatRequest);
+    result = await callChat(chatRequest, opts?.timeoutMs);
   } catch (err: unknown) {
     throw wrapError(err);
   }
@@ -85,7 +99,7 @@ export async function generateCompletion(
       JSON.parse(text);
       return text;
     } catch {
-      return await generateJsonViaPrompt(model, prompt);
+      return await generateJsonViaPrompt(model, prompt, maxTokens, opts?.timeoutMs);
     }
   }
 
@@ -94,7 +108,9 @@ export async function generateCompletion(
 
 async function generateJsonViaPrompt(
   model: string,
-  prompt: string
+  prompt: string,
+  maxTokens: number,
+  timeoutMs?: number
 ): Promise<string> {
   const jsonPrompt = `${prompt}\n\nIMPORTANT: You MUST return only valid JSON. No markdown, no explanation, no code fences.`;
   let result: unknown;
@@ -102,9 +118,9 @@ async function generateJsonViaPrompt(
     result = await callChat({
       model,
       messages: [{ role: "user", content: jsonPrompt }],
-      maxTokens: MAX_OUTPUT_TOKENS,
+      maxTokens,
       stream: false,
-    });
+    }, timeoutMs);
   } catch (err: unknown) {
     throw wrapError(err);
   }
@@ -141,6 +157,9 @@ function wrapError(err: unknown): Error {
     }
     if (name === "ConnectionError") {
       return new Error(`OpenRouter network error: ${err.message}`);
+    }
+    if (name === "RequestTimeoutError" || name === "RequestAbortedError") {
+      return new Error(`OpenRouter request timed out: ${err.message}`);
     }
     if (name === "OpenRouterError" || name.endsWith("ResponseError")) {
       return new Error(

@@ -40,6 +40,13 @@ export interface BlastRadiusResult {
   filteredOut: Array<{ id: string; filePath: string }>;
   /** Candidates whose file is gone from disk — the graph cache is stale. */
   staleNodes: Array<{ id: string; filePath: string }>;
+  /**
+   * True when the graph held no node for the changed model or field, so the
+   * radius was produced by scanning source files alone. The answer is still
+   * enforceable — the syntactic gate is what decides membership either way —
+   * but the graph is out of date and should be resynced.
+   */
+  graphMissing: boolean;
 }
 
 /** What is changing. `field` absent means the whole model is going away. */
@@ -209,15 +216,17 @@ function fileReferencesSymbol(
   absPath: string,
   relPath: string,
   symbols: string[],
-  wholeModel: boolean
+  isFieldChange: boolean
 ): boolean {
   const content = readOrNull(absPath);
   if (content === null) return false;
-  // Deleting a model invalidates type annotations, imports, and Prisma-client
-  // delegates as well as property accesses. Field-only syntax is deliberately
-  // too narrow for this case.
-  if (wholeModel) return symbols.some((s) => referencesIdentifier(content, s));
-  return symbols.some((s) => referencesField(content, relPath, s));
+  // Field names need the precise AST predicate so an unrelated `title` in
+  // metadata does not get swept into the enforced radius. A model name is a
+  // distinct type/client identifier, however, so every identifier reference is
+  // a real dependency when that model is being deleted.
+  return isFieldChange
+    ? symbols.some((s) => referencesField(content, relPath, s))
+    : symbols.some((s) => referencesIdentifier(content, s));
 }
 
 /** A bare word match — the advisory signal, never enforced. */
@@ -344,7 +353,22 @@ function emptyResult(id: string, name: string): BlastRadiusResult {
     affectedFilePaths: [],
     filteredOut: [],
     staleNodes: [],
+    graphMissing: true,
   };
+}
+
+/**
+ * Where the schema lives, relative to the project root.
+ *
+ * Used as the radius anchor when the graph has no node for the target: the
+ * anchor is the one file excluded from the scan, and excluding the schema is
+ * right whether or not the graph knows about it.
+ */
+function schemaRelPath(absRoot: string): string {
+  for (const candidate of ["prisma/schema.prisma", "schema.prisma"]) {
+    if (fs.existsSync(path.resolve(absRoot, candidate))) return candidate;
+  }
+  return "prisma/schema.prisma";
 }
 
 /**
@@ -375,7 +399,15 @@ export async function computeBlastRadius(
   const modelId = `model:${parsed.model}`;
   const changedEntry: GraphMapEntry | undefined = map[changedId] ?? map[modelId];
 
-  if (!changedEntry) return emptyResult(changedId, parsed.field ?? parsed.model);
+  // A target the graph has never heard of is not evidence that nothing depends
+  // on it — far more often it means the graph is stale, which is exactly when
+  // the radius matters most. Returning an empty result here used to let a
+  // rename sail through with "nothing else to update" and silently break every
+  // consumer, because verification then had nothing to verify. So the walk is
+  // skipped (there are no edges to follow) but the syntactic scan below still
+  // runs, and the caller is told the answer came from source alone.
+  const graphMissing = !changedEntry;
+  const anchorPath = changedEntry?.filePath ?? schemaRelPath(absRoot);
 
   const consistencyCheck = checkRemote
     ? checkHydraConsistency(modelId, map)
@@ -398,7 +430,7 @@ export async function computeBlastRadius(
       staleNodes.push({ id, filePath: entry.filePath });
       continue;
     }
-    if (!fileReferencesSymbol(abs, entry.filePath, symbols, !parsed.field)) {
+    if (!fileReferencesSymbol(abs, entry.filePath, symbols, Boolean(parsed.field))) {
       filteredOut.push({ id, filePath: entry.filePath });
       continue;
     }
@@ -414,9 +446,9 @@ export async function computeBlastRadius(
   // graph-only radius is not a safe radius.
   for (const abs of safeListSourceFiles(absRoot)) {
     const rel = toPosix(path.relative(absRoot, abs));
-    if (rel === changedEntry.filePath) continue;
+    if (rel === anchorPath) continue;
     if (kept.some((n) => n.filePath === rel)) continue;
-    if (!fileReferencesSymbol(abs, rel, symbols, !parsed.field)) continue;
+    if (!fileReferencesSymbol(abs, rel, symbols, Boolean(parsed.field))) continue;
 
     const nodeId = map[`component:${rel}`]
       ? `component:${rel}`
@@ -453,7 +485,7 @@ export async function computeBlastRadius(
   }
 
   // ── Advisory sweep ───────────────────────────────────────────────────────
-  const advisoryFiles = sweepForSymbols(absRoot, symbols, byPath, changedEntry.filePath);
+  const advisoryFiles = sweepForSymbols(absRoot, symbols, byPath, anchorPath);
 
   const sortByPath = (a: AffectedNode, b: AffectedNode) =>
     a.filePath.localeCompare(b.filePath);
@@ -469,7 +501,7 @@ export async function computeBlastRadius(
       id: changedId,
       name: parsed.field ? `${parsed.model}.${parsed.field}` : parsed.model,
       kind: parsed.field ? "ModelField" : "PrismaModel",
-      filePath: changedEntry.filePath,
+      filePath: anchorPath,
     },
     affectedRoutes,
     affectedComponents,
@@ -478,6 +510,7 @@ export async function computeBlastRadius(
     affectedFilePaths: [...byPath.keys()].sort(),
     filteredOut,
     staleNodes,
+    graphMissing,
   };
 }
 
@@ -559,6 +592,15 @@ export function formatBlastRadius(result: BlastRadiusResult): string {
   lines.push(`  ${info(result.changedNode.filePath)}`);
 
   const total = blastRadiusSize(result);
+
+  if (result.graphMissing) {
+    lines.push(
+      `  ${warn("!")} The graph has no node for ${accent(result.changedNode.name)} — it is out of date.`
+    );
+    lines.push(
+      `    ${info("Fell back to scanning source files directly. Run 'graphyti init-graph' to resync.")}`
+    );
+  }
 
   if (total === 0) {
     lines.push(`  ${success("No downstream file references this — nothing else to update.")}`);

@@ -13,7 +13,7 @@
 
 import React from "react";
 import { Box, Text, useApp, useInput } from "ink";
-import { UI_COLORS } from "./theme/tokens";
+import { UI_COLORS, UI_SYMBOLS } from "./theme/tokens";
 import { useTerminalLayout, chromeBudget } from "./layout/useTerminalLayout";
 import { useSessionInfo } from "./layout/useSessionInfo";
 import { useSession } from "./state/useSession";
@@ -86,13 +86,14 @@ export function App({
       : "none";
 
   // ── Elapsed timer ──────────────────────────────────────────────────────────
-  // Ticks only while busy, at 10Hz — fast enough to feel live, slow enough not
-  // to spend a frame per animation step.
+  // The spinner owns the visual activity. Updating the elapsed label twice per
+  // second keeps it useful without asking terminals to repaint the live frame
+  // for every tenth of a second.
   React.useEffect(() => {
     if (!busy) return;
     const timer = setInterval(() => {
       setElapsedMs(Date.now() - runStartRef.current);
-    }, 100);
+    }, 500);
     return () => clearInterval(timer);
   }, [busy]);
 
@@ -108,6 +109,20 @@ export function App({
     [layout.contentWidth, layout.maxTextWidth, layout.isNarrow, session.debug, spinnerFrame]
   );
 
+  // Ink's <Static> output is terminal scrollback, not an animation surface.
+  // Keep the frame stable for completed blocks so spinner ticks cannot rebuild
+  // the entire transcript (which made long runs visibly jump in some terminals).
+  const historyCtx: RenderContext = React.useMemo(
+    () => ({
+      width: layout.contentWidth,
+      textWidth: layout.maxTextWidth,
+      narrow: layout.isNarrow,
+      debug: session.debug,
+      spinnerFrame: UI_SYMBOLS.running,
+    }),
+    [layout.contentWidth, layout.maxTextWidth, layout.isNarrow, session.debug]
+  );
+
   /**
    * Finalised history, grouped per block.
    *
@@ -119,9 +134,9 @@ export function App({
     () =>
       session.blocks.map((block) => ({
         id: block.id,
-        lines: [...renderBlock(block, ctx), blank()],
+        lines: [...renderBlock(block, historyCtx), blank()],
       })),
-    [session.blocks, ctx]
+    [session.blocks, historyCtx]
   );
 
   const liveLines: Line[] = React.useMemo(
@@ -574,9 +589,9 @@ function describeError(error: unknown): Block {
   let title = "Something went wrong";
   let hint: string | undefined;
 
-  if (/OPENROUTER_API_KEY|OPENROUTER_MODEL|API key/i.test(message)) {
+  if (/OPENROUTER_API_KEY|GEMINI_API_KEY|API key/i.test(message)) {
     title = "Missing or invalid API key";
-    hint = "Set OPENROUTER_API_KEY and OPENROUTER_MODEL in graphyti's .env, then try again.";
+    hint = "Set OPENROUTER_API_KEY in graphyti's .env, then try again.";
   } else if (/HYDRA_DB|hydra/i.test(message)) {
     title = "Graph database unavailable";
     hint = "Check HYDRA_DB_API_KEY and HYDRA_DB_DATABASE, or rerun with --legacy-context.";

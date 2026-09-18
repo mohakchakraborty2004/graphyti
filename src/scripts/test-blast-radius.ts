@@ -22,8 +22,15 @@ import { extractAll } from "../extract";
 import { adjacencyFromEdges, saveGraphMap, toGraphMapEntry, type GraphMap } from "../graph/ingest";
 import { computeBlastRadius, blastRadiusSize } from "../graph/blastRadius";
 import { verifyStructuralChange } from "../verify/verifyChange";
+import { computeExpectedDelta } from "../graph/expectedDelta";
 import { resolveProjectPath } from "../utils/paths";
-import { validateEditPlan, applySchemaEdit } from "../generate/scopedEdit";
+import {
+  validateEditPlan,
+  applySchemaEdit,
+  applyScopedEdits,
+  pruneRedundantSteps,
+  StaleEditError,
+} from "../generate/scopedEdit";
 import { findFieldReferences } from "../verify/symbolRefs";
 
 // ---------------------------------------------------------------------------
@@ -555,31 +562,317 @@ function testSchemaEditIsPure(root: string) {
   );
 }
 
-function testRemoveModelCleansRelations(root: string) {
-  console.log("\n=== remove_model cleans relations ===\n");
+// ---------------------------------------------------------------------------
+// Removing a model must be a complete, verifiable operation
+// ---------------------------------------------------------------------------
+
+function testModelRemoval(root: string) {
+  console.log("\n=== Removing a Prisma model ===\n");
 
   const schemaPath = path.join(root, "prisma/schema.prisma");
-  const before = fs.readFileSync(schemaPath, "utf-8");
-  const source = `${before}
-model Comment {
-  id     Int @id
-  postId Int
-  post   Post @relation(fields: [postId], references: [id])
-}
-`;
-  const removed = applySchemaEdit(
-    source,
-    { type: "schema", model: "Post", op: "remove_model" },
-    schemaPath,
-    root,
-    { write: false }
+  const onDisk = fs.readFileSync(schemaPath, "utf-8");
+  const source = `datasource db {\n  provider = "postgresql"\n}\n\nmodel User {\n  id Int @id\n  likes LikeDislike[]\n}\n\nmodel Post {\n  id Int @id\n  likes LikeDislike[]\n}\n\nmodel LikeDislike {\n  id Int @id\n  user User @relation(fields: [userId], references: [id])\n  userId Int\n  post Post @relation(fields: [postId], references: [id])\n  postId Int\n}\n`;
+  const edit = { type: "schema" as const, model: "LikeDislike", op: "remove_model" as const };
+  const proposed = applySchemaEdit(source, edit, schemaPath, root, { write: false });
+
+  assert(!proposed.includes("model LikeDislike"), "the target model block is removed");
+  assert(!proposed.includes("LikeDislike[]"), "inverse relation fields are removed with the model");
+  assert(
+    fs.readFileSync(schemaPath, "utf-8") === onDisk,
+    "remove_model preview leaves the working schema untouched"
   );
 
-  assert(!/model\s+Post\s*\{/.test(removed), "the requested model is removed");
-  assert(!/posts\s+Post\[\]/.test(removed), "inverse relation fields are removed");
-  assert(!/post\s+Post\b/.test(removed), "external relation fields are removed");
-  assert(!/postId\s+Int\b/.test(removed), "relation-owned scalar foreign keys are removed");
-  assert(fs.readFileSync(schemaPath, "utf-8") === before, "remove_model preview leaves disk untouched");
+  const blast = {
+    changedNode: { id: "model:LikeDislike", name: "LikeDislike", kind: "PrismaModel", filePath: "prisma/schema.prisma" },
+    affectedRoutes: [],
+    affectedComponents: [],
+    affectedFiles: [{ id: "file:lib/likes.ts", name: "lib/likes.ts", filePath: "lib/likes.ts", reason: "uses LikeDislike" }],
+    advisoryFiles: [],
+    affectedFilePaths: ["lib/likes.ts"],
+    filteredOut: [],
+    staleNodes: [],
+    graphMissing: false,
+  };
+  const delta = computeExpectedDelta(edit, blast, root);
+  assert(
+    delta.changeType === "remove" && delta.targetNodeId === "model:LikeDislike",
+    "remove_model has a model-level expected delta instead of throwing Unknown op"
+  );
+
+  const missed = verifyStructuralChange(
+    [{ blastRadius: blast, oldFields: [], removedModel: "LikeDislike" }],
+    [{ path: path.join(root, "lib/likes.ts"), content: "const item: LikeDislike | null = null;" }],
+    root
+  );
+  assert(missed.missed.length === 1, "local validation blocks a dangling removed-model reference");
+
+  const addressed = verifyStructuralChange(
+    [{ blastRadius: blast, oldFields: [], removedModel: "LikeDislike" }],
+    [{ path: path.join(root, "lib/likes.ts"), content: "export const likesRemoved = true;" }],
+    root
+  );
+  assert(addressed.addressed.length === 1, "local validation clears the file once the model reference is gone");
+}
+
+// ---------------------------------------------------------------------------
+// A stale graph must not silently answer "nothing is affected"
+// ---------------------------------------------------------------------------
+
+async function testStaleGraphStillFindsDependents(root: string) {
+  console.log("\n=== A graph that has never seen the field ===\n");
+
+  const mapPath = path.join(root, ".dbagent", "graph-map.json");
+  const original = fs.readFileSync(mapPath, "utf-8");
+
+  // Drop every node for Post — field AND model — the way a graph left over from
+  // before the model existed, or from a half-finished rename, would look.
+  const map: GraphMap = JSON.parse(original);
+  for (const id of Object.keys(map)) {
+    if (id === "model:Post" || id.startsWith("field:Post.")) delete map[id];
+  }
+  fs.writeFileSync(mapPath, JSON.stringify(map, null, 2), "utf-8");
+
+  try {
+    const result = await computeBlastRadius({ model: "Post", field: "title" }, root, {
+      checkRemote: false,
+    });
+
+    // The old code returned an empty radius here. That let a rename through
+    // with "nothing else to update", and verification then had nothing to
+    // verify — so every consumer broke silently. The syntactic scan must still
+    // run when the graph cannot help.
+    assert(result.graphMissing, "the result is flagged as coming from a stale graph");
+    assertSetEqual(
+      result.affectedFilePaths,
+      ["app/api/posts/route.ts", "app/posts/page.tsx", "components/UserList.tsx"],
+      "the dependents are still found by scanning source"
+    );
+    assert(blastRadiusSize(result) === 3, "blast radius size is 3, not 0");
+    assert(
+      !result.affectedFilePaths.includes("app/layout.tsx"),
+      "precision holds without the graph — metadata title stays advisory"
+    );
+    assert(
+      !result.affectedFilePaths.includes("lib/format.ts"),
+      "precision holds without the graph — a parameter named title stays advisory"
+    );
+    assert(
+      result.changedNode.filePath === "prisma/schema.prisma",
+      "the radius still anchors on the schema file"
+    );
+
+    const healthy = await computeBlastRadius({ model: "User", field: "phone" }, root, {
+      checkRemote: false,
+    });
+    assert(!healthy.graphMissing, "a field the graph does know is not flagged");
+  } finally {
+    fs.writeFileSync(mapPath, original, "utf-8");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// An edit a previous step already made is satisfied, not stale
+// ---------------------------------------------------------------------------
+
+function testAlreadyAppliedEditsAreNotStale() {
+  console.log("\n=== Re-applying an edit that is already in place ===\n");
+
+  const after = "const x = { headline: 1 };\n";
+
+  // Exactly what a multi-step plan does: step 2 quotes the pre-rename text of a
+  // file step 1 has already rewritten. The old code threw StaleEditError, which
+  // aborted the whole plan over work that had been done correctly.
+  const already = applyScopedEdits(
+    after,
+    [{ filePath: "a.ts", oldText: "title: 1", newText: "headline: 1" }],
+    "a.ts"
+  );
+  assert(already === after, "an already-applied edit is a no-op, not an error");
+
+  // A genuinely stale edit — neither old nor new text present — must still throw.
+  let threw = false;
+  try {
+    applyScopedEdits(
+      after,
+      [{ filePath: "a.ts", oldText: "caption: 1", newText: "subtitle: 1" }],
+      "a.ts"
+    );
+  } catch (err) {
+    threw = err instanceof StaleEditError;
+  }
+  assert(threw, "an edit whose newText is absent too still raises StaleEditError");
+
+  // A mixed batch applies the outstanding edit and skips the finished one.
+  const mixed = applyScopedEdits(
+    "const a = { headline: 1, body: 2 };\n",
+    [
+      { filePath: "a.ts", oldText: "title: 1", newText: "headline: 1" },
+      { filePath: "a.ts", oldText: "body: 2", newText: "content: 2" },
+    ],
+    "a.ts"
+  );
+  assert(
+    mixed === "const a = { headline: 1, content: 2 };\n",
+    "the outstanding edit in a mixed batch is still applied"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// A file operation with nothing in it is not an operation
+// ---------------------------------------------------------------------------
+
+function testEmptyFileOpsAreDropped() {
+  console.log("\n=== File operations with no edits ===\n");
+
+  const onlyEmpty = validateEditPlan([{ type: "file", filePath: "a.ts", edits: [] }]);
+  assert(onlyEmpty.ok, "a plan of no-op file operations is valid");
+  assert(
+    onlyEmpty.ok && onlyEmpty.plan.length === 0,
+    "...but it normalises to an empty plan, so the caller reports no change"
+  );
+
+  const mixed = validateEditPlan([
+    { type: "file", filePath: "a.ts", edits: [] },
+    {
+      type: "file",
+      filePath: "b.ts",
+      edits: [{ filePath: "b.ts", oldText: "x", newText: "y" }],
+    },
+  ]);
+  assert(
+    mixed.ok && mixed.plan.length === 1,
+    "a real operation alongside a no-op survives on its own"
+  );
+
+  // Edits that are individually empty collapse the operation too.
+  const hollow = validateEditPlan([
+    { type: "file", filePath: "a.ts", edits: [{ filePath: "a.ts", oldText: "", newText: "" }] },
+  ]);
+  assert(
+    hollow.ok && hollow.plan.length === 0,
+    "an operation whose only edit is blank is dropped as well"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The classifier must not plan the propagation the radius already does
+// ---------------------------------------------------------------------------
+
+function testPropagationStepsArePruned() {
+  console.log("\n=== Pruning propagation-only steps ===\n");
+
+  const split = pruneRedundantSteps({
+    decomposable: true,
+    steps: [
+      { description: "Rename User.phone field to phoneNo in Prisma schema", kind: "structural_edit" },
+      { description: "Update phone references in apiClient and user routes", kind: "structural_edit" },
+    ],
+  });
+  assert(split.steps.length === 1, "the propagation follow-up is dropped");
+  assert(!split.decomposable, "a plan reduced to one step is no longer decomposable");
+  assert(
+    split.steps[0]!.description.includes("Rename"),
+    "the step that does the real work is the one kept"
+  );
+
+  const usages = pruneRedundantSteps({
+    decomposable: true,
+    steps: [
+      { description: "Remove Post.status", kind: "structural_edit" },
+      { description: "Fix the components that use status", kind: "structural_edit" },
+    ],
+  });
+  assert(usages.steps.length === 1, "a step naming the components that use X is recognised too");
+
+  // Genuinely independent work must survive.
+  const independent = pruneRedundantSteps({
+    decomposable: true,
+    steps: [
+      { description: "Add a Tag model to the schema", kind: "structural_edit" },
+      { description: "Create app/api/tags/route.ts", kind: "new_file" },
+    ],
+  });
+  assert(independent.steps.length === 2, "independent steps are left alone");
+
+  const newFile = pruneRedundantSteps({
+    decomposable: true,
+    steps: [
+      { description: "Rename Post.title to heading", kind: "structural_edit" },
+      { description: "Create a component that renders heading", kind: "new_file" },
+    ],
+  });
+  assert(newFile.steps.length === 2, "a new_file step is never pruned, whatever it is called");
+
+  const single = pruneRedundantSteps({
+    decomposable: false,
+    steps: [{ description: "Update the title references", kind: "structural_edit" }],
+  });
+  assert(single.steps.length === 1, "a lone step is never pruned away to nothing");
+}
+
+// ---------------------------------------------------------------------------
+// Creating a file must actually be expressible
+// ---------------------------------------------------------------------------
+
+function testNewFileCreationIsExpressible() {
+  console.log("\n=== Creating a new file ===\n");
+
+  // The documented shape must validate.
+  const direct = validateEditPlan([
+    {
+      type: "create_file",
+      filePath: "components/PostSummary.tsx",
+      content: "export default function PostSummary() { return null; }\n",
+      reason: "renders the summary",
+    },
+  ]);
+  assert(direct.ok, "a create_file operation validates");
+
+  // The old shape the prompt used to ask for — a lone edit with an empty
+  // oldText — died on ScopedEditSchema's min(1), which failed every new_file
+  // step with "Too small: expected string to have >=1 characters". It must now
+  // be converted rather than rejected.
+  const legacy = validateEditPlan([
+    {
+      type: "file",
+      filePath: "components/PostSummary.tsx",
+      edits: [
+        {
+          filePath: "components/PostSummary.tsx",
+          oldText: "",
+          newText: "export default function PostSummary() { return null; }\n",
+        },
+      ],
+    },
+  ]);
+  assert(legacy.ok, "the legacy empty-oldText shape no longer fails validation");
+  assert(
+    legacy.ok && legacy.plan.length === 1 && legacy.plan[0]!.type === "create_file",
+    "…it is converted into a create_file operation"
+  );
+  assert(
+    legacy.ok &&
+      legacy.plan[0]!.type === "create_file" &&
+      legacy.plan[0]!.content.includes("PostSummary"),
+    "…carrying the full file content"
+  );
+
+  // A blank oldText mixed into a real edit batch is dropped, not fatal.
+  const mixed = validateEditPlan([
+    {
+      type: "file",
+      filePath: "a.ts",
+      edits: [
+        { filePath: "a.ts", oldText: "", newText: "junk" },
+        { filePath: "a.ts", oldText: "x", newText: "y" },
+      ],
+    },
+  ]);
+  assert(mixed.ok, "a batch containing a blank oldText still validates");
+  assert(
+    mixed.ok && mixed.plan[0]!.type === "file" && mixed.plan[0]!.edits.length === 1,
+    "…with the unusable edit dropped and the real one kept"
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -601,7 +894,12 @@ async function main() {
     testPathNormalisation(root);
     testPlanGuards();
     testSchemaEditIsPure(root);
-    testRemoveModelCleansRelations(root);
+    testModelRemoval(root);
+    await testStaleGraphStillFindsDependents(root);
+    testAlreadyAppliedEditsAreNotStale();
+    testEmptyFileOpsAreDropped();
+    testPropagationStepsArePruned();
+    testNewFileCreationIsExpressible();
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

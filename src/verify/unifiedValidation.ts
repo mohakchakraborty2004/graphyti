@@ -22,7 +22,6 @@ export interface ValidationChange {
   blastRadius: BlastRadiusResult;
   /** Field names *this* change breaks. */
   breakingFieldNames: string[];
-  referenceMode?: "field" | "model";
   delta: ExpectedDelta;
 }
 
@@ -89,7 +88,10 @@ export async function runUnifiedValidation(
   const targets: VerifyTarget[] = changes.map((c) => ({
     blastRadius: c.blastRadius,
     oldFields: c.breakingFieldNames,
-    referenceMode: c.referenceMode ?? "field",
+    removedModel:
+      c.delta.changeType === "remove" && c.delta.targetNodeId.startsWith("model:")
+        ? c.delta.targetModel
+        : undefined,
   }));
 
   const localReport = verifyStructuralChange(targets, generatedFiles, projectRoot);
