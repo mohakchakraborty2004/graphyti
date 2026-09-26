@@ -6,7 +6,7 @@
     "graphyti": "./run.mjs"
   },
   "scripts": {
-    "test": "npm run test:commands && npm run test:intent && npm run test:prisma-commands && npm run test:pipeline && npm run test:config && npm run test:docs && npm run test:blast && npm run test:validation && npm run test:tui",
+    "test": "npm run test:commands && npm run test:intent && npm run test:prisma-commands && npm run test:pipeline && npm run test:config && npm run test:docs && npm run test:blast && npm run test:validation && npm run test:logs && npm run test:tui",
     "dev": "ts-node src/index.ts",
     "build": "node build-tui.mjs",
     "relink": "npm unlink -g graphyti && npm run build && npm link",
@@ -29,7 +29,8 @@
     "dev:next": "next dev web -p 3000",
     "build:next": "next build web",
     "test:blast": "tsx src/scripts/test-blast-radius.ts",
-    "test:validation": "tsx src/scripts/test-unified-validation.ts"
+    "test:validation": "tsx src/scripts/test-unified-validation.ts",
+    "test:logs": "tsx src/scripts/test-agent-log.ts"
   },
   "keywords": [],
   "author": "",
