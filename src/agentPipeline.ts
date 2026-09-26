@@ -162,6 +162,11 @@ export async function handleAgentOutput(
   const createFailures: WriteResult["createFailures"] = [];
   const schemaFailures: WriteResult["schemaFailures"] = [];
 
+  console.log(
+    `[agentPipeline] Starting ${plan.length} action(s) ` +
+      `(dryRun=${dryRun}, yes=${yes}, projectRoot=${projectRoot})`
+  );
+
   // ── 1. SchemaEdit entries — FIRST, and fatal on failure ─────────────
   //
   // The schema is the source of truth every other edit is derived from. When
@@ -235,6 +240,9 @@ export async function handleAgentOutput(
   if (schemaFailures.length > 0 && !dryRun) {
     console.error(
       `    ${error("✗")} ${schemaFailures.length} schema edit(s) failed — skipping all file writes and commands`
+    );
+    console.log(
+      `[agentPipeline] Stopped after schema failure(s): ${schemaFailures.length}`
     );
     return { writtenPaths, executedCommands, staleEdits, createdPaths, createFailures, schemaFailures };
   }
@@ -374,6 +382,12 @@ export async function handleAgentOutput(
     const ran = await runCommand(cmd.command, dryRun, yes, onBeforeCommand);
     if (ran) executedCommands.push(ran);
   }
+
+  console.log(
+    `[agentPipeline] Finished: written=${writtenPaths.length}, created=${createdPaths.length}, ` +
+      `commands=${executedCommands.length}, stale=${staleEdits.length}, ` +
+      `createFailures=${createFailures.length}, schemaFailures=${schemaFailures.length}`
+  );
 
   return { writtenPaths, executedCommands, staleEdits, createdPaths, createFailures, schemaFailures };
 }
