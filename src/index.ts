@@ -13,6 +13,7 @@ import { type GeneratedFile } from "./verify/verifyChange";
 import { runUnifiedValidation, type UnifiedValidationResult } from "./verify/unifiedValidation";
 import { reingestFile } from "./graph/incremental";
 import { resolveProjectPath } from "./utils/paths";
+import { configureLogger, logError, logInfo, logWarn } from "./utils/logger";
 import { regenerateAffectedFile, clampForPrompt } from "./generate/regenerateFile";
 import { injectPrismaCommands } from "./utils/prismaCommands";
 import {
@@ -114,6 +115,8 @@ program
   .command("init")
   .description("FALLBACK ONLY — write the flat .dbagent/context.json snapshot (use init-graph instead)")
   .action(async () => {
+    configureLogger({ projectRoot: process.cwd() });
+    logInfo("init.start", { mode: "legacy-context" });
     print(section("Context"));
     const spin = spinner("Initializing project context...");
     spin.start();
@@ -121,8 +124,10 @@ program
     try {
       await ContextGen();
       spin.succeed(`Context gathering complete ${info(fmtElapsed(Date.now() - t0))}`);
+      logInfo("init.end", { status: "ok", elapsedMs: Date.now() - t0 });
     } catch (err) {
       spin.fail("Context initialization failed");
+      logError("init.end", { status: "failed", error: err });
       throw err;
     }
   });
@@ -147,6 +152,9 @@ if (isTui) {
     const dryRun = args.includes("--dry-run");
     const autoConfirm = args.includes("--yes");
     const legacyContext = args.includes("--legacy-context");
+
+    configureLogger({ projectRoot: process.cwd() });
+    logInfo("tui.start", { dryRun, autoConfirm, legacyContext, version: pkg.version });
 
     await launchTui({ dryRun, autoConfirm, legacyContext });
     process.exit(0);
@@ -183,6 +191,20 @@ if (isTui) {
       exitCode: 0,
     };
 
+    // Every event below lands in the run log as well as on stdout: the
+    // terminal output is gone the moment the run ends, the file is not.
+    const runLogFile = configureLogger({ projectRoot });
+    logInfo("run.start", {
+      query,
+      dryRun,
+      yes,
+      json: jsonOut,
+      legacyContext: Boolean(options.legacyContext),
+      version: pkg.version,
+      projectRoot,
+      logFile: runLogFile,
+    });
+
     try {
 
     // ── Header ─────────────────────────────────────────────────────────────
@@ -198,26 +220,38 @@ if (isTui) {
     // =======================================================================
     print(section("Context"));
     let context: string;
+    let contextSource: "legacy" | "graph" | "fallback" = "graph";
     const ctxSpin = spinner("Retrieving codebase context...");
     ctxSpin.start();
     const ctxStart = Date.now();
 
     if (options.legacyContext) {
       ctxSpin.warn("--legacy-context: falling back to .dbagent/context.json");
+      contextSource = "legacy";
       context = formatLegacyContext(loadContext());
     } else {
       try {
-        context = (await retrieveContext(query ?? "")) ?? (() => {
+        const retrieved = await retrieveContext(query ?? "");
+        if (retrieved) {
+          context = retrieved;
+        } else {
+          contextSource = "fallback";
           ctxSpin.warn("HydraDB retrieval returned null — falling back to .dbagent/context.json");
-          return formatLegacyContext(loadContext());
-        })();
+          context = formatLegacyContext(loadContext());
+        }
       } catch (err) {
         ctxSpin.fail("Context retrieval failed");
+        logError("context.failed", { elapsedMs: Date.now() - ctxStart, error: err });
         throw err;
       }
     }
 
     const ctxElapsed = Date.now() - ctxStart;
+    logInfo("context.retrieved", {
+      source: contextSource,
+      elapsedMs: ctxElapsed,
+      lines: context.split("\n").length,
+    });
     if (ctxElapsed > 2000) {
       ctxSpin.succeed(`Context retrieved ${info(fmtElapsed(ctxElapsed))}`);
     } else {
@@ -262,6 +296,13 @@ if (isTui) {
       classSpin.succeed(`Classified ${info(fmtElapsed(classElapsed))}`);
     }
 
+    logInfo("classification", {
+      decomposable: classification.decomposable,
+      steps: classification.steps.length,
+      elapsedMs: classElapsed,
+      degraded: degraded ?? undefined,
+    });
+
     if (!classification.decomposable) {
       // Single-step: proceed exactly as before — no overhead
       print(`    ${info("Single-step operation detected")}`);
@@ -282,6 +323,12 @@ if (isTui) {
 
       jsonResult.filesWritten = stepResult.writtenPaths.map((p) => path.relative(projectRoot, p));
       jsonResult.elapsedMs = Date.now() - startTime;
+      logInfo("run.end", {
+        status: "ok",
+        exitCode: 0,
+        elapsedMs: jsonResult.elapsedMs,
+        filesWritten: jsonResult.filesWritten,
+      });
       if (jsonOut) print(JSON.stringify(jsonResult, null, 2));
       return;
     }
@@ -308,6 +355,7 @@ if (isTui) {
       });
       if (!confirmed) {
         print(`  ${warn("!")} Plan rejected by user.`);
+        logWarn("run.cancelled", { reason: "plan-rejected", exitCode: 1 });
         jsonResult.exitCode = 1;
         if (jsonOut) print(JSON.stringify(jsonResult, null, 2));
         process.exit(1);
@@ -410,6 +458,16 @@ if (isTui) {
     }
     jsonResult.filesWritten = allWrittenPaths.map((p) => path.relative(projectRoot, p));
     jsonResult.elapsedMs = Date.now() - startTime;
+    const runSummary = {
+      status: stoppedEarly ? "failed" : "ok",
+      exitCode: jsonResult.exitCode,
+      elapsedMs: jsonResult.elapsedMs,
+      steps: { planned: classification.steps.length, completed, failed, skipped },
+      filesWritten: jsonResult.filesWritten,
+      filesCreated: allCreatedPaths.map((p) => path.relative(projectRoot, p)),
+    };
+    if (stoppedEarly) logWarn("run.end", runSummary);
+    else logInfo("run.end", runSummary);
     if (jsonOut) print(JSON.stringify(jsonResult, null, 2));
     return;
 
@@ -431,6 +489,14 @@ if (isTui) {
         jsonResult.exitCode = 1;
         jsonResult.filesWritten = err.writtenPaths.map((p) => path.relative(projectRoot, p));
         jsonResult.elapsedMs = Date.now() - startTime;
+        logError("run.end", {
+          status: "blocked",
+          exitCode: 1,
+          elapsedMs: jsonResult.elapsedMs,
+          step: err.stepIndex + 1,
+          reason: err.reason,
+          filesWritten: jsonResult.filesWritten,
+        });
         if (jsonOut) print(JSON.stringify(jsonResult, null, 2));
         process.exitCode = 1;
         return;
@@ -447,6 +513,12 @@ if (isTui) {
       print(`  ${info("Stack")}: ${err instanceof Error ? err.stack : "N/A"}`);
       jsonResult.exitCode = 2;
       jsonResult.elapsedMs = Date.now() - startTime;
+      logError("run.end", {
+        status: "error",
+        exitCode: 2,
+        elapsedMs: jsonResult.elapsedMs,
+        error: err,
+      });
       if (jsonOut) print(JSON.stringify(jsonResult, null, 2));
       process.exitCode = 2;
       return;
@@ -535,6 +607,7 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
   });
 
   print(section(`[${stepLabel}]`));
+  logInfo("step.start", { step: stepIndex + 1, description, dryRun });
 
   const schemaPath = findSchemaPath(projectRoot);
   const schemaSource = schemaPath ? fs.readFileSync(schemaPath, "utf-8") : undefined;
@@ -549,13 +622,16 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
     editPlan = await extractIntentWithRetry(query, context, schemaSource);
   } catch (err) {
     intentSpin.fail("Intent extraction failed");
+    logError("intent.failed", { elapsedMs: Date.now() - intentStart, error: err });
     throw fail(`Intent extraction failed: ${err instanceof Error ? err.message : err}`);
   }
   const intentElapsed = Date.now() - intentStart;
   if (editPlan.length === 0) {
     intentSpin.info("No operations extracted.");
+    logInfo("intent.empty", { elapsedMs: intentElapsed });
     return noChange();
   }
+  logInfo("intent.extracted", { operations: editPlan.length, elapsedMs: intentElapsed });
   intentSpin.succeed(`Intent extracted ${info(fmtElapsed(intentElapsed))}`);
   print(`    ${info(`${editPlan.length} operation(s) extracted`)}`);
   print(`    ${info("Operations")}:`);
@@ -572,6 +648,12 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
   const changes = await analyzeBreakingChanges(editPlan, projectRoot);
   const mustChange = affectedFilePaths(changes);
   let promptInjection = "";
+
+  logInfo("blastRadius.computed", {
+    breakingChanges: changes.length,
+    mustChangeFiles: mustChange.length,
+    operations: editPlan.length,
+  });
 
   if (changes.length > 0) {
     print(section("Blast Radius"));
@@ -612,7 +694,10 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
           resolve(answer.trim().toLowerCase().startsWith("y"));
         });
       });
-      if (!confirmed) throw fail("Write aborted by user.");
+      if (!confirmed) {
+        logWarn("write.rejected", { reason: "user-declined", step: stepIndex + 1 });
+        throw fail("Write aborted by user.");
+      }
     }
   } else {
     const additive = schemaEditsOf(editPlan).filter((op) => op.op === "add_field");
@@ -635,9 +720,11 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
 
   if (!actions?.length) {
     genSpin.info("No actions generated.");
+    logWarn("generation.empty", { elapsedMs: genElapsed });
     return noChange();
   }
   genSpin.succeed(`Code generated ${info(fmtElapsed(genElapsed))}`);
+  logInfo("generation.complete", { actions: actions.length, elapsedMs: genElapsed });
   print(`    ${info(`${actions.length} action(s) returned from model`)}`);
 
   // ── Post-process: new-file edits (the model may return non-empty oldText) ──
@@ -732,6 +819,7 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
       });
     } catch (err) {
       verifySpin.fail("Structural verification crashed");
+      logError("verification.crashed", { error: err });
       throw fail(`Structural validation crashed: ${err instanceof Error ? err.message : err}`);
     }
 
@@ -743,10 +831,23 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
     }
     reportValidation(unifiedResult);
 
+    const verificationLog = {
+      passed: unifiedResult.overallPassed,
+      localAddressed: unifiedResult.localCheck.addressed,
+      localMissed: unifiedResult.localCheck.missed,
+      graphSkipped: unifiedResult.graphCheckSkipped,
+      staleNodes: unifiedResult.graphCheck.staleNodesFound,
+      resolution: unifiedResult.resolutionReason,
+      elapsedMs: verifyElapsed,
+    };
+    if (unifiedResult.overallPassed) logInfo("verification.result", verificationLog);
+    else logError("verification.result", verificationLog);
+
     // ── 7b. One retry for files the first pass missed ───────────────
     if (!unifiedResult.overallPassed && unifiedResult.localCheck.missed > 0) {
       print();
       print(`  ${warn("!")} Attempting one retry to fix ${unifiedResult.localCheck.missed} missed file(s)...`);
+      logWarn("verification.retry", { missed: unifiedResult.localCheck.missed });
       const retrySpin = spinner("Re-generating for missed files...");
       retrySpin.start();
       const retryStart = Date.now();
@@ -822,6 +923,10 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
 
       if (retryResult.localCheck.missed > 0) {
         retrySpin.fail(`Retry failed ${info(fmtElapsed(retryElapsed))}`);
+        logError("verification.retry.failed", {
+          stillMissed: retryResult.localCheck.missed,
+          elapsedMs: retryElapsed,
+        });
         printErr(`\n  ${error("✗")} Retry still missed ${retryResult.localCheck.missed} file(s):`);
         for (const m of retryResult.localCheck.report.missed) {
           printErr(`    ${sym.bullet} ${m.filePath}`);
@@ -834,6 +939,10 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
       }
 
       retrySpin.succeed(`Retry succeeded ${info(fmtElapsed(retryElapsed))}`);
+      logInfo("verification.retry.succeeded", {
+        addressed: retryResult.localCheck.addressed,
+        elapsedMs: retryElapsed,
+      });
       print(`  ${sym.ok} All ${retryResult.localCheck.addressed} blast-radius file(s) now addressed`);
       verifiedActions = merged;
       print();
@@ -859,8 +968,18 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
     onBeforeCommand: () => { writeSpin.stop(); },
   });
 
+  const writeElapsed = Date.now() - writeStart;
+  logInfo("write.complete", {
+    dryRun,
+    written: result.writtenPaths.length,
+    created: result.createdPaths.length,
+    commands: result.executedCommands.length,
+    staleEdits: result.staleEdits.length,
+    elapsedMs: writeElapsed,
+  });
+
   console.log(
-    `    ${sym.ok} ${dryRun ? "Preview" : "Write"} complete ${info(fmtElapsed(Date.now() - writeStart))}`
+    `    ${sym.ok} ${dryRun ? "Preview" : "Write"} complete ${info(fmtElapsed(writeElapsed))}`
   );
   print();
 
@@ -868,6 +987,15 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
   // Reported before anything else: a failed schema edit aborts the whole write,
   // so there is nothing on disk and nothing else worth reporting.
   if (result.schemaFailures.length > 0) {
+    logError("write.schemaFailed", {
+      count: result.schemaFailures.length,
+      failures: result.schemaFailures.map((f) => ({
+        op: f.edit.op,
+        model: f.edit.model,
+        field: f.edit.fieldName,
+        error: f.error,
+      })),
+    });
     printErr(`\n  ${error("✗")} ${result.schemaFailures.length} schema edit(s) failed:`);
     for (const { edit, error: msg } of result.schemaFailures) {
       printErr(`    ${sym.bullet} ${edit.op} on ${edit.model}.${edit.fieldName ?? ""} — ${msg}`);
@@ -925,6 +1053,7 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
 
     staleSpin.stop();
     if (failedPaths.length > 0) {
+      logError("write.staleRetryFailed", { count: failedPaths.length, paths: failedPaths });
       printErr(`\n  ${error("✗")} Stale edit retry failed for ${failedPaths.length} file(s):`);
       for (const p of failedPaths) printErr(`    ${sym.bullet} ${p}`);
       throw new StepError(
@@ -936,11 +1065,16 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
       );
     }
     print(`  ${sym.ok} All stale edits retried successfully`);
+    logInfo("write.staleRetryOk", { retried: result.staleEdits.length });
     print();
   }
 
   // ── Handle create-file failures ──────────────────────────────────
   if (result.createFailures.length > 0) {
+    logError("write.createFailed", {
+      count: result.createFailures.length,
+      failures: result.createFailures.map((f) => ({ path: f.edit.filePath, error: f.error })),
+    });
     printErr(`\n  ${error("✗")} ${result.createFailures.length} create-file operation(s) failed:`);
     for (const { edit, error: msg } of result.createFailures) {
       printErr(`    ${sym.bullet} ${edit.filePath} — ${msg}`);
@@ -963,17 +1097,29 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
     const idxSpin = spinner("Updating graph index...");
     idxSpin.start();
     const idxStart = Date.now();
+    let reingestFailures = 0;
     for (const absPath of allPaths) {
       try {
         await reingestFile(absPath, projectRoot);
       } catch (err) {
+        reingestFailures++;
+        logWarn("graph.reingest.failed", {
+          path: path.relative(projectRoot, absPath),
+          error: err,
+        });
         printErr(
           `  ${warn("!")} reingest failed for ${absPath}:`,
           err instanceof Error ? err.message : err
         );
       }
     }
-    idxSpin.succeed(`Graph index updated ${info(fmtElapsed(Date.now() - idxStart))}`);
+    const idxElapsed = Date.now() - idxStart;
+    logInfo("graph.reingested", {
+      files: allPaths.length,
+      failed: reingestFailures,
+      elapsedMs: idxElapsed,
+    });
+    idxSpin.succeed(`Graph index updated ${info(fmtElapsed(idxElapsed))}`);
     print();
   }
 

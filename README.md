@@ -109,7 +109,7 @@ HydraDB is given the edges rather than left to infer them from prose.
 | `client.context.delete` — drop nodes that no longer exist | [`src/graph/ingest.ts:304`](src/graph/ingest.ts#L304) |
 | `client.context.status` polling until `graph_creation` / `completed` | [`src/graph/hydraClient.ts:79`](src/graph/hydraClient.ts#L79) |
 
-Invoked by `graphyti init-graph` → [`src/cli/init-graph.ts:6`](src/cli/init-graph.ts#L6).
+Invoked by `graphyti init-graph` → [`src/cli/init-graph.ts:7`](src/cli/init-graph.ts#L7).
 
 ### 2. Incremental updates — `src/graph/incremental.ts`
 
@@ -124,7 +124,7 @@ local graph map, so the graph stays current without a full re-ingest.
 | `client.context.ingest` — changed nodes only | [`src/graph/incremental.ts:79`](src/graph/incremental.ts#L79) |
 | `waitForIndexed` before the run reports success | [`src/graph/incremental.ts:115`](src/graph/incremental.ts#L115) |
 
-Called per written file from [`src/index.ts:964`](src/index.ts#L964).
+Called per written file from [`src/index.ts:1103`](src/index.ts#L1103).
 
 ### 3. Graph-grounded retrieval — `src/generate/retrieveContext.ts`
 
@@ -133,13 +133,13 @@ dump. This is the "grounding at generation time" step.
 
 | What | Where |
 | --- | --- |
-| `client.query({ ... })` | [`src/generate/retrieveContext.ts:20`](src/generate/retrieveContext.ts#L20) |
-| `queryBy: "hybrid"`, `mode: "thinking"` | [`src/generate/retrieveContext.ts:25`](src/generate/retrieveContext.ts#L25) |
-| **`graphContext: true`** — pulls related nodes, not just text matches | [`src/generate/retrieveContext.ts:27`](src/generate/retrieveContext.ts#L27) |
-| **`buildString(result)`** — SDK helper formats the envelope for the LLM; no hand-rolled JSON in the prompt | [`src/generate/retrieveContext.ts:33`](src/generate/retrieveContext.ts#L33) |
-| `HydraDBError` handling — logs `error_code` + `request_id`, returns null | [`src/generate/retrieveContext.ts:35`](src/generate/retrieveContext.ts#L35) |
+| `client.query({ ... })` | [`src/generate/retrieveContext.ts:22`](src/generate/retrieveContext.ts#L22) |
+| `queryBy: "hybrid"`, `mode: "thinking"` | [`src/generate/retrieveContext.ts:27`](src/generate/retrieveContext.ts#L27) |
+| **`graphContext: true`** — pulls related nodes, not just text matches | [`src/generate/retrieveContext.ts:29`](src/generate/retrieveContext.ts#L29) |
+| **`buildString(result)`** — SDK helper formats the envelope for the LLM; no hand-rolled JSON in the prompt | [`src/generate/retrieveContext.ts:35`](src/generate/retrieveContext.ts#L35) |
+| `HydraDBError` handling — logs `error_code` + `request_id`, returns null | [`src/generate/retrieveContext.ts:39`](src/generate/retrieveContext.ts#L39) |
 
-Consumed at [`src/index.ts:201`](src/index.ts#L201).
+Consumed at [`src/index.ts:234`](src/index.ts#L234).
 
 ### 4. Blast-radius cross-check — `src/graph/blastRadius.ts`
 
@@ -211,6 +211,41 @@ same gate as the blast-radius confirmation; the canonical parsed argv is what
 actually runs, via `spawnSync`, not the model's original string. `--yes`
 auto-confirms; a non-interactive terminal without `--yes` refuses to run rather
 than hanging. See [`src/agentPipeline.ts`](src/agentPipeline.ts).
+
+---
+
+## Run logs
+
+Every run appends to `.dbagent/logs/graphyti.log` in the target project —
+beside `graph-map.json`, in the same directory Graphyti already uses for its
+own state. (Add `.dbagent` to the target project's `.gitignore` if it is not
+there already; this repository already ignores it.) One line per event:
+
+```
+2026-09-27T10:12:03.412Z INFO  run.start {"query":"add a heading field to Post","dryRun":false,...}
+2026-09-27T10:12:04.180Z INFO  blastRadius.computed {"breakingChanges":1,"mustChangeFiles":3}
+2026-09-27T10:12:07.995Z ERROR verification.result {"passed":false,"localMissed":1,...}
+2026-09-27T10:12:08.002Z ERROR run.end {"status":"blocked","exitCode":1,...}
+```
+
+Event names are stable — `run.start`, `intent.extracted`,
+`blastRadius.computed`, `verification.result`, `command.refused`,
+`file.updated`, `graph.reingested` — so a failed run can be reconstructed long
+after the terminal has scrolled past it, including the two details that are
+easiest to lose: *why* a write was blocked and *which* command the allowlist
+refused.
+
+- The log is written, never printed: it cannot disturb `--json` output and
+  cannot tear the TUI's live frame.
+- Logging can never fail a run. An unwritable destination disables the file for
+  good and the pipeline carries on unchanged.
+- Secrets are redacted before they reach disk — by key (`apiKey`, `token`,
+  `Authorization`, …) and by value (`sk-…`, `Bearer …`), at any depth.
+- The file rotates at 2 MB; the previous contents become `graphyti.log.1`.
+- `GRAPHYTI_LOG=path/to/file.log` relocates it (a relative path resolves
+  against the target project); `GRAPHYTI_LOG=off` turns file logging off.
+
+Covered by `npm run test:logging`.
 
 ---
 

@@ -9,6 +9,7 @@ import type { EditPlan, FileEdit, SchemaEdit, CommandAction, CreateFile } from "
 import { applyScopedEdits, applySchemaEdit, checkSyntax } from "./generate/scopedEdit";
 import { StaleEditError, AmbiguousEditError } from "./generate/scopedEdit";
 import { resolveProjectPath } from "./utils/paths";
+import { logError, logInfo, logWarn } from "./utils/logger";
 
 export { StaleEditError, AmbiguousEditError };
 
@@ -61,12 +62,14 @@ function safeResolve(
 ): { abs: string; rel: string } | null {
   const resolved = resolveProjectPath(filePath, projectRoot);
   if (!resolved) {
+    logWarn("file.refused", { path: filePath, reason: `${label} resolves outside the project root` });
     console.error(
       `    ${error("✗")} Refused ${label}: ${filePath} resolves outside the project root`
     );
     return null;
   }
   if (resolved.corrected) {
+    logWarn("file.pathCorrected", { from: filePath, to: resolved.rel });
     console.log(
       `    ${warn("!")} Corrected path ${filePath} → ${resolved.rel} (duplicated project-root prefix)`
     );
@@ -83,7 +86,9 @@ async function runCommand(
   const check = parseAllowedCommand(cmd);
 
   if (!check.ok) {
-    console.error(`    ${error("✗")} Refused to run command: ${typeof cmd === "string" ? cmd : String(cmd)}`);
+    const attempted = typeof cmd === "string" ? cmd : String(cmd);
+    logWarn("command.refused", { command: attempted, reason: check.reason });
+    console.error(`    ${error("✗")} Refused to run command: ${attempted}`);
     console.error(`      ${check.reason}`);
     console.error(`      Only these command shapes are ever executed:`);
     for (const line of ALLOWLIST_HELP) console.error(`        ${sym.bullet} ${line}`);
@@ -91,6 +96,7 @@ async function runCommand(
   }
 
   if (dryRun) {
+    logInfo("command.preview", { command: check.display });
     console.log(`    ${info("›")} Would run: ${check.display}`);
     return null;
   }
@@ -99,8 +105,13 @@ async function runCommand(
   console.log(`      cwd: ${process.cwd()}`);
 
   if (yes) {
+    logInfo("command.autoConfirmed", { command: check.display });
     console.log(`    ${info("ℹ")} Auto-confirmed (--yes)`);
   } else if (!process.stdin.isTTY) {
+    logWarn("command.blocked", {
+      command: check.display,
+      reason: "no interactive terminal; re-run with --yes to auto-confirm",
+    });
     console.error(
       `    ${error("✗")} Not running: no interactive terminal. ` +
         `Re-run with --yes to auto-confirm.`
@@ -109,6 +120,7 @@ async function runCommand(
   } else {
     const confirmed = await askConfirm(`    Run this command? [y/N] `);
     if (!confirmed) {
+      logWarn("command.skipped", { command: check.display, reason: "declined by user" });
       console.log(`    ${warn("!")} Skipped by user.`);
       return null;
     }
@@ -118,20 +130,32 @@ async function runCommand(
 
   const isWindows = process.platform === "win32";
   const [exe, ...args] = check.argv;
+  const started = Date.now();
   const result = spawnSync(isWindows ? `${exe}.cmd` : exe, args, {
     stdio: "inherit",
     shell: isWindows,
   });
 
   if (result.error) {
+    logError("command.failed", {
+      command: check.display,
+      error: result.error,
+      elapsedMs: Date.now() - started,
+    });
     console.error(`    ${error("✗")} Failed to run: ${check.display}`, result.error.message);
     return null;
   }
   if (result.status !== 0) {
+    logError("command.failed", {
+      command: check.display,
+      exitCode: result.status,
+      elapsedMs: Date.now() - started,
+    });
     console.error(`    ${error("✗")} Exited with code ${result.status}: ${check.display}`);
     return null;
   }
 
+  logInfo("command.executed", { command: check.display, elapsedMs: Date.now() - started });
   console.log(`    ${sym.ok} Executed: ${check.display}`);
   return check.display;
 }
@@ -181,6 +205,7 @@ export async function handleAgentOutput(
     const schemaPath = candidates.find((p) => fs.existsSync(p));
     if (!schemaPath) {
       const msg = `No schema.prisma found for ${schemaEdit.op} on ${schemaEdit.model}`;
+      logError("schema.notFound", { op: schemaEdit.op, model: schemaEdit.model, error: msg });
       console.error(`    ${error("✗")} ${msg}`);
       schemaFailures.push({ edit: schemaEdit, error: msg });
       continue;
@@ -223,8 +248,21 @@ export async function handleAgentOutput(
       }
 
       writtenPaths.push(schemaPath);
+      logInfo("schema.updated", {
+        file: relSchemaPath,
+        op: schemaEdit.op,
+        model: schemaEdit.model,
+        field: schemaEdit.fieldName,
+        newField: schemaEdit.newFieldName,
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      logError("schema.editFailed", {
+        op: schemaEdit.op,
+        model: schemaEdit.model,
+        field: schemaEdit.fieldName,
+        error: msg,
+      });
       console.error(`    ${error("✗")} Schema edit failed: ${msg}`);
       schemaFailures.push({ edit: schemaEdit, error: msg });
     }
@@ -263,6 +301,11 @@ export async function handleAgentOutput(
           }
         } catch (err) {
           if (err instanceof StaleEditError || err instanceof AmbiguousEditError) {
+            logWarn("file.staleEdit", {
+              path: resolved.rel,
+              dryRun: true,
+              error: err.message,
+            });
             console.error(`\n  ${error("✗")} ${err.message}`);
             for (const f of err.failures) {
               console.error(`    ${sym.bullet} ${f.filePath}: ${f.oldText}${f.count !== undefined ? ` (${f.count} matches)` : ""}`);
@@ -289,8 +332,13 @@ export async function handleAgentOutput(
         fs.writeFileSync(absPath, fileEdit.edits[0].newText, "utf-8");
         console.log(`    ${sym.ok} Created: ${absPath}`);
         writtenPaths.push(absPath);
+        logInfo("file.created", { path: resolved.rel });
         continue;
       }
+      logWarn("file.writeSkipped", {
+        path: resolved.rel,
+        reason: "file does not exist and no creation edit",
+      });
       console.error(`    ${error("✗")} File does not exist and no creation edit: ${absPath}`);
       continue;
     }
@@ -308,9 +356,11 @@ export async function handleAgentOutput(
       }
 
       writtenPaths.push(absPath);
+      logInfo("file.updated", { path: resolved.rel, edits: fileEdit.edits.length });
     } catch (err) {
       if (err instanceof StaleEditError || err instanceof AmbiguousEditError) {
         // Collect for retry — do NOT write anything for this file
+        logWarn("file.staleEdit", { path: resolved.rel, error: err.message });
         console.error(`    ${error("✗")} ${err.message}`);
         staleEdits.push({ edit: fileEdit, error: err });
       } else {
@@ -347,6 +397,7 @@ export async function handleAgentOutput(
     // Actual write
     if (fs.existsSync(absPath)) {
       const msg = `File already exists — cannot create ${createOp.filePath}. The plan assumed this file did not exist (stale graph state or planning bug).`;
+      logError("file.createFailed", { path: createOp.filePath, error: msg });
       console.error(`    ${error("✗")} ${msg}`);
       createFailures.push({ edit: createOp, error: msg });
       continue;
@@ -355,6 +406,7 @@ export async function handleAgentOutput(
     // Syntax sanity check before writing
     const syntaxCheck = checkSyntax(createOp.content, createOp.filePath);
     if (!syntaxCheck.ok) {
+      logError("file.createFailed", { path: createOp.filePath, error: syntaxCheck.reason });
       console.error(`    ${error("✗")} ${syntaxCheck.reason}`);
       createFailures.push({ edit: createOp, error: syntaxCheck.reason });
       continue;
@@ -365,6 +417,7 @@ export async function handleAgentOutput(
     fs.writeFileSync(absPath, createOp.content, "utf-8");
     console.log(`    ${sym.ok} Created: ${absPath} ${info(`— ${createOp.reason}`)}`);
     createdPaths.push(absPath);
+    logInfo("file.created", { path: createOp.filePath, reason: createOp.reason });
   }
 
   // ── 4. CommandAction entries ─────────────────────────────────────────
