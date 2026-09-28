@@ -10,6 +10,9 @@ import {
   type BlastRadiusResult,
 } from "../graph/blastRadius";
 import { success, error, warn, info, sym, bold } from "../cli/theme";
+import { createLogger } from "../utils/logger";
+
+const log = createLogger("prewrite");
 
 // ---------------------------------------------------------------------------
 // Public-facing types
@@ -160,14 +163,18 @@ function diffSchema(item: CodeGenItem, projectRoot: string): SchemaDiff | null {
     ? fullPath
     : path.resolve(projectRoot, fullPath);
 
+  const relPath = path.relative(projectRoot, absPath).replace(/\\/g, "/");
+
   // Net-new file — nothing to compare against
-  if (!fs.existsSync(absPath)) return null;
+  if (!fs.existsSync(absPath)) {
+    log.debug(`${relPath}: net-new schema.prisma — nothing to diff against`);
+    return null;
+  }
 
   const oldSource = fs.readFileSync(absPath, "utf-8");
   // CodeGenItem.content may use literal \n sequences from the JSON schema response
   const newSource = item.content.replace(/\\n/g, "\n");
 
-  const relPath = path.relative(projectRoot, absPath).replace(/\\/g, "/");
   const oldParsed = extractPrismaSchemaFromSource(oldSource, relPath);
   const newParsed = extractPrismaSchemaFromSource(newSource, relPath);
 
@@ -175,6 +182,10 @@ function diffSchema(item: CodeGenItem, projectRoot: string): SchemaDiff | null {
   // almost certainly produced a truncated or malformed file. Bail out early
   // so we don't misinterpret every missing model's fields as "removed".
   if (!isPlausibleNewSchema(oldParsed, newParsed)) {
+    log.warn(
+      `${relPath}: ${newParsed.models.length} generated model(s) vs ${oldParsed.models.length} on disk — ` +
+        `skipping diff to avoid a false blast radius`
+    );
     console.warn(
       `  ${warn("!")} Generated schema has fewer models than current ` +
       `(${newParsed.models.length} vs ${oldParsed.models.length}) — ` +
@@ -218,6 +229,11 @@ function diffSchema(item: CodeGenItem, projectRoot: string): SchemaDiff | null {
   const breakingModels = new Set(allBreaking.map((c) => c.modelName));
   const affectedModelIds = [...breakingModels].map((name) => `model:${name}`);
 
+  log.debug(
+    `${relPath}: ${allBreaking.length} breaking, ${allAdditive.length} additive ` +
+      `across ${allModels.size} model(s); ${affectedModelIds.length} model(s) gated`
+  );
+
   return { breaking: allBreaking, additive: allAdditive, affectedModelIds };
 }
 
@@ -259,6 +275,8 @@ function collectSchemaDiffs(
     }
   }
 
+  log.debug(`collected ${diffs.length} schema diff(s)${truncated ? "; truncation detected" : ""}`);
+
   return { diffs, truncated };
 }
 
@@ -290,6 +308,7 @@ export async function preWriteCheck(
   const { diffs, truncated } = collectSchemaDiffs(items, projectRoot);
 
   if (truncated) {
+    log.error("generated schema looks truncated — aborting before any write");
     console.error(
       `\n  ${error("✗")} Generated schema has fewer models than current — ` +
       `looks truncated or malformed. Aborting to prevent data loss.\n` +
@@ -300,6 +319,7 @@ export async function preWriteCheck(
 
   if (diffs.length === 0) {
     // No schema writes, or all schema writes are net-new files
+    log.debug("no schema.prisma diff to check — write approved without gating");
     return { blastResults: [], promptInjection: "", confirmed: true, breakingFieldNamesPerModel: [] };
   }
 
@@ -307,6 +327,11 @@ export async function preWriteCheck(
   const allBreaking: FieldChange[] = diffs.flatMap((d) => d.breaking);
   const allAdditive: FieldChange[] = diffs.flatMap((d) => d.additive);
   const breakingModelIds = [...new Set(diffs.flatMap((d) => d.affectedModelIds))];
+
+  log.debug(
+    `${allBreaking.length} breaking field(s) in ${breakingModelIds.length} model(s), ` +
+      `${allAdditive.length} additive field(s)`
+  );
 
   // -------------------------------------------------------------------------
   // 2. Print additive changes — informational only, never blocks
@@ -319,6 +344,7 @@ export async function preWriteCheck(
   // 3. If there are no breaking changes, proceed immediately
   // -------------------------------------------------------------------------
   if (allBreaking.length === 0) {
+    log.debug("schema change is additive only — no blast radius, approved without prompting");
     return { blastResults: [], promptInjection: "", confirmed: true, breakingFieldNamesPerModel: [] };
   }
 
