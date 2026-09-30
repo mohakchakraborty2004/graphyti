@@ -302,6 +302,16 @@ const projectRoot = requiredTargetProject();
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use((req, res, next) => {
+  const startedAt = Date.now();
+  console.info(`[api] ${req.method} ${req.path} started`);
+
+  res.on("finish", () => {
+    console.info(`[api] ${req.method} ${req.path} ${res.statusCode} ${Date.now() - startedAt}ms`);
+  });
+
+  next();
+});
 
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 app.use(auth);
