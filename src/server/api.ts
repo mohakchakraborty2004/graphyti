@@ -3,6 +3,7 @@ import cors from "cors";
 import fs from "fs";
 import path from "path";
 import { execFileSync } from "child_process";
+import { randomUUID } from "crypto";
 import { createServer, type IncomingMessage } from "http";
 import { WebSocket, WebSocketServer } from "ws";
 import { CancelledError, runPipeline, type PipelineEvents } from "../tui/engine/runPipeline";
@@ -45,6 +46,24 @@ class ApiError extends Error {
   constructor(message: string, readonly status = 500) {
     super(message);
   }
+}
+
+type LogLevel = "info" | "warn" | "error";
+
+/**
+ * Emit one-line, machine-readable operational logs without including query
+ * text, authorization headers, or other credentials.
+ */
+function apiLog(level: LogLevel, event: string, details: Record<string, unknown> = {}) {
+  const entry = JSON.stringify({
+    timestamp: new Date().toISOString(),
+    level,
+    event,
+    ...details,
+  });
+  if (level === "error") console.error(entry);
+  else if (level === "warn") console.warn(entry);
+  else console.log(entry);
 }
 
 function requiredTargetProject(): string {
@@ -300,6 +319,24 @@ async function executeQuery(
 
 const projectRoot = requiredTargetProject();
 const app = express();
+app.use((req, res, next) => {
+  const requestId = randomUUID();
+  const startedAt = Date.now();
+  res.locals.requestId = requestId;
+  res.setHeader("x-request-id", requestId);
+
+  res.on("finish", () => {
+    const level: LogLevel = res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";
+    apiLog(level, "http_request_complete", {
+      requestId,
+      method: req.method,
+      path: req.path,
+      statusCode: res.statusCode,
+      elapsedMs: Date.now() - startedAt,
+    });
+  });
+  next();
+});
 app.use(cors());
 app.use(express.json());
 
@@ -315,10 +352,23 @@ app.get("/api/status", (_req, res, next) => {
 });
 
 app.post("/api/init", async (_req, res, next) => {
+  const startedAt = Date.now();
+  apiLog("info", "graph_init_started", { requestId: res.locals.requestId });
   try {
     await runInitGraph(projectRoot);
-    res.json({ success: true, ...graphCounts(projectRoot) });
+    const counts = graphCounts(projectRoot);
+    apiLog("info", "graph_init_completed", {
+      requestId: res.locals.requestId,
+      elapsedMs: Date.now() - startedAt,
+      ...counts,
+    });
+    res.json({ success: true, ...counts });
   } catch (error) {
+    apiLog("error", "graph_init_failed", {
+      requestId: res.locals.requestId,
+      elapsedMs: Date.now() - startedAt,
+      error: error instanceof Error ? error.message : String(error),
+    });
     next(error);
   }
 });
@@ -330,16 +380,42 @@ app.post("/api/query", async (req: Request<object, object, QueryBody>, res, next
     return;
   }
 
+  const startedAt = Date.now();
+  const dryRun = req.body.dryRun === true;
+  apiLog("info", "query_started", {
+    requestId: res.locals.requestId,
+    transport: "http",
+    dryRun,
+    queryLength: query.length,
+  });
   try {
-    res.json(await executeQuery(query, req.body.dryRun === true, projectRoot));
+    const result = await executeQuery(query, dryRun, projectRoot);
+    apiLog(result.exitCode === 0 ? "info" : "warn", "query_completed", {
+      requestId: res.locals.requestId,
+      transport: "http",
+      elapsedMs: Date.now() - startedAt,
+      exitCode: result.exitCode,
+      filesWritten: result.filesWritten.length,
+      graphIndexUpdated: result.graphIndexUpdated,
+      branch: result.branch,
+      pushed: result.push?.pushed,
+      prCreated: Boolean(result.prUrl),
+    });
+    res.json(result);
   } catch (error) {
+    apiLog("error", "query_failed", {
+      requestId: res.locals.requestId,
+      transport: "http",
+      elapsedMs: Date.now() - startedAt,
+      error: error instanceof Error ? error.message : String(error),
+    });
     next(error);
   }
 });
 
 app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
   const message = error instanceof Error ? error.message : String(error);
-  console.error("API request failed:", message);
+  apiLog("error", "http_request_failed", { requestId: res.locals.requestId, error: message });
   res.status(error instanceof ApiError ? error.status : 500).json({ error: message });
 });
 
@@ -348,13 +424,31 @@ const wss = new WebSocketServer({ noServer: true });
 
 wss.on("connection", (socket: WebSocket, _request: IncomingMessage, context: { query: string; dryRun: boolean }) => {
   const abort = new AbortController();
+  const requestId = randomUUID();
+  const startedAt = Date.now();
   let completed = false;
+  let disconnected = false;
+  apiLog("info", "query_started", {
+    requestId,
+    transport: "websocket",
+    dryRun: context.dryRun,
+    queryLength: context.query.length,
+  });
   const send = (message: StreamMessage) => {
     if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
   };
 
   socket.on("close", () => {
-    if (!completed) abort.abort();
+    if (!completed) {
+      disconnected = true;
+      apiLog("warn", "query_cancelled", {
+        requestId,
+        transport: "websocket",
+        elapsedMs: Date.now() - startedAt,
+        reason: "client_disconnected",
+      });
+      abort.abort();
+    }
   });
 
   void (async () => {
@@ -367,10 +461,29 @@ wss.on("connection", (socket: WebSocket, _request: IncomingMessage, context: { q
         abort.signal
       );
       completed = true;
+      if (!disconnected) {
+        apiLog(result.exitCode === 0 ? "info" : "warn", "query_completed", {
+          requestId,
+          transport: "websocket",
+          elapsedMs: Date.now() - startedAt,
+          exitCode: result.exitCode,
+          filesWritten: result.filesWritten.length,
+          graphIndexUpdated: result.graphIndexUpdated,
+          branch: result.branch,
+          pushed: result.push?.pushed,
+          prCreated: Boolean(result.prUrl),
+        });
+      }
       send({ stage: "complete", result });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       completed = true;
+      apiLog("error", "query_failed", {
+        requestId,
+        transport: "websocket",
+        elapsedMs: Date.now() - startedAt,
+        error: message,
+      });
       send({ stage: "complete", status: "error", message, result: {
         query: context.query,
         filesWritten: [],
@@ -391,6 +504,7 @@ wss.on("connection", (socket: WebSocket, _request: IncomingMessage, context: { q
 server.on("upgrade", (request, socket, head) => {
   const requestUrl = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
   if (requestUrl.pathname !== "/api/query/stream") {
+    apiLog("warn", "websocket_upgrade_rejected", { path: requestUrl.pathname, statusCode: 404 });
     socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
     socket.destroy();
     return;
@@ -398,6 +512,7 @@ server.on("upgrade", (request, socket, head) => {
 
   const expected = process.env.GRAPHYTI_API_TOKEN;
   if (!expected || request.headers.authorization !== `Bearer ${expected}`) {
+    apiLog("warn", "websocket_upgrade_rejected", { path: requestUrl.pathname, statusCode: 401 });
     socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
     socket.destroy();
     return;
@@ -405,6 +520,7 @@ server.on("upgrade", (request, socket, head) => {
 
   const query = requestUrl.searchParams.get("query")?.trim() ?? "";
   if (!query) {
+    apiLog("warn", "websocket_upgrade_rejected", { path: requestUrl.pathname, statusCode: 400 });
     socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
     socket.destroy();
     return;
@@ -419,4 +535,4 @@ server.on("upgrade", (request, socket, head) => {
 });
 
 const port = Number(process.env.PORT ?? 4000);
-server.listen(port, () => console.log(`Graphyti API listening on http://127.0.0.1:${port} for ${projectRoot}`));
+server.listen(port, () => apiLog("info", "server_started", { port, projectRoot }));
