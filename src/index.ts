@@ -29,6 +29,9 @@ import {
   fmtElapsed, rule, section, summaryBox, row,
   setJsonMode, isJsonMode, print, printErr,
 } from "./cli/theme";
+import { beginAgentRun, endAgentRun, log, setAgentRunFields, setLauncherLogLevel, type LogFields } from "./utils/agentLog";
+import { configSummary } from "./config";
+import { getConfiguredModel } from "./generate/llmClient";
 import ora from "ora";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -147,6 +150,9 @@ if (isTui) {
     const dryRun = args.includes("--dry-run");
     const autoConfirm = args.includes("--yes");
     const legacyContext = args.includes("--legacy-context");
+    // The TUI starts a run per prompt and has nowhere to thread a level
+    // through, so it is recorded once here for every run that follows.
+    setLauncherLogLevel(flagValue(args, "--log"));
 
     await launchTui({ dryRun, autoConfirm, legacyContext });
     process.exit(0);
@@ -161,17 +167,40 @@ if (isTui) {
     .option("--dry-run", "Show blast radius and generated code without writing any files")
     .option("--yes", "Skip the blast-radius and command confirmation prompts and auto-confirm all writes")
     .option("--json", "Output machine-readable JSON (no spinners, no ANSI)")
-    .action(async (query: string | undefined, options: Record<string, boolean>) => {
+    .option(
+      "--log <level>",
+      "Agent run log verbosity: off | error | warn | info | debug (default info, or $GRAPHYTI_LOG)"
+    )
+    .action(async (query: string | undefined, options: Record<string, boolean | string>) => {
     if (!query) {
       program.help();
     }
-    const dryRun = options.dryRun ?? false;
-    const yes    = options.yes    ?? false;
-    const jsonOut = options.json ?? false;
+    // Commander types every option as boolean | string, because some of them
+    // take a value. These three are flags, so only a literal `true` enables one.
+    const dryRun = options.dryRun === true;
+    const yes    = options.yes   === true;
+    const jsonOut = options.json === true;
     const projectRoot = process.cwd();
     const startTime = Date.now();
 
     if (jsonOut) setJsonMode(true);
+
+    // One log file per invocation, written before anything else can fail, so a
+    // run that dies in the first seconds is still diagnosable.
+    const logFile = beginAgentRun({
+      projectRoot,
+      source: "cli",
+      level: typeof options.log === "string" ? options.log : undefined,
+      fields: {
+        query: query ?? "",
+        dryRun,
+        autoConfirm: yes,
+        legacyContext: Boolean(options.legacyContext),
+        model: getConfiguredModel(),
+        // Never the values themselves — configSummary() reports set / MISSING.
+        config: configSummary(),
+      },
+    });
 
     const jsonResult: Record<string, any> = {
       query,
@@ -181,6 +210,17 @@ if (isTui) {
       graphIndexUpdated: false,
       elapsedMs: 0,
       exitCode: 0,
+      ...(logFile ? { logFile } : {}),
+    };
+
+    /** Close the run log, then emit the machine-readable result. */
+    const finish = (summary: Record<string, unknown> = {}) => {
+      endAgentRun({
+        ...summary,
+        filesWritten: jsonResult.filesWritten.length,
+        exitCode: jsonResult.exitCode,
+      });
+      if (jsonOut) print(JSON.stringify(jsonResult, null, 2));
     };
 
     try {
@@ -191,6 +231,9 @@ if (isTui) {
     print(rule());
     print(row("Query", accent(query)));
     if (dryRun) print(row("Mode", info("dry-run")));
+    // Say where the run is being recorded. A log nobody can find is a log
+    // nobody reads.
+    if (logFile) print(row("Log", info(path.relative(projectRoot, logFile) || logFile)));
     print();
 
     // =======================================================================
@@ -201,23 +244,34 @@ if (isTui) {
     const ctxSpin = spinner("Retrieving codebase context...");
     ctxSpin.start();
     const ctxStart = Date.now();
+    let contextSource = options.legacyContext ? "legacy" : "graph";
 
     if (options.legacyContext) {
       ctxSpin.warn("--legacy-context: falling back to .dbagent/context.json");
       context = formatLegacyContext(loadContext());
     } else {
       try {
-        context = (await retrieveContext(query ?? "")) ?? (() => {
+        const retrieved = await retrieveContext(query ?? "");
+        if (retrieved === null) {
           ctxSpin.warn("HydraDB retrieval returned null — falling back to .dbagent/context.json");
-          return formatLegacyContext(loadContext());
-        })();
+          contextSource = "fallback";
+        }
+        context = retrieved ?? formatLegacyContext(loadContext());
       } catch (err) {
         ctxSpin.fail("Context retrieval failed");
+        log.error("context.failed", { reason: err instanceof Error ? err.message : String(err) });
         throw err;
       }
     }
 
     const ctxElapsed = Date.now() - ctxStart;
+    // The retrieved text itself is the single largest thing the agent handles;
+    // its size is the useful fact, the text is not.
+    log.info("context.ready", {
+      source: contextSource,
+      chars: context.length,
+      elapsedMs: ctxElapsed,
+    });
     if (ctxElapsed > 2000) {
       ctxSpin.succeed(`Context retrieved ${info(fmtElapsed(ctxElapsed))}`);
     } else {
@@ -255,6 +309,12 @@ if (isTui) {
     // used to kill the whole run before a single file was touched.
     const { classification, degraded } = await classifyQueryWithRetry(query ?? "", context);
     const classElapsed = Date.now() - classStart;
+    log.info("classification.ready", {
+      decomposable: classification.decomposable,
+      steps: classification.steps.length,
+      degraded: degraded ?? null,
+      elapsedMs: classElapsed,
+    });
     if (degraded) {
       classSpin.warn(`Classification unavailable — treating as a single step ${info(fmtElapsed(classElapsed))}`);
       print(`    ${info(degraded)}`);
@@ -282,7 +342,7 @@ if (isTui) {
 
       jsonResult.filesWritten = stepResult.writtenPaths.map((p) => path.relative(projectRoot, p));
       jsonResult.elapsedMs = Date.now() - startTime;
-      if (jsonOut) print(JSON.stringify(jsonResult, null, 2));
+      finish({ outcome: "completed", steps: 1 });
       return;
     }
 
@@ -309,7 +369,7 @@ if (isTui) {
       if (!confirmed) {
         print(`  ${warn("!")} Plan rejected by user.`);
         jsonResult.exitCode = 1;
-        if (jsonOut) print(JSON.stringify(jsonResult, null, 2));
+        finish({ outcome: "rejected", steps: classification.steps.length });
         process.exit(1);
       }
     }
@@ -410,7 +470,13 @@ if (isTui) {
     }
     jsonResult.filesWritten = allWrittenPaths.map((p) => path.relative(projectRoot, p));
     jsonResult.elapsedMs = Date.now() - startTime;
-    if (jsonOut) print(JSON.stringify(jsonResult, null, 2));
+    finish({
+      outcome: stoppedEarly ? "step_failed" : "completed",
+      steps: classification.steps.length,
+      stepsCompleted: completed,
+      stepsFailed: failed,
+      stepsSkipped: skipped,
+    });
     return;
 
     } catch (err) {
@@ -431,7 +497,14 @@ if (isTui) {
         jsonResult.exitCode = 1;
         jsonResult.filesWritten = err.writtenPaths.map((p) => path.relative(projectRoot, p));
         jsonResult.elapsedMs = Date.now() - startTime;
-        if (jsonOut) print(JSON.stringify(jsonResult, null, 2));
+        log.error("step.failed", {
+          step: err.stepIndex + 1,
+          description: err.description,
+          reason: err.reason,
+          filesWritten: err.writtenPaths.length,
+          filesCreated: err.createdPaths.length,
+        });
+        finish({ outcome: "step_failed", step: err.stepIndex + 1 });
         process.exitCode = 1;
         return;
       }
@@ -447,7 +520,13 @@ if (isTui) {
       print(`  ${info("Stack")}: ${err instanceof Error ? err.stack : "N/A"}`);
       jsonResult.exitCode = 2;
       jsonResult.elapsedMs = Date.now() - startTime;
-      if (jsonOut) print(JSON.stringify(jsonResult, null, 2));
+      log.error("run.crashed", {
+        error: err instanceof Error ? err.message : String(err),
+        // The stack is the whole point of this line, but it is the bulkiest
+        // thing in the file, so it stays at debug.
+        stack: err instanceof Error ? err.stack : undefined,
+      });
+      finish({ outcome: "crashed" });
       process.exitCode = 2;
       return;
     }
@@ -459,6 +538,21 @@ program.parse();
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Value of a `--flag value` or `--flag=value` argument, or undefined.
+ *
+ * The TUI parses `process.argv` by hand rather than through commander, so it
+ * needs this to honour `--log` without duplicating the option table.
+ */
+function flagValue(argv: string[], flag: string): string | undefined {
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === flag) return argv[i + 1];
+    if (arg.startsWith(`${flag}=`)) return arg.slice(flag.length + 1);
+  }
+  return undefined;
+}
 
 function findSchemaPath(projectRoot: string): string | null {
   const candidates = [
@@ -535,6 +629,9 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
   });
 
   print(section(`[${stepLabel}]`));
+  // Every phase below now inherits the step, so a line in the log is never
+  // ambiguous about which step of a multi-step run it came from.
+  setAgentRunFields({ step: stepIndex + 1, stepDescription: description });
 
   const schemaPath = findSchemaPath(projectRoot);
   const schemaSource = schemaPath ? fs.readFileSync(schemaPath, "utf-8") : undefined;
@@ -549,13 +646,20 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
     editPlan = await extractIntentWithRetry(query, context, schemaSource);
   } catch (err) {
     intentSpin.fail("Intent extraction failed");
+    log.error("intent.failed", { reason: err instanceof Error ? err.message : String(err) });
     throw fail(`Intent extraction failed: ${err instanceof Error ? err.message : err}`);
   }
   const intentElapsed = Date.now() - intentStart;
   if (editPlan.length === 0) {
     intentSpin.info("No operations extracted.");
+    log.warn("intent.empty", { elapsedMs: intentElapsed });
     return noChange();
   }
+  log.info("intent.extracted", {
+    operations: editPlan.length,
+    plan: describePlan(editPlan),
+    elapsedMs: intentElapsed,
+  });
   intentSpin.succeed(`Intent extracted ${info(fmtElapsed(intentElapsed))}`);
   print(`    ${info(`${editPlan.length} operation(s) extracted`)}`);
   print(`    ${info("Operations")}:`);
@@ -599,6 +703,12 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
 
     promptInjection = promptInjectionFor(changes);
     blastSpin.succeed(`Blast radius computed ${info(fmtElapsed(Date.now() - blastStart))}`);
+    log.info("blast.computed", {
+      changes: changes.length,
+      breakingFields: [...new Set(changes.flatMap((c) => c.breakingFieldNames))],
+      mustChange: mustChange.length,
+      elapsedMs: Date.now() - blastStart,
+    });
     print();
     print(`    ${bold(String(mustChange.length))} file(s) must change alongside the schema`);
     print();
@@ -635,9 +745,15 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
 
   if (!actions?.length) {
     genSpin.info("No actions generated.");
+    log.warn("generation.empty", { elapsedMs: genElapsed });
     return noChange();
   }
   genSpin.succeed(`Code generated ${info(fmtElapsed(genElapsed))}`);
+  log.info("generation.ready", {
+    actions: actions.length,
+    plan: describePlan(actions),
+    elapsedMs: genElapsed,
+  });
   print(`    ${info(`${actions.length} action(s) returned from model`)}`);
 
   // ── Post-process: new-file edits (the model may return non-empty oldText) ──
@@ -699,6 +815,7 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
       } else {
         reSpin.info(`No additional file edits generated ${info(fmtElapsed(reElapsed))}`);
       }
+      log.info("regeneration.done", { uncovered: uncovered.length, added, elapsedMs: reElapsed });
       for (const line of outcomes) print(line);
       print();
     }
@@ -716,6 +833,9 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
     if (unapplied.length > 0) {
       printErr(`  ${warn("!")} ${unapplied.length} edit(s) could not be applied:`);
       for (const u of unapplied) printErr(`    ${sym.bullet} ${u.filePath} — ${u.reason}`);
+      log.warn("verification.unapplied", {
+        files: unapplied.map((u) => ({ filePath: u.filePath, reason: u.reason })),
+      });
     }
 
     const verifySpin = spinner("Running unified structural validation...");
@@ -732,6 +852,7 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
       });
     } catch (err) {
       verifySpin.fail("Structural verification crashed");
+      log.error("verification.crashed", { reason: err instanceof Error ? err.message : String(err) });
       throw fail(`Structural validation crashed: ${err instanceof Error ? err.message : err}`);
     }
 
@@ -741,6 +862,18 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
     } else {
       verifySpin.fail(`Structural verification failed ${info(fmtElapsed(verifyElapsed))}`);
     }
+    log.info("verification.done", {
+      passed: unifiedResult.overallPassed,
+      addressed: unifiedResult.localCheck.addressed,
+      missed: unifiedResult.localCheck.missed,
+      missedFiles: unifiedResult.localCheck.report.missed.map((m) => ({
+        filePath: m.filePath,
+        reason: m.reason,
+      })),
+      graphCheckSkipped: unifiedResult.graphCheckSkipped,
+      staleNodes: unifiedResult.graphCheckSkipped ? 0 : unifiedResult.graphCheck.staleNodesFound,
+      elapsedMs: verifyElapsed,
+    });
     reportValidation(unifiedResult);
 
     // ── 7b. One retry for files the first pass missed ───────────────
@@ -835,6 +968,11 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
 
       retrySpin.succeed(`Retry succeeded ${info(fmtElapsed(retryElapsed))}`);
       print(`  ${sym.ok} All ${retryResult.localCheck.addressed} blast-radius file(s) now addressed`);
+      log.info("verification.retry.succeeded", {
+        retried: missedPaths.length,
+        addressed: retryResult.localCheck.addressed,
+        elapsedMs: retryElapsed,
+      });
       verifiedActions = merged;
       print();
     } else if (!unifiedResult.overallPassed) {
@@ -862,6 +1000,7 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
   console.log(
     `    ${sym.ok} ${dryRun ? "Preview" : "Write"} complete ${info(fmtElapsed(Date.now() - writeStart))}`
   );
+  log.info("write.phase", { dryRun, elapsedMs: Date.now() - writeStart });
   print();
 
   // ── Handle schema failures ────────────────────────────────────────
@@ -927,6 +1066,7 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
     if (failedPaths.length > 0) {
       printErr(`\n  ${error("✗")} Stale edit retry failed for ${failedPaths.length} file(s):`);
       for (const p of failedPaths) printErr(`    ${sym.bullet} ${p}`);
+      log.error("stale.retry.failed", { files: failedPaths, retried: result.staleEdits.length });
       throw new StepError(
         stepIndex,
         description,
@@ -936,6 +1076,7 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
       );
     }
     print(`  ${sym.ok} All stale edits retried successfully`);
+    log.info("stale.retry.succeeded", { retried: result.staleEdits.length });
     print();
   }
 
@@ -963,19 +1104,35 @@ async function runStep(opts: StepOptions): Promise<StepResult> {
     const idxSpin = spinner("Updating graph index...");
     idxSpin.start();
     const idxStart = Date.now();
+    const failed: string[] = [];
     for (const absPath of allPaths) {
       try {
         await reingestFile(absPath, projectRoot);
       } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
         printErr(
           `  ${warn("!")} reingest failed for ${absPath}:`,
           err instanceof Error ? err.message : err
         );
+        // A failed reingest leaves the graph stale but the files correct, so it
+        // is a warning — but only a logged one can be found again later.
+        log.warn("reingest.failed", { path: absPath, reason });
+        failed.push(absPath);
       }
     }
     idxSpin.succeed(`Graph index updated ${info(fmtElapsed(Date.now() - idxStart))}`);
+    log.info("reingest.done", {
+      files: allPaths.length,
+      failed: failed.length,
+      elapsedMs: Date.now() - idxStart,
+    });
     print();
   }
+
+  log.info("step.done", {
+    written: result.writtenPaths.length,
+    created: result.createdPaths.length,
+  });
 
   return {
     stepIndex,
@@ -1020,6 +1177,33 @@ function editedPaths(plan: EditPlan, projectRoot: string): Set<string> {
     if (resolved) paths.add(resolved.rel);
   }
   return paths;
+}
+
+/**
+ * What a plan contains, in the shape a log reader wants: which operations, on
+ * which files. The same information `printOperations` renders, without the
+ * symbol soup.
+ */
+function describePlan(plan: EditPlan): LogFields {
+  const schema: string[] = [];
+  const files: string[] = [];
+  const commands: string[] = [];
+  for (const op of plan) {
+    if (op.type === "schema") {
+      schema.push(
+        op.op === "create_model" || op.op === "remove_model"
+          ? `${op.op} ${op.model}`
+          : `${op.op} ${op.model}.${op.fieldName ?? ""}`
+      );
+    } else if (op.type === "file") {
+      files.push(`${op.filePath} (${op.edits.length} edit${op.edits.length === 1 ? "" : "s"})`);
+    } else if (op.type === "create_file") {
+      files.push(`${op.filePath} (new)`);
+    } else if (op.type === "command") {
+      commands.push(String(op.command));
+    }
+  }
+  return { schema, files, commands };
 }
 
 /**

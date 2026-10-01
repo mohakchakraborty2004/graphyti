@@ -9,6 +9,7 @@ import type { EditPlan, FileEdit, SchemaEdit, CommandAction, CreateFile } from "
 import { applyScopedEdits, applySchemaEdit, checkSyntax } from "./generate/scopedEdit";
 import { StaleEditError, AmbiguousEditError } from "./generate/scopedEdit";
 import { resolveProjectPath } from "./utils/paths";
+import { log, type LogFields } from "./utils/agentLog";
 
 export { StaleEditError, AmbiguousEditError };
 
@@ -64,12 +65,14 @@ function safeResolve(
     console.error(
       `    ${error("✗")} Refused ${label}: ${filePath} resolves outside the project root`
     );
+    log.warn("path.refused", { label, filePath });
     return null;
   }
   if (resolved.corrected) {
     console.log(
       `    ${warn("!")} Corrected path ${filePath} → ${resolved.rel} (duplicated project-root prefix)`
     );
+    log.info("path.corrected", { label, filePath, corrected: resolved.rel });
   }
   return { abs: resolved.abs, rel: resolved.rel };
 }
@@ -87,11 +90,13 @@ async function runCommand(
     console.error(`      ${check.reason}`);
     console.error(`      Only these command shapes are ever executed:`);
     for (const line of ALLOWLIST_HELP) console.error(`        ${sym.bullet} ${line}`);
+    log.error("command.refused", { command: String(cmd), reason: check.reason });
     return null;
   }
 
   if (dryRun) {
     console.log(`    ${info("›")} Would run: ${check.display}`);
+    log.info("command.dryRun", { command: check.display });
     return null;
   }
 
@@ -105,11 +110,13 @@ async function runCommand(
       `    ${error("✗")} Not running: no interactive terminal. ` +
         `Re-run with --yes to auto-confirm.`
     );
+    log.warn("command.skipped", { command: check.display, reason: "no interactive terminal" });
     return null;
   } else {
     const confirmed = await askConfirm(`    Run this command? [y/N] `);
     if (!confirmed) {
       console.log(`    ${warn("!")} Skipped by user.`);
+      log.warn("command.skipped", { command: check.display, reason: "declined by user" });
       return null;
     }
   }
@@ -125,14 +132,17 @@ async function runCommand(
 
   if (result.error) {
     console.error(`    ${error("✗")} Failed to run: ${check.display}`, result.error.message);
+    log.error("command.failed", { command: check.display, error: result.error.message });
     return null;
   }
   if (result.status !== 0) {
     console.error(`    ${error("✗")} Exited with code ${result.status}: ${check.display}`);
+    log.error("command.failed", { command: check.display, exitCode: result.status });
     return null;
   }
 
   console.log(`    ${sym.ok} Executed: ${check.display}`);
+  log.info("command.executed", { command: check.display, cwd: process.cwd() });
   return check.display;
 }
 
@@ -162,6 +172,14 @@ export async function handleAgentOutput(
   const createFailures: WriteResult["createFailures"] = [];
   const schemaFailures: WriteResult["schemaFailures"] = [];
 
+  // What the plan is made of, before anything lands. This is the line that
+  // answers "what did the model actually ask for?" when a run goes wrong.
+  log.debug("write.start", {
+    dryRun,
+    projectRoot,
+    operations: summarizePlan(plan),
+  });
+
   // ── 1. SchemaEdit entries — FIRST, and fatal on failure ─────────────
   //
   // The schema is the source of truth every other edit is derived from. When
@@ -183,6 +201,7 @@ export async function handleAgentOutput(
       const msg = `No schema.prisma found for ${schemaEdit.op} on ${schemaEdit.model}`;
       console.error(`    ${error("✗")} ${msg}`);
       schemaFailures.push({ edit: schemaEdit, error: msg });
+      log.error("write.schema.missing", { op: schemaEdit.op, model: schemaEdit.model });
       continue;
     }
     const relSchemaPath = path.relative(projectRoot, schemaPath);
@@ -227,6 +246,12 @@ export async function handleAgentOutput(
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`    ${error("✗")} Schema edit failed: ${msg}`);
       schemaFailures.push({ edit: schemaEdit, error: msg });
+      log.error("write.schema.failed", {
+        op: schemaEdit.op,
+        model: schemaEdit.model,
+        field: schemaEdit.fieldName,
+        reason: msg,
+      });
     }
   }
 
@@ -236,6 +261,7 @@ export async function handleAgentOutput(
     console.error(
       `    ${error("✗")} ${schemaFailures.length} schema edit(s) failed — skipping all file writes and commands`
     );
+    log.error("write.aborted", { reason: "schema_failures", failed: schemaFailures.length });
     return { writtenPaths, executedCommands, staleEdits, createdPaths, createFailures, schemaFailures };
   }
   // ── 2. FileEdit entries ─────────────────────────────────────────────
@@ -289,9 +315,11 @@ export async function handleAgentOutput(
         fs.writeFileSync(absPath, fileEdit.edits[0].newText, "utf-8");
         console.log(`    ${sym.ok} Created: ${absPath}`);
         writtenPaths.push(absPath);
+        log.info("write.file", { path: absPath, outcome: "created", edits: 1 });
         continue;
       }
       console.error(`    ${error("✗")} File does not exist and no creation edit: ${absPath}`);
+      log.error("write.file.missing", { path: absPath, edits: fileEdit.edits.length });
       continue;
     }
 
@@ -308,11 +336,21 @@ export async function handleAgentOutput(
       }
 
       writtenPaths.push(absPath);
+      log.info("write.file", {
+        path: absPath,
+        outcome: "updated",
+        edits: fileEdit.edits.length,
+      });
     } catch (err) {
       if (err instanceof StaleEditError || err instanceof AmbiguousEditError) {
         // Collect for retry — do NOT write anything for this file
         console.error(`    ${error("✗")} ${err.message}`);
         staleEdits.push({ edit: fileEdit, error: err });
+        log.warn("write.file.stale", {
+          path: absPath,
+          reason: err instanceof StaleEditError ? "stale" : "ambiguous",
+          detail: err.message,
+        });
       } else {
         throw err;
       }
@@ -349,6 +387,7 @@ export async function handleAgentOutput(
       const msg = `File already exists — cannot create ${createOp.filePath}. The plan assumed this file did not exist (stale graph state or planning bug).`;
       console.error(`    ${error("✗")} ${msg}`);
       createFailures.push({ edit: createOp, error: msg });
+      log.error("write.create.exists", { path: absPath, reason: createOp.reason });
       continue;
     }
 
@@ -357,6 +396,7 @@ export async function handleAgentOutput(
     if (!syntaxCheck.ok) {
       console.error(`    ${error("✗")} ${syntaxCheck.reason}`);
       createFailures.push({ edit: createOp, error: syntaxCheck.reason });
+      log.error("write.create.syntax", { path: absPath, reason: syntaxCheck.reason });
       continue;
     }
 
@@ -365,6 +405,7 @@ export async function handleAgentOutput(
     fs.writeFileSync(absPath, createOp.content, "utf-8");
     console.log(`    ${sym.ok} Created: ${absPath} ${info(`— ${createOp.reason}`)}`);
     createdPaths.push(absPath);
+    log.info("write.create", { path: absPath, reason: createOp.reason, bytes: createOp.content.length });
   }
 
   // ── 4. CommandAction entries ─────────────────────────────────────────
@@ -375,5 +416,32 @@ export async function handleAgentOutput(
     if (ran) executedCommands.push(ran);
   }
 
+  const summary = {
+    written: writtenPaths.length,
+    created: createdPaths.length,
+    executed: executedCommands.length,
+    stale: staleEdits.length,
+    createFailures: createFailures.length,
+    schemaFailures: schemaFailures.length,
+    paths: [...writtenPaths, ...createdPaths],
+    commands: executedCommands,
+  };
+  if (summary.schemaFailures > 0 || summary.createFailures > 0) {
+    log.error("write.complete", summary);
+  } else {
+    log.info("write.complete", summary);
+  }
+
   return { writtenPaths, executedCommands, staleEdits, createdPaths, createFailures, schemaFailures };
+}
+
+/** Counts per operation kind, plus the paths touched. */
+function summarizePlan(plan: EditPlan): LogFields {
+  const counts: Record<string, number> = {};
+  const paths: string[] = [];
+  for (const item of plan) {
+    counts[item.type] = (counts[item.type] ?? 0) + 1;
+    if (item.type === "file" || item.type === "create_file") paths.push(item.filePath);
+  }
+  return { counts, paths };
 }

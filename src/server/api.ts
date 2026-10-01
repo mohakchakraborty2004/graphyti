@@ -234,6 +234,7 @@ async function executeQuery(
       autoConfirm: true,
       legacyContext: false,
       projectRoot,
+      source: "api",
       onBeforeWrite: () => {
         branch = createQueryBranch(projectRoot, query);
       },

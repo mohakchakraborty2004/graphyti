@@ -25,6 +25,7 @@ import type { PermissionRequest, ToolCall, ToolKind } from "../state/types";
 import type { StatusKind } from "../theme/tokens";
 import type { BlastRadiusResult } from "../../graph/blastRadius";
 import type { UnifiedValidationResult } from "../../verify/unifiedValidation";
+import { beginAgentRun, endAgentRun, log, setAgentRunFields } from "../../utils/agentLog";
 
 export interface PipelineOptions {
   dryRun: boolean;
@@ -33,6 +34,10 @@ export interface PipelineOptions {
   projectRoot: string;
   /** Runs after validation and immediately before the first write. */
   onBeforeWrite?: () => void | Promise<void>;
+  /** Log level for this run. Falls back to `GRAPHYTI_LOG`, then `info`. */
+  logLevel?: string;
+  /** Which surface started the run. Recorded on every log line. */
+  source?: string;
 }
 
 export interface PipelineEvents {
@@ -122,6 +127,20 @@ export async function runPipeline(
   const startedAt = Date.now();
   const capture: ConsoleCapture = captureConsole();
 
+  // One log file per query. The TUI's own output is a live frame the user can
+  // scroll past; this is the copy that still exists after the process exits.
+  const logFile = beginAgentRun({
+    projectRoot: options.projectRoot,
+    source: options.source ?? "tui",
+    level: options.logLevel,
+    fields: {
+      query,
+      dryRun: options.dryRun,
+      autoConfirm: options.autoConfirm,
+      legacyContext: options.legacyContext,
+    },
+  });
+
   const result: PipelineResult = {
     filesWritten: [],
     filesCreated: [],
@@ -133,6 +152,7 @@ export async function runPipeline(
     elapsedMs: 0,
   };
 
+  let outcome = "completed";
   try {
     // ── Context ──────────────────────────────────────────────────────────────
     events.state("thinking");
@@ -146,6 +166,11 @@ export async function runPipeline(
     events.toolUpdate(contextTool, {
       status: "success",
       result: context.label,
+      elapsedMs: Date.now() - contextStart,
+    });
+    log.info("context.ready", {
+      source: context.label,
+      chars: context.text.length,
       elapsedMs: Date.now() - contextStart,
     });
 
@@ -168,6 +193,12 @@ export async function runPipeline(
     if (degraded) {
       events.message(`Could not plan multi-step work (${degraded}) — treating this as a single change.`);
     }
+    log.info("classification.ready", {
+      local: Boolean(localIntent),
+      decomposable: classification.decomposable,
+      steps: classification.steps.length,
+      degraded: degraded ?? null,
+    });
     throwIfAborted(signal);
 
     if (classification.decomposable && classification.steps.length > 0) {
@@ -193,31 +224,69 @@ export async function runPipeline(
         const step = classification.steps[i]!;
         events.planProgress(i, completed, failed);
         events.activity(step.description);
+        setStepFields(i + 1, step.description);
 
         try {
           await executeStep(step.description, context.text, options, events, signal, result);
           completed.push(i);
+          log.info("step.done", { completed: completed.length, failed: failed.length });
         } catch (error) {
           if (error instanceof CancelledError) throw error;
           failed.push(i);
           events.planProgress(i, completed, failed);
+          log.error("step.failed", {
+            reason: error instanceof Error ? error.message : String(error),
+            completed: completed.length,
+            failed: failed.length,
+          });
           throw error;
         }
       }
 
       events.planProgress(classification.steps.length, completed, failed);
     } else {
+      setStepFields(1, query);
       await executeStep(query, context.text, options, events, signal, result);
     }
 
     result.elapsedMs = Date.now() - startedAt;
     return result;
+  } catch (error) {
+    // A run that ends in a throw never reaches the return above, so the
+    // classification of "why did this stop" has to happen here.
+    outcome = error instanceof CancelledError ? "cancelled" : "failed";
+    log.error("run.failed", {
+      reason: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+    throw error;
   } finally {
     capture.restore();
     const captured = capture.lines().map(decolorize).filter((l) => l.trim().length > 0);
     if (captured.length > 0) events.logs(captured);
     events.activity(null);
+    if (logFile && captured.length > 0) {
+      // Everything the pipeline printed is already on the transcript, but a
+      // collapsed log block is the first thing a user stops reading.
+      log.debug("console.captured", { lines: captured.length });
+    }
+    // Recorded even when nothing was written: "the run ended here with nothing
+    // in it" is the fact that explains a puzzling empty diff.
+    endAgentRun({
+      outcome,
+      filesWritten: result.filesWritten.length,
+      filesCreated: result.filesCreated.length,
+      commands: result.commands.length,
+      blastRadiusSize: result.blastRadiusSize,
+      graphIndexUpdated: result.graphIndexUpdated,
+      logCapturedLines: captured.length,
+    });
   }
+}
+
+/** Tag every later log line of this run with the step it belongs to. */
+function setStepFields(step: number, description: string): void {
+  setAgentRunFields({ step, stepDescription: description });
 }
 
 async function loadContextFor(
@@ -342,14 +411,21 @@ async function executeStep(
   // ── Intent ─────────────────────────────────────────────────────────────────
   events.state("thinking");
   events.activity("Extracting edit intent");
+  const intentStart = Date.now();
   const editPlan = await extractIntentWithRetry(stepQuery, context, schemaSource);
   throwIfAborted(signal);
 
   if (editPlan.length === 0) {
     events.message("I could not find a concrete change to make for that request.");
+    log.warn("intent.empty", { elapsedMs: Date.now() - intentStart });
     return;
   }
 
+  log.info("intent.extracted", {
+    operations: editPlan.length,
+    types: summarizePlan(editPlan),
+    elapsedMs: Date.now() - intentStart,
+  });
   events.operations(editPlan as unknown[]);
 
   // ── Blast radius ───────────────────────────────────────────────────────────
@@ -369,6 +445,12 @@ async function executeStep(
   const promptInjection = changes.length > 0 ? promptInjectionFor(changes) : "";
   result.blastRadiusSize += mustChange.length;
   result.blastRadius.push(...changes.map(({ blastRadius }) => blastRadius));
+  log.info("blast.computed", {
+    changes: changes.length,
+    mustChange: mustChange.length,
+    graphMissing: changes.filter(({ blastRadius }) => blastRadius.graphMissing).length,
+    elapsedMs: Date.now() - blastStart,
+  });
 
   if (changes.length === 0) {
     events.toolUpdate(blastTool, {
@@ -419,13 +501,21 @@ async function executeStep(
   // ── Generation ─────────────────────────────────────────────────────────────
   events.state("thinking");
   events.activity("Generating code");
+  const genStart = Date.now();
   const actions = await codeGen(editPlan, stepQuery, context + promptInjection);
   throwIfAborted(signal);
 
   if (!actions?.length) {
     events.message("The generation step produced no changes.");
+    log.warn("generation.empty", { elapsedMs: Date.now() - genStart });
     return;
   }
+
+  log.info("generation.ready", {
+    actions: actions.length,
+    types: summarizePlan(actions),
+    elapsedMs: Date.now() - genStart,
+  });
 
   // The TUI must finish schema work just as the CLI does. `yes: true` is used
   // below because Ink owns stdin; it therefore runs these allowlisted commands
@@ -480,6 +570,11 @@ async function executeStep(
         result: `${added}/${uncovered.length} affected file(s) updated`,
         elapsedMs: Date.now() - reGenStart,
       });
+      log.info("regeneration.done", {
+        uncovered: uncovered.length,
+        added,
+        elapsedMs: Date.now() - reGenStart,
+      });
     }
   }
 
@@ -498,6 +593,9 @@ async function executeStep(
     const firstPass = materialize(actions);
     for (const problem of firstPass.unapplied) {
       events.message(`Edit could not be applied — ${problem}`);
+    }
+    if (firstPass.unapplied.length > 0) {
+      log.warn("verification.unapplied", { problems: firstPass.unapplied });
     }
 
     let unifiedResult: import("../../verify/unifiedValidation").UnifiedValidationResult;
@@ -523,6 +621,17 @@ async function executeStep(
     events.toolUpdate(verifyTool, {
       status: unifiedResult.overallPassed ? "success" : "error",
       result: unifiedResult.summary,
+      elapsedMs: verifyElapsed,
+    });
+    log.info("verification.done", {
+      passed: unifiedResult.overallPassed,
+      addressed: unifiedResult.localCheck.addressed,
+      missed: unifiedResult.localCheck.missed,
+      missedFiles: unifiedResult.localCheck.report.missed.map((m) => ({
+        filePath: m.filePath,
+        reason: m.reason,
+      })),
+      graphCheckSkipped: unifiedResult.graphCheckSkipped,
       elapsedMs: verifyElapsed,
     });
 
@@ -638,6 +747,7 @@ async function executeStep(
   const before = snapshotFiles(targets);
 
   const { handleAgentOutput } = await import("../../agentPipeline");
+  const writeStart = Date.now();
   const writeResult = await handleAgentOutput(verifiedActions, {
     dryRun: options.dryRun,
     // Command execution asks through our own permission prompt, so the pipeline's
@@ -647,6 +757,14 @@ async function executeStep(
     projectRoot,
   });
   throwIfAborted(signal);
+  log.info("write.phase", {
+    dryRun: options.dryRun,
+    written: writeResult.writtenPaths.length,
+    created: writeResult.createdPaths.length,
+    executed: writeResult.executedCommands.length,
+    stale: writeResult.staleEdits.length,
+    elapsedMs: Date.now() - writeStart,
+  });
 
   if (options.dryRun) {
     // Nothing was written, so project the result in memory to preview it.
@@ -751,6 +869,10 @@ async function executeStep(
     }
 
     if (unresolved.length > 0) {
+      log.error("stale.retry.failed", {
+        files: [...new Set(unresolved)],
+        retried: writeResult.staleEdits.length,
+      });
       throw new PipelineError(
         `Could not apply ${unresolved.length} stale edit(s): ${[...new Set(unresolved)].join(", ")}. ` +
           "Other completed writes remain on disk."
@@ -788,14 +910,22 @@ async function executeStep(
 
     const { reingestFile } = await import("../../graph/incremental");
     let indexed = 0;
+    const failed: string[] = [];
     for (const absolute of writeResult.writtenPaths) {
       if (signal.aborted) break;
       try {
         await reingestFile(absolute, projectRoot);
         indexed++;
-      } catch {
+      } catch (err) {
         // Re-indexing is best-effort: a stale index degrades later context
         // quality but must not fail a run whose files are already written.
+        // The reason is still recorded, because "the index is behind" is
+        // otherwise the hardest symptom in the tool to trace back to a file.
+        failed.push(absolute);
+        log.warn("reingest.failed", {
+          path: absolute,
+          reason: err instanceof Error ? err.message : String(err),
+        });
       }
     }
 
@@ -805,7 +935,20 @@ async function executeStep(
       result: `${indexed}/${writeResult.writtenPaths.length} files`,
       elapsedMs: Date.now() - indexStart,
     });
+    log.info("reingest.done", {
+      files: writeResult.writtenPaths.length,
+      indexed,
+      failed: failed.length,
+      elapsedMs: Date.now() - indexStart,
+    });
   }
+}
+
+/** Counts per operation type, so a plan is legible in one log line. */
+function summarizePlan(plan: ReadonlyArray<{ type: string }>): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const op of plan) counts[op.type] = (counts[op.type] ?? 0) + 1;
+  return counts;
 }
 
 // ── Diff support ─────────────────────────────────────────────────────────────

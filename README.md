@@ -214,6 +214,62 @@ than hanging. See [`src/agentPipeline.ts`](src/agentPipeline.ts).
 
 ---
 
+## Agent run logs
+
+Every run writes a log of what it did to the project being worked on, in the
+project's own `.dbagent/logs/` directory, one file per run and one JSON object
+per line. The CLI's output scrolls away and the TUI's captured log block dies
+with the process; when a run goes wrong — a verification failure, a stale edit, a
+step that wrote nothing — this is the evidence that survives it.
+
+| | |
+| --- | --- |
+| Location | `<projectRoot>/.dbagent/logs/<timestamp>-<run id>.jsonl` |
+| Default level | `info` |
+| Levels | `off` · `error` · `warn` · `info` · `debug` |
+| Turned off by | `--log off`, or `GRAPHYTI_LOG=off` |
+| Redirected by | `GRAPHYTI_LOG_FILE=/path/to/file.jsonl` |
+| Retention | the newest 20 runs; older ones are pruned |
+
+A line is the event, the level, the time, milliseconds since the run started, and
+the run's identity — so a step's lines can be pulled out of a long run with one
+`grep`. `run.start` records the query, the model and which config keys were set
+(never their values), and `run.end` closes the run with its outcome, the files
+written and the exit code. Between them are the phases: context retrieval,
+classification, plan, per-file writes with their outcomes, refused paths and
+commands, schema failures, retries, generation, verification and reingest.
+`--debug` adds the prompt sizes and timings. See
+[`src/utils/agentLog.ts:185`](src/utils/agentLog.ts#L185) for the run
+lifecycle, and the call sites in
+[`src/index.ts:190`](src/index.ts#L190) (CLI),
+[`src/tui/engine/runPipeline.ts:132`](src/tui/engine/runPipeline.ts#L132) (TUI
+and API — every TUI prompt is its own run) and
+[`src/agentPipeline.ts:318`](src/agentPipeline.ts#L318) (the shared write and
+command phase, which is where refusals are recorded).
+
+A run is scoped to the flow that started it, so two API queries in flight at once
+write two files instead of one interleaved one.
+
+The flag wins over the environment, which wins over the default:
+
+```bash
+graphyti "add a heading field to Post" --log debug   # this run only
+GRAPHYTI_LOG=debug graphyti "add a heading field to Post"
+graphyti --log off                                   # silence it
+graphyti --json "add a heading field to Post"        # logFile in the JSON result
+```
+
+Three things the log will not do, because a diagnostic aid that costs you a run
+is worse than no log at all. It never touches the terminal — writes go to a file
+through `fs`, never `console`, because the TUI owns the screen. It never records
+a secret — values are redacted on the way in
+([`redact`](src/utils/agentLog.ts#L281)) and callers log shapes and sizes rather
+than prompts and file contents. And it never fails a run: the first write error
+disables logging for the rest of the run instead of retrying, so a full disk or a
+read-only project costs you the log and nothing else.
+
+---
+
 ## Legacy flat context (fallback only)
 
 `graphyti init` and `--legacy-context` use a pre-graph, relation-free snapshot at
