@@ -25,6 +25,7 @@ import type { PermissionRequest, ToolCall, ToolKind } from "../state/types";
 import type { StatusKind } from "../theme/tokens";
 import type { BlastRadiusResult } from "../../graph/blastRadius";
 import type { UnifiedValidationResult } from "../../verify/unifiedValidation";
+import { configureLogger, logError, logInfo, logWarn } from "../../utils/logger";
 
 export interface PipelineOptions {
   dryRun: boolean;
@@ -122,6 +123,19 @@ export async function runPipeline(
   const startedAt = Date.now();
   const capture: ConsoleCapture = captureConsole();
 
+  // File logging is configured here rather than only at launch: the HTTP API
+  // drives this same runner against a different project root, and a run log
+  // written next to the wrong project would be worse than none at all.
+  configureLogger({ projectRoot: options.projectRoot });
+  logInfo("run.start", {
+    source: "pipeline",
+    query,
+    dryRun: options.dryRun,
+    legacyContext: options.legacyContext,
+    autoConfirm: options.autoConfirm,
+    projectRoot: options.projectRoot,
+  });
+
   const result: PipelineResult = {
     filesWritten: [],
     filesCreated: [],
@@ -211,7 +225,23 @@ export async function runPipeline(
     }
 
     result.elapsedMs = Date.now() - startedAt;
+    logInfo("run.end", {
+      status: "ok",
+      elapsedMs: result.elapsedMs,
+      filesWritten: result.filesWritten,
+      filesCreated: result.filesCreated,
+      commands: result.commands,
+      verifications: result.verification.length,
+    });
     return result;
+  } catch (err) {
+    const elapsedMs = Date.now() - startedAt;
+    if (err instanceof CancelledError) {
+      logWarn("run.end", { status: "cancelled", elapsedMs });
+    } else {
+      logError("run.end", { status: "failed", elapsedMs, error: err });
+    }
+    throw err;
   } finally {
     capture.restore();
     const captured = capture.lines().map(decolorize).filter((l) => l.trim().length > 0);
@@ -347,10 +377,12 @@ async function executeStep(
 
   if (editPlan.length === 0) {
     events.message("I could not find a concrete change to make for that request.");
+    logInfo("intent.empty", { query: stepQuery });
     return;
   }
 
   events.operations(editPlan as unknown[]);
+  logInfo("intent.extracted", { operations: editPlan.length });
 
   // ── Blast radius ───────────────────────────────────────────────────────────
   //
@@ -369,6 +401,13 @@ async function executeStep(
   const promptInjection = changes.length > 0 ? promptInjectionFor(changes) : "";
   result.blastRadiusSize += mustChange.length;
   result.blastRadius.push(...changes.map(({ blastRadius }) => blastRadius));
+
+  logInfo("blastRadius.computed", {
+    breakingChanges: changes.length,
+    mustChangeFiles: mustChange.length,
+    operations: editPlan.length,
+    elapsedMs: Date.now() - blastStart,
+  });
 
   if (changes.length === 0) {
     events.toolUpdate(blastTool, {
@@ -520,6 +559,17 @@ async function executeStep(
 
     const verifyElapsed = Date.now() - verifyStart;
     result.verification.push(unifiedResult);
+    const verificationLog = {
+      passed: unifiedResult.overallPassed,
+      localAddressed: unifiedResult.localCheck.addressed,
+      localMissed: unifiedResult.localCheck.missed,
+      graphSkipped: unifiedResult.graphCheckSkipped,
+      staleNodes: unifiedResult.graphCheck.staleNodesFound,
+      resolution: unifiedResult.resolutionReason,
+      elapsedMs: verifyElapsed,
+    };
+    if (unifiedResult.overallPassed) logInfo("verification.result", verificationLog);
+    else logError("verification.result", verificationLog);
     events.toolUpdate(verifyTool, {
       status: unifiedResult.overallPassed ? "success" : "error",
       result: unifiedResult.summary,
@@ -591,6 +641,10 @@ async function executeStep(
       result.verification.push(retryResult);
 
       if (retryResult.localCheck.missed > 0) {
+        logError("verification.retry.failed", {
+          stillMissed: retryResult.localCheck.missed,
+          elapsedMs: Date.now() - retryStart,
+        });
         events.toolUpdate(retryTool, {
           status: "error",
           error: `retry still missed ${retryResult.localCheck.missed} file(s): ${retryResult.localCheck.report.missed
@@ -605,6 +659,10 @@ async function executeStep(
       }
 
       verifiedActions = merged;
+      logInfo("verification.retry.succeeded", {
+        addressed: retryResult.localCheck.addressed,
+        elapsedMs: Date.now() - retryStart,
+      });
       events.toolUpdate(retryTool, {
         status: "success",
         result: `retry succeeded — all ${retryResult.localCheck.addressed} file(s) verified`,
@@ -647,6 +705,16 @@ async function executeStep(
     projectRoot,
   });
   throwIfAborted(signal);
+
+  logInfo("write.complete", {
+    dryRun: options.dryRun,
+    written: writeResult.writtenPaths.length,
+    created: writeResult.createdPaths.length,
+    commands: writeResult.executedCommands.length,
+    staleEdits: writeResult.staleEdits.length,
+    schemaFailures: writeResult.schemaFailures.length,
+    createFailures: writeResult.createFailures.length,
+  });
 
   if (options.dryRun) {
     // Nothing was written, so project the result in memory to preview it.

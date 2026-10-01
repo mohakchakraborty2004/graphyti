@@ -49,6 +49,14 @@ export const env = {
   hydraDbCollection: normalize(process.env.HYDRA_DB_COLLECTION),
   openrouterApiKey: normalize(process.env.OPENROUTER_API_KEY),
   openrouterModel: normalize(process.env.OPENROUTER_MODEL),
+  /**
+   * Where run logs are written. A path (absolute, or relative to the target
+   * project) or `off`. Unset means the default
+   * `<projectRoot>/.dbagent/logs/graphyti.log`. Read by `utils/logger.ts` at
+   * configure time, never validated here: a log destination is not credentials,
+   * and a bad value must degrade to "logging off", not fail the run.
+   */
+  graphytiLog: normalize(process.env.GRAPHYTI_LOG),
 } as const;
 
 export interface HydraConfig {
@@ -134,5 +142,8 @@ export function configSummary(): string {
     `HYDRA_DB_API_KEY=${secret(env.hydraDbApiKey)}`,
     `OPENROUTER_API_KEY=${secret(env.openrouterApiKey)}`,
     `OPENROUTER_MODEL=${env.openrouterModel ?? "MISSING"}`,
+    // Not a credential — the destination is worth showing when a run produced
+    // no log file, or produced one somewhere unexpected.
+    `GRAPHYTI_LOG=${env.graphytiLog ?? "(default .dbagent/logs/graphyti.log)"}`,
   ].join(" ");
 }
