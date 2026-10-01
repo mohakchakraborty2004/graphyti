@@ -161,6 +161,20 @@ export async function handleAgentOutput(
   const createdPaths: string[] = [];
   const createFailures: WriteResult["createFailures"] = [];
   const schemaFailures: WriteResult["schemaFailures"] = [];
+  const actionCounts = plan.reduce(
+    (counts, item) => {
+      counts[item.type] += 1;
+      return counts;
+    },
+    { schema: 0, file: 0, create_file: 0, command: 0 } as Record<EditPlan[number]["type"], number>
+  );
+
+  console.log(
+    `[agentPipeline] Starting ${plan.length} action(s) ` +
+      `(schema=${actionCounts.schema}, file=${actionCounts.file}, ` +
+      `create=${actionCounts.create_file}, command=${actionCounts.command}, ` +
+      `dryRun=${dryRun}, yes=${yes}, projectRoot=${projectRoot})`
+  );
 
   // ── 1. SchemaEdit entries — FIRST, and fatal on failure ─────────────
   //
@@ -172,6 +186,10 @@ export async function handleAgentOutput(
   for (const item of plan) {
     if (item.type !== "schema") continue;
     const schemaEdit = item as SchemaEdit;
+    console.log(
+      `[agentPipeline] Schema phase: ${schemaEdit.op} on ${schemaEdit.model}` +
+        `${schemaEdit.fieldName ? `.${schemaEdit.fieldName}` : ""}`
+    );
 
     // Find schema.prisma
     const candidates = [
@@ -236,12 +254,21 @@ export async function handleAgentOutput(
     console.error(
       `    ${error("✗")} ${schemaFailures.length} schema edit(s) failed — skipping all file writes and commands`
     );
+    console.log(
+      `[agentPipeline] Stopped after schema failure(s): ${schemaFailures.length}`
+    );
     return { writtenPaths, executedCommands, staleEdits, createdPaths, createFailures, schemaFailures };
   }
+  console.log(
+    `[agentPipeline] Schema phase complete: applied=${writtenPaths.length}, failures=${schemaFailures.length}`
+  );
   // ── 2. FileEdit entries ─────────────────────────────────────────────
   for (const item of plan) {
     if (item.type !== "file") continue;
     const fileEdit = item as FileEdit;
+    console.log(
+      `[agentPipeline] File phase: ${fileEdit.filePath} (${fileEdit.edits.length} edit(s), dryRun=${dryRun})`
+    );
 
     const resolved = safeResolve(fileEdit.filePath, projectRoot, "file edit");
     if (!resolved) continue;
@@ -320,9 +347,11 @@ export async function handleAgentOutput(
   }
 
   // ── 3. CreateFile entries ───────────────────────────────────────────
+  console.log(`[agentPipeline] Create phase: ${actionCounts.create_file} file(s)`);
   for (const item of plan) {
     if (item.type !== "create_file") continue;
     const createOp = item as CreateFile;
+    console.log(`[agentPipeline] Create phase: ${createOp.filePath}`);
 
     const resolved = safeResolve(createOp.filePath, projectRoot, "file creation");
     if (!resolved) continue;
@@ -368,12 +397,20 @@ export async function handleAgentOutput(
   }
 
   // ── 4. CommandAction entries ─────────────────────────────────────────
+  console.log(`[agentPipeline] Command phase: ${actionCounts.command} command(s)`);
   for (const item of plan) {
     if (item.type !== "command") continue;
     const cmd = item as CommandAction;
+    console.log(`[agentPipeline] Command phase: preparing command`);
     const ran = await runCommand(cmd.command, dryRun, yes, onBeforeCommand);
     if (ran) executedCommands.push(ran);
   }
+
+  console.log(
+    `[agentPipeline] Finished: written=${writtenPaths.length}, created=${createdPaths.length}, ` +
+      `commands=${executedCommands.length}, stale=${staleEdits.length}, ` +
+      `createFailures=${createFailures.length}, schemaFailures=${schemaFailures.length}`
+  );
 
   return { writtenPaths, executedCommands, staleEdits, createdPaths, createFailures, schemaFailures };
 }
