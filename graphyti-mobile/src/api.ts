@@ -1,5 +1,7 @@
 import { API_BASE_URL, API_TOKEN } from './config';
 
+const LOG_PREFIX = '[Graphyti API]';
+
 type QueryOptions = {
   dryRun?: boolean;
 };
@@ -71,22 +73,37 @@ function apiUrl(path: string) {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(apiUrl(path), {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${API_TOKEN}`,
-      ...init?.headers,
-    },
-  });
+  const method = init?.method ?? 'GET';
+  const startedAt = Date.now();
+  console.info(`${LOG_PREFIX} ${method} ${path} started`);
+
+  let response: Response;
+  try {
+    response = await fetch(apiUrl(path), {
+      ...init,
+      headers: {
+        Authorization: `Bearer ${API_TOKEN}`,
+        ...init?.headers,
+      },
+    });
+  } catch (error) {
+    console.error(`${LOG_PREFIX} ${method} ${path} failed after ${Date.now() - startedAt}ms`, error);
+    throw error;
+  }
   const body = await response.text();
+  const duration = Date.now() - startedAt;
 
   if (!response.ok) {
+    console.error(`${LOG_PREFIX} ${method} ${path} returned ${response.status} after ${duration}ms`);
     throw new Error(`API request failed (${response.status} ${response.statusText}): ${body}`);
   }
+
+  console.info(`${LOG_PREFIX} ${method} ${path} completed with ${response.status} in ${duration}ms`);
 
   try {
     return JSON.parse(body) as T;
   } catch {
+    console.warn(`${LOG_PREFIX} ${method} ${path} returned a non-JSON response`);
     return body as T;
   }
 }
@@ -120,6 +137,7 @@ export function streamQuery(
     onConnectionLost: (message: string) => void;
   }
 ) {
+  console.info(`${LOG_PREFIX} query stream connecting`);
   // React Native supports custom handshake headers even though the DOM's
   // TypeScript declaration (also present in Expo) only exposes two arguments.
   const NativeWebSocket = WebSocket as unknown as new (
@@ -134,23 +152,42 @@ export function streamQuery(
   );
   let completed = false;
 
+  socket.onopen = () => {
+    console.info(`${LOG_PREFIX} query stream connected`);
+  };
   socket.onmessage = (message) => {
     try {
       const event = JSON.parse(String(message.data)) as QueryStreamEvent;
       if (event.stage === 'complete') completed = true;
+      console.info(`${LOG_PREFIX} query stream event`, {
+        stage: event.stage,
+        status: event.status,
+        elapsedMs: event.elapsedMs,
+      });
       handlers.onEvent(event);
-    } catch {
+    } catch (error) {
+      console.error(`${LOG_PREFIX} query stream received an unreadable message`, error);
       handlers.onConnectionLost('Graphyti sent an unreadable stream message.');
     }
   };
-  socket.onerror = () => {
+  socket.onerror = (event) => {
+    console.error(`${LOG_PREFIX} query stream error`, event);
     if (!completed) handlers.onConnectionLost("Connection lost — check Graphyti's API and tunnel.");
   };
   socket.onclose = (event) => {
+    console.info(`${LOG_PREFIX} query stream closed`, {
+      code: event.code,
+      reason: event.reason,
+      clean: event.wasClean,
+      completed,
+    });
     if (!completed && event.code !== 1000) {
       handlers.onConnectionLost(`Connection lost (socket closed with code ${event.code || 'unknown'}).`);
     }
   };
 
-  return () => socket.close();
+  return () => {
+    console.info(`${LOG_PREFIX} query stream cancellation requested`);
+    socket.close();
+  };
 }
