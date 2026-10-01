@@ -16,6 +16,9 @@ import { client, hydraErrorMessage, waitForIndexed } from "./hydraClient";
 import { requireHydraConfig } from "../config";
 import { HydraDBError } from "@hydradb/sdk";
 import { info, sym } from "../cli/theme";
+import { createLogger } from "../utils/logger";
+
+const log = createLogger("reingest");
 
 function entriesEqual(a: GraphMapEntry, b: GraphMapEntry): boolean {
   return (
@@ -45,6 +48,8 @@ export async function reingestFile(filePath: string, projectRoot: string): Promi
   const map = loadGraphMap(absRoot);
   const previousOwned = new Set(ownedIds(map, rel));
   const fileMissing = !fs.existsSync(absFile);
+  log.debug(`${rel}: ${previousOwned.size} previously owned ids`);
+  if (fileMissing) log.warn(`${rel}: file no longer exists, dropping its nodes from the graph`);
 
   const extracted = fileMissing ? { nodes: [], edges: [] } : extractForFile(absRoot, absFile);
   const adj = adjacencyFromEdges(extracted.edges);
@@ -56,6 +61,10 @@ export async function reingestFile(filePath: string, projectRoot: string): Promi
     const prev = map[node.id];
     return !prev || !entriesEqual(prev, entry);
   });
+  if (toDelete.length > 0) log.debug(`${rel}: deleting ids ${toDelete.join(", ")}`);
+  if (toUpsert.length > 0) {
+    log.debug(`${rel}: upserting nodes ${toUpsert.map((n) => n.id).join(", ")}`);
+  }
 
   console.log(
     `  ${info("›")} ${rel}: ${toUpsert.length} upsert, ${toDelete.length} delete, ${extracted.nodes.length} current nodes`
@@ -114,6 +123,8 @@ export async function reingestFile(filePath: string, projectRoot: string): Promi
   if (ingestedIds.length > 0) {
     console.log(`  ${info("›")} Waiting for indexing of ${ingestedIds.length} ids`);
     await waitForIndexed(ingestedIds);
+    log.debug(`${rel}: ${ingestedIds.length} ids confirmed indexed`);
   }
+  log.debug(`${rel}: graph map updated (${extracted.nodes.length} nodes)`);
   console.log(`  ${sym.ok} ${rel} done`);
 }

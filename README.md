@@ -118,11 +118,11 @@ local graph map, so the graph stays current without a full re-ingest.
 
 | What | Where |
 | --- | --- |
-| `reingestFile()` — re-extract one file, diff, upsert + delete | [`src/graph/incremental.ts:36`](src/graph/incremental.ts#L36) |
-| Upsert/delete sets computed from the previous graph map | [`src/graph/incremental.ts:53`](src/graph/incremental.ts#L53) |
-| `deleteKnowledgeIds` for nodes the file no longer owns | [`src/graph/incremental.ts:64`](src/graph/incremental.ts#L64) |
-| `client.context.ingest` — changed nodes only | [`src/graph/incremental.ts:79`](src/graph/incremental.ts#L79) |
-| `waitForIndexed` before the run reports success | [`src/graph/incremental.ts:115`](src/graph/incremental.ts#L115) |
+| `reingestFile()` — re-extract one file, diff, upsert + delete | [`src/graph/incremental.ts:39`](src/graph/incremental.ts#L39) |
+| Upsert/delete sets computed from the previous graph map | [`src/graph/incremental.ts:58`](src/graph/incremental.ts#L58) |
+| `deleteKnowledgeIds` for nodes the file no longer owns | [`src/graph/incremental.ts:74`](src/graph/incremental.ts#L74) |
+| `client.context.ingest` — changed nodes only | [`src/graph/incremental.ts:88`](src/graph/incremental.ts#L88) |
+| `waitForIndexed` before the run reports success | [`src/graph/incremental.ts:125`](src/graph/incremental.ts#L125) |
 
 Called per written file from [`src/index.ts:964`](src/index.ts#L964).
 

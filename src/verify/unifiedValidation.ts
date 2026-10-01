@@ -7,6 +7,9 @@ import {
 import { verifyGraphConsistency, type GraphVerifyResult } from "../graph/hydraVerify";
 import type { BlastRadiusResult } from "../graph/blastRadius";
 import type { ExpectedDelta } from "../graph/expectedDelta";
+import { createLogger } from "../utils/logger";
+
+const log = createLogger("validation");
 
 // ---------------------------------------------------------------------------
 // Types
@@ -98,8 +101,16 @@ export async function runUnifiedValidation(
   const localPassed = localReport.missed.length === 0;
   const totalAffected = localReport.addressed.length + localReport.missed.length;
 
+  log.debug(
+    `local gate: ${localReport.addressed.length}/${totalAffected} files verified` +
+      (localReport.missed.length > 0 ? `, ${localReport.missed.length} missed` : "")
+  );
+
   // ── 2. Short-circuit: if local failed, skip the graph check ────────
   if (!localPassed) {
+    log.warn(
+      `local structural check failed (${localReport.missed.length} missed) — skipping HydraDB graph check`
+    );
     return {
       localCheck: {
         addressed: localReport.addressed.length,
@@ -123,6 +134,7 @@ export async function runUnifiedValidation(
   }
 
   if (opts.skipGraphCheck) {
+    log.debug("graph check skipped by caller; local gate is the only result");
     return {
       localCheck: {
         addressed: localReport.addressed.length,
@@ -159,6 +171,11 @@ export async function runUnifiedValidation(
       ...change.blastRadius.affectedFiles,
     ].map((n) => n.id);
 
+    log.debug(
+      `${change.delta.changeType} of ${change.delta.targetModel}: ` +
+        `${nodeIds.length} node id(s) in blast radius`
+    );
+
     try {
       const graphResult = await verifyGraphConsistency(
         change.delta,
@@ -172,12 +189,14 @@ export async function runUnifiedValidation(
       staleNodesFound.push(...graphResult.staleNodesFound);
       indexPending = indexPending || graphResult.indexPending;
     } catch (err) {
+      const reason = `Graph verification error: ${err instanceof Error ? err.message : err}`;
+      log.warn(`${change.delta.targetModel}: ${reason}`);
       graphMissed.push({
         nodeId:
           change.delta.changeType === "add"
             ? `model:${change.delta.targetModel}`
             : change.delta.targetNodeId,
-        reason: `Graph verification error: ${err instanceof Error ? err.message : err}`,
+        reason,
       });
     }
   }
@@ -204,6 +223,10 @@ export async function runUnifiedValidation(
     // so a correct rename can look stale for as long as the old extraction batch
     // remains current. Blocking on it failed correct runs in practice, which is
     // the opposite of what a safety gate is for.
+    log.warn(
+      `${staleNodesFound.length} HydraDB relation(s) still point at the old node` +
+        (indexPending ? " (indexing still pending — likely just lag)" : "")
+    );
     overallPassed = true;
     resolutionReason =
       `PASSED with warning: local check passed, but ${staleNodesFound.length} HydraDB relation(s) ` +
@@ -222,6 +245,9 @@ export async function runUnifiedValidation(
   const summary = overallPassed
     ? `Structural validation PASSED (${localReport.addressed.length}/${totalAffected} files verified locally, ${graphAddressed.length} graph relations confirmed, ${staleNodesFound.length} stale nodes)`
     : `Structural validation FAILED — ${resolutionReason}`;
+
+  log.debug(summary);
+  log.debug(`resolution: ${resolutionReason}`);
 
   return {
     localCheck: {

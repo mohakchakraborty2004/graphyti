@@ -1,5 +1,11 @@
 import { HydraDBClient, HydraDBError } from "@hydradb/sdk";
 import { env, requireHydraConfig } from "../config";
+import { createLogger } from "../utils/logger";
+
+// Polling an id through HydraDB's indexing queue is invisible otherwise: a stall
+// looks identical to a slow success from the outside. Everything here is logged
+// at debug — silent by default, `GRAPHYTI_LOG_LEVEL=debug` to watch the wait.
+const log = createLogger("hydra");
 
 // ../config loads .env from the package root before this module's body runs.
 // The token is read unvalidated so that importing this module never throws;
@@ -63,14 +69,18 @@ export async function waitForIndexed(
 
   const pending = new Set(ids);
   const started = Date.now();
+  log.debug(`waiting for ${ids.length} id(s) to index in ${database}/${collection}`);
 
   while (pending.size > 0) {
-    if (Date.now() - started > MAX_WAIT_MS) {
+    const elapsedMs = Date.now() - started;
+    if (elapsedMs > MAX_WAIT_MS) {
+      const stillPending = [...pending].join(", ");
       if (throwOnTimeout) {
         throw new Error(
-          `Timed out after ${MAX_WAIT_MS / 1000}s waiting for HydraDB indexing. Still pending: ${[...pending].join(", ")}`
+          `Timed out after ${MAX_WAIT_MS / 1000}s waiting for HydraDB indexing. Still pending: ${stillPending}`
         );
       }
+      log.debug(`giving up after ${elapsedMs}ms, returning ${pending.size} still-pending id(s): ${stillPending}`);
       return [...pending];
     }
 
@@ -109,23 +119,30 @@ export async function waitForIndexed(
       const indexingStatus = (status.indexingStatus ?? "").toLowerCase();
 
       if (FAILED.has(indexingStatus) || status.success === false) {
-        throw new Error(
-          hydraErrorMessage("HydraDB indexing failed.", {
-            id,
-            indexingStatus: status.indexingStatus,
-            errorCode: status.errorCode || envelope.error?.code,
-            errorMessage: status.errorMessage || status.message,
-            requestId,
-          })
-        );
+        const failure = hydraErrorMessage("HydraDB indexing failed.", {
+          id,
+          indexingStatus: status.indexingStatus,
+          errorCode: status.errorCode || envelope.error?.code,
+          errorMessage: status.errorMessage || status.message,
+          requestId,
+        });
+        // The caller sees this as a thrown error; log it too so a debug run
+        // has the request id even when the error is caught upstream.
+        log.debug(failure);
+        throw new Error(failure);
       }
 
       if (READY.has(indexingStatus)) {
         pending.delete(id);
+        log.debug(`${id} ready (${status.indexingStatus}), ${pending.size} still pending`);
       }
     }
 
-    if (pending.size === 0) return [];
+    if (pending.size === 0) {
+      log.debug(`all ${ids.length} id(s) indexed after ${Date.now() - started}ms`);
+      return [];
+    }
+    log.debug(`${pending.size} id(s) still pending after ${Date.now() - started}ms, rechecking in ${POLL_MS}ms`);
     await new Promise((r) => setTimeout(r, POLL_MS));
   }
   return [];

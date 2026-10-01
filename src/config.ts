@@ -2,6 +2,9 @@ import path from "path";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 import { z } from "zod";
+import { createLogger } from "./utils/logger";
+
+const log = createLogger("config");
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -32,6 +35,7 @@ export const ENV_PATH = path.join(__dirname, "..", ".env");
 // owns the terminal surface, so dependency chatter must never appear above the
 // prompt or look like an agent error.
 dotenv.config({ path: ENV_PATH, quiet: true });
+log.debug(`loaded .env from ${ENV_PATH}`);
 
 /** A `.env` line like `FOO=` yields "" — that is absent, not configured. */
 function normalize(value: string | undefined): string | undefined {
@@ -106,6 +110,7 @@ export function requireHydraConfig(): HydraConfig {
     database: parsed.data.HYDRA_DB_DATABASE,
     collection: env.hydraDbCollection,
   };
+  log.debug("resolved HydraDB credentials:", configSummary());
   return cachedHydraConfig;
 }
 

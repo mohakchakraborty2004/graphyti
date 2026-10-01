@@ -3,6 +3,9 @@ import * as path from "path";
 import { spawnSync } from "child_process";
 import { extractPrismaSchemaFromSource, type PrismaExtractResult } from "../extract/prismaExtractor";
 import type { ModelField } from "../extract/types";
+import { createLogger } from "../utils/logger";
+
+const log = createLogger("schema-merge");
 
 // ---------------------------------------------------------------------------
 // Types
@@ -223,10 +226,14 @@ export function formatPrismaSchema(
   });
 
   if (result.status === 0 && fs.existsSync(schemaPath)) {
+    log.debug(`${schemaPath}: prisma format succeeded`);
     return fs.readFileSync(schemaPath, "utf-8");
   }
 
   // If prisma format fails, return the file as-is (still valid, just unformatted)
+  log.warn(
+    `${schemaPath}: prisma format unavailable (exit=${result.status ?? "signal"}); keeping unformatted output`
+  );
   return fs.readFileSync(schemaPath, "utf-8");
 }
 
@@ -257,9 +264,22 @@ export function structuralSchemaMerge(
 
   const mutations = computeSchemaMutations(oldParsed, newParsed);
 
+  if (mutations.length > 0) {
+    log.debug(
+      `${schemaPath}: ${mutations.length} model(s) mutated — ` +
+        mutations
+          .map(
+            (m) =>
+              `${m.modelName} (+${m.added.length}/-${m.removed.length}/~${m.typeChanged.length})`
+          )
+          .join(", ")
+    );
+  }
+
   if (mutations.length === 0) {
     // No field-level changes detected — fall back to the generated content
     // (the model might have changed comments, formatting, or @@attributes)
+    log.debug(`${schemaPath}: no field-level mutations; keeping generated content as-is`);
     return generatedContent;
   }
 
